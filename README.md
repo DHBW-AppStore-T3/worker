@@ -125,13 +125,14 @@ make docker-build      # Build Docker image
 
 ### Components
 
-- **Celery Tasks** (`tasks.py`): Three main tasks for deployment operations
-  - `deploy_application`: Full deployment with Packer + Terraform
-  - `delete_deployment`: Infrastructure teardown
-  - `upgrade_deployment`: Update to new version
+- **Celery Tasks** (`tasks.py`): the deployment lifecycle operations
+  - `deploy_application`: full deployment with Packer + Terraform
+  - `destroy_deployment`: infrastructure teardown
+  - `pause_deployment` / `resume_deployment`: stop / start the running VMs
+  - `redeploy_resource`: `terraform apply -replace` for a single compute instance
 
 - **Git Service** (`services/git_service.py`): Handles repository cloning and cleanup
-- **Executors** (`services/executors.py`): Wrappers for Terraform and Packer CLI tools with OpenStack env injection
+- **Executors** (`services/terraform_executor.py`, `services/packer_executor.py`): Wrappers for the Terraform and Packer CLI tools with OpenStack env injection
 - **OpenStack Auth** (`services/openstack_auth.py`): `PerTaskCloudsConfig` context manager. Decrypts the per-user credential envelope received from the backend via Celery (using the shared Fernet key) and materialises a `clouds.yaml` (mode 0600) inside the per-task workspace. The file is shredded on exit.
 - **Build Lock** (`services/build_lock.py`): Redis-backed distributed lock keyed on `(project_id, image_name)` so two parallel workers never run the same Packer build twice.
 

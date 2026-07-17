@@ -247,16 +247,15 @@ class TerraformExecutor:
         """Run terraform plan."""
         logger.operation_start("terraform_plan", var_file=var_file, var_count=len(variables or {}))
         try:
-            # ``-lock=false``: jedes Deployment hat sein eigenes pg-Schema
-            # (siehe ``_tfstate_schema_name`` im Worker), sodass der State
-            # pro Deployment isoliert ist. Das State-Locking der geteilten
-            # ``postgres-tfstate``-DB serialisiert sonst UNZUSAMMENHÄNGENDE
-            # Deployments und lässt gleichzeitige Deletes/Applies in
-            # „Error acquiring the state lock" laufen. Echte Parallelität
-            # auf DEMSELBEN State verhindert bereits das Backend
-            # (``acquire_deployment_xact_lock`` + Partial-Unique-Index auf
-            # aktive Tasks pro Deployment), daher ist das Abschalten hier
-            # sicher.
+            # ``-lock=false``: each deployment has its own pg schema (see
+            # ``_tfstate_schema_name`` in the worker), so state is isolated
+            # per deployment. Otherwise the shared ``postgres-tfstate`` DB's
+            # state locking would serialize UNRELATED deployments and make
+            # concurrent deletes/applies fail with "Error acquiring the state
+            # lock". Real concurrency on the SAME state is already prevented
+            # by the backend (``acquire_deployment_xact_lock`` + partial
+            # unique index on active tasks per deployment), so disabling the
+            # lock here is safe.
             cmd = [self.terraform_path, "plan", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
