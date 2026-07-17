@@ -210,7 +210,7 @@ def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
         if isinstance(v, bool):
             # HCL accepts lowercase only; ``str(True)`` would emit "True".
             result[k] = "true" if v else "false"
-        elif isinstance(v, (dict, list)):
+        elif isinstance(v, dict | list):
             result[k] = json.dumps(_scrub_nested_nones(v), ensure_ascii=False)
         else:
             result[k] = str(v)
@@ -577,11 +577,7 @@ def _build_one_packer_image(
             # ``packer/`` directly; multi uses ``packer/<key>/``. Template
             # file name is always ``template.pkr.hcl`` relative to that
             # directory.
-            packer_dir = (
-                os.path.join(repo_path, "packer")
-                if is_legacy
-                else os.path.join(repo_path, "packer", tmpl.key)
-            )
+            packer_dir = os.path.join(repo_path, "packer") if is_legacy else os.path.join(repo_path, "packer", tmpl.key)
             packer = PackerExecutor(
                 packer_dir,
                 env_vars=openstack_env,
