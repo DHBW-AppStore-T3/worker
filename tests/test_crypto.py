@@ -144,7 +144,7 @@ class TestBuildCipherErrors:
         assert "malformed" in message
         # Original exception preserved via __cause__ (from e).
         assert exc_info.value.__cause__ is not None
-        assert isinstance(exc_info.value.__cause__, (ValueError, TypeError))
+        assert isinstance(exc_info.value.__cause__, ValueError | TypeError)
 
     def test_build_cipher_accepts_str_key(self, mocker):
         """_build_cipher encodes a str key to bytes before passing to Fernet."""

@@ -3,6 +3,8 @@ import os
 import re
 from typing import Any
 
+import git
+
 from .celery_app import celery_app
 from .config import settings
 from .services import (
@@ -208,7 +210,7 @@ def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
         if isinstance(v, bool):
             # HCL accepts lowercase only; ``str(True)`` would emit "True".
             result[k] = "true" if v else "false"
-        elif isinstance(v, (dict, list)):
+        elif isinstance(v, dict | list):
             result[k] = json.dumps(_scrub_nested_nones(v), ensure_ascii=False)
         else:
             result[k] = str(v)
@@ -252,12 +254,6 @@ def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
         else:
             result[k] = str(v)
     return result
-
-
-# Back-compat alias for any external import. Defaults to the Packer
-# semantics (lists → comma-joined) which matches the old helper's intent
-# but no longer strips backslashes.
-flatten_vars_to_strings = encode_packer_vars
 
 
 # --- Phase tracking ----------------------------------------------------------
@@ -449,6 +445,197 @@ class _PhaseTracker:
         )
 
 
+def _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema) -> TerraformExecutor:
+    """Build a TerraformExecutor bound to the deployment's pg-backend schema."""
+    return TerraformExecutor(
+        terraform_dir,
+        env_vars=openstack_env,
+        backend_conn_str=tfstate_conn_str,
+        backend_schema_name=tfstate_schema,
+    )
+
+
+def collect_terraform_state_helper(
+    terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, *, local_fallback=False
+):
+    """Snapshot the terraform state for the task row (best-effort).
+
+    With the pg backend the canonical state lives in Postgres; this
+    snapshot is used for debugging only. When ``local_fallback`` is set
+    (deploy path), a missing/empty pull falls back to reading the local
+    ``terraform.tfstate`` file for legacy/test modes that don't configure
+    a remote backend. Returns ``None`` when nothing could be read.
+    """
+    if not (terraform_dir and os.path.exists(terraform_dir)):
+        return None
+    try:
+        pulled = _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).state_pull()
+        if pulled or not local_fallback:
+            return pulled
+    except Exception as e:
+        task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
+        if not local_fallback:
+            return None
+
+    # Legacy fallback — only relevant when no pg backend is configured.
+    tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
+    if os.path.exists(tfstate_path):
+        try:
+            with open(tfstate_path) as f:
+                return f.read()
+        except Exception as e:
+            task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
+    return None
+
+
+def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger):
+    """Collect terraform outputs even on partial success. ``None`` on failure."""
+    if terraform_dir and os.path.exists(terraform_dir):
+        try:
+            return _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).output()
+        except Exception as e:
+            task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
+    return None
+
+
+def _build_one_packer_image(
+    tmpl,
+    *,
+    image_name,
+    is_legacy,
+    openstack_service,
+    project_id,
+    repo_path,
+    openstack_env,
+    stream_line,
+    user_vars,
+    phase_tracker,
+    task_logger,
+):
+    """Build (or reuse) the Packer image for a single template.
+
+    Skips the build when the image already exists in Glance, and
+    coordinates concurrent workers via ``PackerBuildLock`` (only one
+    worker builds a given image; the others wait and reuse it). Raises
+    ``Exception("Packer error: ...")`` on any failure, matching the
+    previous inline loop body.
+    """
+    log_prefix = "" if is_legacy else f"[{tmpl.key}] "
+
+    # Phase names: legacy stays unsuffixed so the stepper for a pre-multi
+    # app is byte-identical; multi-template apps get one ``PHASE:<key>``
+    # trio per template.
+    init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
+    validate_phase = PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
+    build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
+
+    build_lock = PackerBuildLock(project_id, image_name)
+    wait_announced = False
+    try:
+        while True:
+            # If the image already exists, skip the build and the lock.
+            exists, image_id = openstack_service.check_image_exists(image_name)
+            if exists:
+                task_logger.success(
+                    f"{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
+                    category=LogCategory.STATUS,
+                )
+                break
+
+            held = build_lock.acquire_or_wait()
+            if not held:
+                # Another worker is still building the same image. Surface
+                # this in the per-deployment log once so the frontend's
+                # live tail shows *something* during the 5-second poll
+                # cycles — without it the browser sees no events and looks
+                # frozen.
+                if not wait_announced:
+                    task_logger.info(
+                        f"{log_prefix}Another worker is currently building image '{image_name}'. Waiting…",
+                        category=LogCategory.STATUS,
+                    )
+                    wait_announced = True
+                # We slept inside acquire_or_wait; re-check Glance.
+                continue
+
+            # Re-check after acquiring: another worker may have finished its
+            # build between our last check and our lock acquisition.
+            exists, image_id = openstack_service.check_image_exists(image_name)
+            if exists:
+                task_logger.success(
+                    f"{log_prefix}Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
+                    category=LogCategory.STATUS,
+                )
+                break
+
+            task_logger.info(
+                f"{log_prefix}Image '{image_name}' does not exist. Building...",
+                category=LogCategory.OPERATION,
+            )
+
+            # Pick the right packer working directory: legacy uses
+            # ``packer/`` directly; multi uses ``packer/<key>/``. Template
+            # file name is always ``template.pkr.hcl`` relative to that
+            # directory.
+            packer_dir = os.path.join(repo_path, "packer") if is_legacy else os.path.join(repo_path, "packer", tmpl.key)
+            packer = PackerExecutor(
+                packer_dir,
+                env_vars=openstack_env,
+                output_callback=stream_line,
+            )
+
+            # Per-template Packer variables. Legacy shape is the flat
+            # ``user_vars["packer"][var_name]``; multi shape is nested
+            # ``user_vars["packer"][template_key][var_name]``.
+            if is_legacy:
+                user_packer = user_vars.get("packer", {})
+            else:
+                user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
+            packer_vars = {**user_packer}
+            packer_vars["image_name"] = image_name
+            packer_vars = encode_packer_vars(packer_vars)
+
+            task_logger.info(
+                f"{log_prefix}Packer variable keys",
+                category=LogCategory.OPERATION,
+                keys=list(packer_vars.keys()),
+                template=tmpl.key,
+                image_name=image_name,
+            )
+
+            phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
+            success, stdout, stderr = packer.init()
+            if not success:
+                if stdout:
+                    task_logger.command_output("packer_init_stdout", stdout, returncode=1)
+                if stderr:
+                    task_logger.command_output("packer_init_stderr", stderr, returncode=1)
+                raise Exception(f"{log_prefix}Packer init failed")
+
+            phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
+            success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
+            if not success:
+                raise Exception(f"{log_prefix}Packer validation failed: {stderr}")
+
+            phase_tracker.mark(
+                build_phase,
+                f"{log_prefix}Building image '{image_name}' (this may take minutes)",
+            )
+            success, output = packer.build("template.pkr.hcl", packer_vars)
+            if not success:
+                raise Exception(f"{log_prefix}Packer build failed: {output}")
+
+            task_logger.success(
+                f"{log_prefix}Image '{image_name}' built successfully",
+                category=LogCategory.STATUS,
+            )
+            break
+    except Exception as e:
+        raise Exception(f"Packer error: {str(e)}")
+    finally:
+        build_lock.release()
+
+
 @celery_app.task(bind=True, name="tasks.deploy_application")
 def deploy_application(
     self,
@@ -468,7 +655,7 @@ def deploy_application(
         app_git_link: Git repo URL
         release: Tag/Release to checkout
         user_vars: User variables for Packer/Terraform
-        teams: Teams mit User-Emails {"team_name": [{"email": "user@example.com"}]}
+        teams: Teams with user emails {"team_name": [{"email": "user@example.com"}]}
         openstack_envelope: Encrypted per-user OpenStack credential envelope
             shipped from the backend. Required for new deploys; the optional
             default exists only so older queued messages don't crash the
@@ -517,52 +704,14 @@ def deploy_application(
         teams = {}
 
     def collect_terraform_state():
-        """Snapshot terraform state for the task row.
-
-        With the pg backend the canonical state lives in Postgres; this
-        snapshot is best-effort and used for debugging only. Falls back
-        to reading the local `terraform.tfstate` file for legacy/test
-        modes that don't configure a remote backend.
-        """
-        if not (terraform_dir and os.path.exists(terraform_dir)):
-            return None
-        try:
-            terraform = TerraformExecutor(
-                terraform_dir,
-                env_vars=openstack_env,
-                backend_conn_str=tfstate_conn_str,
-                backend_schema_name=tfstate_schema,
-            )
-            pulled = terraform.state_pull()
-            if pulled:
-                return pulled
-        except Exception as e:
-            task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
-
-        # Legacy fallback — only relevant when no pg backend is configured.
-        tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
-        if os.path.exists(tfstate_path):
-            try:
-                with open(tfstate_path) as f:
-                    return f.read()
-            except Exception as e:
-                task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
-        return None
+        return collect_terraform_state_helper(
+            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, local_fallback=True
+        )
 
     def collect_terraform_outputs():
-        """Try to collect terraform outputs even on partial success"""
-        if terraform_dir and os.path.exists(terraform_dir):
-            try:
-                terraform = TerraformExecutor(
-                    terraform_dir,
-                    env_vars=openstack_env,
-                    backend_conn_str=tfstate_conn_str,
-                    backend_schema_name=tfstate_schema,
-                )
-                return terraform.output()
-            except Exception as e:
-                task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
-        return None
+        return collect_terraform_outputs_helper(
+            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
+        )
 
     try:
         phase_tracker.mark(PHASE_STARTING, "Starting deployment")
@@ -594,8 +743,6 @@ def deploy_application(
 
             # Get commit info
             try:
-                import git
-
                 repo = git.Repo(repo_path)
                 commit = repo.head.commit
                 commit_info = {
@@ -682,126 +829,19 @@ def deploy_application(
             is_legacy = len(templates) == 1 and templates[0].key == "default"
 
             for tmpl in templates:
-                image_name = image_names[tmpl.key]
-                log_prefix = "" if is_legacy else f"[{tmpl.key}] "
-
-                # Phase names: legacy stays unsuffixed so the stepper
-                # for a pre-multi app is byte-identical; multi-template
-                # apps get one ``PHASE:<key>`` trio per template.
-                init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
-                validate_phase = PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
-                build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
-
-                build_lock = PackerBuildLock(project_id, image_name)
-                wait_announced = False
-                try:
-                    while True:
-                        # If the image already exists, skip the build and the lock.
-                        exists, image_id = openstack_service.check_image_exists(image_name)
-                        if exists:
-                            task_logger.success(
-                                f"{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
-                                category=LogCategory.STATUS,
-                            )
-                            break
-
-                        held = build_lock.acquire_or_wait()
-                        if not held:
-                            # Another worker is still building the same image.
-                            # Surface this in the per-deployment log once so
-                            # the frontend's live tail shows *something*
-                            # during the 5-second poll cycles — without it the
-                            # browser sees no events and looks frozen.
-                            if not wait_announced:
-                                task_logger.info(
-                                    f"{log_prefix}Another worker is currently building image '{image_name}'. Waiting…",
-                                    category=LogCategory.STATUS,
-                                )
-                                wait_announced = True
-                            # We slept inside acquire_or_wait; re-check Glance.
-                            continue
-
-                        # Re-check after acquiring: another worker may have
-                        # finished its build between our last check and our lock
-                        # acquisition.
-                        exists, image_id = openstack_service.check_image_exists(image_name)
-                        if exists:
-                            task_logger.success(
-                                f"{log_prefix}Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
-                                category=LogCategory.STATUS,
-                            )
-                            break
-
-                        task_logger.info(
-                            f"{log_prefix}Image '{image_name}' does not exist. Building...",
-                            category=LogCategory.OPERATION,
-                        )
-
-                        # Pick the right packer working directory: legacy
-                        # uses ``packer/`` directly; multi uses
-                        # ``packer/<key>/``. Template file name is always
-                        # ``template.pkr.hcl`` relative to that directory.
-                        packer_dir = (
-                            os.path.join(repo_path, "packer")
-                            if is_legacy
-                            else os.path.join(repo_path, "packer", tmpl.key)
-                        )
-                        packer = PackerExecutor(
-                            packer_dir,
-                            env_vars=openstack_env,
-                            output_callback=_stream_line,
-                        )
-
-                        # Per-template Packer variables. Legacy shape is
-                        # the flat ``user_vars["packer"][var_name]``;
-                        # multi shape is nested ``user_vars["packer"][template_key][var_name]``.
-                        if is_legacy:
-                            user_packer = user_vars.get("packer", {})
-                        else:
-                            user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
-                        packer_vars = {**user_packer}
-                        packer_vars["image_name"] = image_name
-                        packer_vars = encode_packer_vars(packer_vars)
-
-                        task_logger.info(
-                            f"{log_prefix}Packer variable keys",
-                            category=LogCategory.OPERATION,
-                            keys=list(packer_vars.keys()),
-                            template=tmpl.key,
-                            image_name=image_name,
-                        )
-
-                        phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
-                        success, stdout, stderr = packer.init()
-                        if not success:
-                            if stdout:
-                                task_logger.command_output("packer_init_stdout", stdout, returncode=1)
-                            if stderr:
-                                task_logger.command_output("packer_init_stderr", stderr, returncode=1)
-                            raise Exception(f"{log_prefix}Packer init failed")
-
-                        phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
-                        success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
-                        if not success:
-                            raise Exception(f"{log_prefix}Packer validation failed: {stderr}")
-
-                        phase_tracker.mark(
-                            build_phase,
-                            f"{log_prefix}Building image '{image_name}' (this may take minutes)",
-                        )
-                        success, output = packer.build("template.pkr.hcl", packer_vars)
-                        if not success:
-                            raise Exception(f"{log_prefix}Packer build failed: {output}")
-
-                        task_logger.success(
-                            f"{log_prefix}Image '{image_name}' built successfully",
-                            category=LogCategory.STATUS,
-                        )
-                        break
-                except Exception as e:
-                    raise Exception(f"Packer error: {str(e)}")
-                finally:
-                    build_lock.release()
+                _build_one_packer_image(
+                    tmpl,
+                    image_name=image_names[tmpl.key],
+                    is_legacy=is_legacy,
+                    openstack_service=openstack_service,
+                    project_id=project_id,
+                    repo_path=repo_path,
+                    openstack_env=openstack_env,
+                    stream_line=_stream_line,
+                    user_vars=user_vars,
+                    phase_tracker=phase_tracker,
+                    task_logger=task_logger,
+                )
 
         # Phase 4: Terraform
         terraform_dir = os.path.join(repo_path, "terraform")
@@ -1072,26 +1112,9 @@ def destroy_deployment(
         task_logger.tool_output_line(tool, line)
 
     def collect_terraform_state():
-        """Snapshot the post-destroy state for the task row.
-
-        Same shape as in ``deploy_application``. After a successful
-        destroy this should report ``resources: []`` — handy for
-        debugging if the DB row claims destroyed but Glance still shows
-        servers.
-        """
-        if not (terraform_dir and os.path.exists(terraform_dir)):
-            return None
-        try:
-            terraform = TerraformExecutor(
-                terraform_dir,
-                env_vars=openstack_env,
-                backend_conn_str=tfstate_conn_str,
-                backend_schema_name=tfstate_schema,
-            )
-            return terraform.state_pull()
-        except Exception as e:
-            task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
-            return None
+        return collect_terraform_state_helper(
+            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
+        )
 
     try:
         phase_tracker.mark(PHASE_STARTING, "Starting destroy")
@@ -1120,9 +1143,7 @@ def destroy_deployment(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                import git as _git
-
-                repo = _git.Repo(repo_path)
+                repo = git.Repo(repo_path)
                 commit = repo.head.commit
                 commit_info = {
                     "hash": commit.hexsha,
@@ -1825,39 +1846,14 @@ def redeploy_resource(
         task_logger.tool_output_line(tool, line)
 
     def collect_terraform_state():
-        """Snapshot the post-apply state for the task row.
-
-        Same shape as the deploy/destroy snapshot. We re-run the pull
-        from the pg backend so the row reflects what terraform thinks
-        is canonical, not what was true at the start of the task.
-        """
-        if not (terraform_dir and os.path.exists(terraform_dir)):
-            return None
-        try:
-            terraform = TerraformExecutor(
-                terraform_dir,
-                env_vars=openstack_env,
-                backend_conn_str=tfstate_conn_str,
-                backend_schema_name=tfstate_schema,
-            )
-            return terraform.state_pull()
-        except Exception as e:
-            task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
-            return None
+        return collect_terraform_state_helper(
+            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
+        )
 
     def collect_terraform_outputs():
-        if terraform_dir and os.path.exists(terraform_dir):
-            try:
-                terraform = TerraformExecutor(
-                    terraform_dir,
-                    env_vars=openstack_env,
-                    backend_conn_str=tfstate_conn_str,
-                    backend_schema_name=tfstate_schema,
-                )
-                return terraform.output()
-            except Exception as e:
-                task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
-        return None
+        return collect_terraform_outputs_helper(
+            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
+        )
 
     try:
         # Validate the address shape before we do any work. Backend
@@ -1894,9 +1890,7 @@ def redeploy_resource(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                import git as _git
-
-                repo = _git.Repo(repo_path)
+                repo = git.Repo(repo_path)
                 commit = repo.head.commit
                 commit_info = {
                     "hash": commit.hexsha,

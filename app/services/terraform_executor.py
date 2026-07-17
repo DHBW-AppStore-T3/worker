@@ -247,7 +247,16 @@ class TerraformExecutor:
         """Run terraform plan."""
         logger.operation_start("terraform_plan", var_file=var_file, var_count=len(variables or {}))
         try:
-            cmd = [self.terraform_path, "plan", "-input=false"]
+            # ``-lock=false``: each deployment has its own pg schema (see
+            # ``_tfstate_schema_name`` in the worker), so state is isolated
+            # per deployment. Otherwise the shared ``postgres-tfstate`` DB's
+            # state locking would serialize UNRELATED deployments and make
+            # concurrent deletes/applies fail with "Error acquiring the state
+            # lock". Real concurrency on the SAME state is already prevented
+            # by the backend (``acquire_deployment_xact_lock`` + partial
+            # unique index on active tasks per deployment), so disabling the
+            # lock here is safe.
+            cmd = [self.terraform_path, "plan", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -309,7 +318,10 @@ class TerraformExecutor:
             replace_count=len(replace or []),
         )
         try:
-            cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false"]
+            # ``-lock=false``: siehe Begründung in ``plan()`` — per-Deployment-
+            # Schema isoliert den State, das geteilte pg-Lock würde nur
+            # unzusammenhängende Deployments serialisieren.
+            cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -349,7 +361,11 @@ class TerraformExecutor:
         """Run terraform destroy."""
         logger.operation_start("terraform_destroy", var_file=var_file, var_count=len(variables or {}))
         try:
-            cmd = [self.terraform_path, "destroy", "-auto-approve", "-input=false"]
+            # ``-lock=false``: siehe Begründung in ``plan()``. Gerade der
+            # Destroy-Pfad ist der Auslöser des Bugs — gleichzeitiges Löschen
+            # mehrerer Deployments lief sonst in „Error acquiring the state
+            # lock" gegen die geteilte ``postgres-tfstate``-DB.
+            cmd = [self.terraform_path, "destroy", "-auto-approve", "-input=false", "-lock=false"]
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:

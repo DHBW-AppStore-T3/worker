@@ -123,11 +123,11 @@ def _scalar_or_str(value: Any) -> Any:
     ``json`` module for portability, so we down-cast unknown types to their
     repr.
     """
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str | int | float | bool) or value is None:
         return value
     if isinstance(value, dict):
         return {k: _scalar_or_str(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_scalar_or_str(v) for v in value]
     return str(value)
 

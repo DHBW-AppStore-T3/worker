@@ -93,7 +93,7 @@ class PackerExecutor:
             cmd = [self.packer_path, "validate"]
             if variables:
                 for key, value in variables.items():
-                    value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+                    value_str = json.dumps(value) if isinstance(value, list | dict) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
             cmd.append(".")
 
@@ -140,7 +140,7 @@ class PackerExecutor:
 
             if variables:
                 for key, value in variables.items():
-                    value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+                    value_str = json.dumps(value) if isinstance(value, list | dict) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
             cmd.append(".")
 

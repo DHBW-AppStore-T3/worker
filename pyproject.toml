@@ -5,7 +5,7 @@ description = "Celery Worker für Click-n-Deploy"
 license = "Apache-2.0"
 package-mode = false
 authors = [
-    "Dein Name <dein@email.de>"
+    "Your Name <your.email@example.com>"
 ]
 keywords = ["celery", "redis", "terraform", "packer", "git", "worker"]
 classifiers = [
@@ -88,7 +88,6 @@ ignore = [
     "E501",   # line too long (handled by black)
     "B008",   # function calls in argument defaults
     "B904",   # raise from (too strict for existing code)
-    "UP038",  # isinstance union (Python 3.10+ syntax)
     "N818",   # exception naming (existing code)
 ]
 

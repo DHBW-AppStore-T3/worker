@@ -346,7 +346,10 @@ class TestPlan:
         ok, _, _ = ex.plan()
         assert ok is True
         cmd = stream.call_args.args[0]
-        assert cmd == [ex.terraform_path, "plan", "-input=false"]
+        # ``-lock=false``: per-Deployment-Schema isoliert den State, das
+        # geteilte pg-Lock würde sonst unzusammenhängende Deployments
+        # serialisieren (siehe TerraformExecutor.plan).
+        assert cmd == [ex.terraform_path, "plan", "-input=false", "-lock=false"]
         assert stream.call_args.kwargs["timeout"] == 300
 
     def test_plan_with_var_file_and_variables(self, mocker, tmp_path):
@@ -390,7 +393,7 @@ class TestApply:
         ok, _, _ = ex.apply()
         assert ok is True
         cmd = stream.call_args.args[0]
-        assert cmd == [ex.terraform_path, "apply", "-auto-approve", "-input=false"]
+        assert cmd == [ex.terraform_path, "apply", "-auto-approve", "-input=false", "-lock=false"]
         assert stream.call_args.kwargs["timeout"] == 1800
 
     def test_apply_with_targets_and_replaces(self, mocker, tmp_path):
@@ -443,7 +446,7 @@ class TestDestroy:
         ok, _, _ = ex.destroy()
         assert ok is True
         cmd = stream.call_args.args[0]
-        assert cmd == [ex.terraform_path, "destroy", "-auto-approve", "-input=false"]
+        assert cmd == [ex.terraform_path, "destroy", "-auto-approve", "-input=false", "-lock=false"]
         assert stream.call_args.kwargs["timeout"] == 1800
 
     def test_destroy_with_var_file_and_variables(self, mocker, tmp_path):
