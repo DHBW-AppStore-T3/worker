@@ -41,9 +41,7 @@ Tests, Lint und Format laufen im Worker-Container — `make shell-worker` öffne
 
 ## Code-Struktur
 
-Der Code liegt in `app/`. Einstieg ist `tasks.py`: Celery ruft eine Task-Funktion
-auf, die die Services orchestriert — Repo klonen → (optional) Packer → Terraform →
-OpenStack. Jeder Service kapselt genau einen dieser Schritte.
+Der Code liegt in `app/`. Einstieg ist `tasks.py`: Celery ruft eine Task-Funktion auf, die die Services orchestriert — Repo klonen → (optional) Packer → Terraform → OpenStack. Jeder Service kapselt genau einen dieser Schritte.
 
 ```
 app/
@@ -54,8 +52,7 @@ app/
 └── utils/           # crypto (Envelope-Entschlüsselung), logger (strukturiertes Logging)
 ```
 
-**tasks.py** definiert fünf Celery-Tasks (nicht nur einen) — jeder orchestriert
-die Services für seinen Ablauf:
+**tasks.py** definiert fünf Celery-Tasks — jeder orchestriert die Services für seinen Ablauf:
 
 | Task | Zweck |
 |---|---|
@@ -65,8 +62,7 @@ die Services für seinen Ablauf:
 | `tasks.resume_deployment` | Pausierte VMs wieder starten |
 | `tasks.redeploy_resource` | Einzelne Ressource im Bestands-State neu ausrollen |
 
-Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch
-Celery zurück, damit das Backend sie dem User anzeigen kann.
+Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch Celery zurück, damit das Backend sie dem User anzeigen kann.
 
 **services/** — je ein Schritt der Pipeline:
 
