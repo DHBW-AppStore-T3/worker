@@ -357,8 +357,19 @@ class TerraformExecutor:
             logger.operation_end("terraform_apply", success=False)
             return False, "", str(e)
 
-    def destroy(self, var_file: str | None = None, variables: dict[str, Any] | None = None) -> tuple[bool, str, str]:
-        """Run terraform destroy."""
+    def destroy(
+        self,
+        var_file: str | None = None,
+        variables: dict[str, Any] | None = None,
+        refresh: bool = True,
+    ) -> tuple[bool, str, str]:
+        """Run terraform destroy.
+
+        ``refresh=False`` adds ``-refresh=false`` so Terraform tears down
+        purely from state without re-reading data sources. Only used as a
+        targeted fallback by the worker when a stale data source (e.g. a
+        Glance image deleted out-of-band) blocks the refresh-based destroy.
+        """
         logger.operation_start("terraform_destroy", var_file=var_file, var_count=len(variables or {}))
         try:
             # ``-lock=false``: siehe Begründung in ``plan()``. Gerade der
@@ -366,6 +377,8 @@ class TerraformExecutor:
             # mehrerer Deployments lief sonst in „Error acquiring the state
             # lock" gegen die geteilte ``postgres-tfstate``-DB.
             cmd = [self.terraform_path, "destroy", "-auto-approve", "-input=false", "-lock=false"]
+            if not refresh:
+                cmd.append("-refresh=false")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:

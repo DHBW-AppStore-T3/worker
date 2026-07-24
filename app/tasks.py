@@ -1232,6 +1232,22 @@ def destroy_deployment(
 
         phase_tracker.mark(PHASE_TERRAFORM_DESTROY, "Destroying resources")
         success, stdout, stderr = terraform.destroy(variables=terraform_vars)
+        # A data source (e.g. the Glance image lookup) is re-read on every
+        # destroy refresh. If that image/network was deleted out-of-band,
+        # the refresh fails with "Your query returned no results" before any
+        # managed resource is touched — even though the data source isn't
+        # needed to tear down ports/FIPs/VMs (their IDs already live in
+        # state). Retry once with -refresh=false so the teardown proceeds
+        # purely from state. Scoped to this exact error so genuine destroy
+        # failures still surface.
+        if not success and "Your query returned no results" in f"{stdout or ''}{stderr or ''}":
+            task_logger.warning(
+                "Destroy blocked by a stale data source (image/network deleted "
+                "out-of-band). Retrying with -refresh=false — resources are torn "
+                "down from state.",
+                category=LogCategory.WARNING,
+            )
+            success, stdout, stderr = terraform.destroy(variables=terraform_vars, refresh=False)
         if not success:
             if stdout:
                 task_logger.command_output("terraform_destroy_stdout", stdout, returncode=1)
