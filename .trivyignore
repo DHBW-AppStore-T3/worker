@@ -77,3 +77,8 @@ CVE-2026-27136
 CVE-2026-39821
 CVE-2026-42502
 CVE-2026-42506
+
+# google.golang.org/grpc (fixed in 1.82.1): gRPC-Go xDS RBAC / HTTP/2
+# advisory. Vendored into Packer and Terraform; available once HashiCorp
+# rebuilds against the patched grpc. Nothing to fix on our side.
+GHSA-hrxh-6v49-42gf
