@@ -39,6 +39,43 @@ Tests, Lint und Format laufen im Worker-Container — `make shell-worker` öffne
 - **SQLAlchemy 2.0** nur lesend gegen die App-DB
 - **pytest** mit `unit` und `integration` als Markern
 
+## Code-Struktur
+
+Der Code liegt in `app/`. Einstieg ist `tasks.py`: Celery ruft eine Task-Funktion auf, die die Services orchestriert — Repo klonen → (optional) Packer → Terraform → OpenStack. Jeder Service kapselt genau einen dieser Schritte.
+
+```
+app/
+├── celery_app.py    # Celery-Instanz + Config (Broker, Result-Backend, Serializer)
+├── config.py        # Pydantic-Settings aus Env-Variablen
+├── tasks.py         # Die Celery-Tasks + Failure-Exception; orchestriert die Services
+├── services/        # Ein Service pro Deploy-Schritt (siehe unten)
+└── utils/           # crypto (Envelope-Entschlüsselung), logger (strukturiertes Logging)
+```
+
+**tasks.py** definiert fünf Celery-Tasks — jeder orchestriert die Services für seinen Ablauf:
+
+| Task | Zweck |
+|---|---|
+| `tasks.deploy_application` | Repo klonen → ggf. Packer-Image → `terraform apply` |
+| `tasks.destroy_deployment` | `terraform destroy` gegen denselben State |
+| `tasks.pause_deployment` | VMs stoppen (Daten bleiben) |
+| `tasks.resume_deployment` | Pausierte VMs wieder starten |
+| `tasks.redeploy_resource` | Einzelne Ressource im Bestands-State neu ausrollen |
+
+Die `Failure`-Exception in `tasks.py` trägt strukturierte Fehlerdaten durch Celery zurück, damit das Backend sie dem User anzeigen kann.
+
+**services/** — je ein Schritt der Pipeline:
+
+| Service | Zweck |
+|---|---|
+| `git_service` | Klont das App-Repo am Release-Tag (HTTPS + Token) |
+| `packer_discovery` | Findet Packer-Templates im geklonten Repo |
+| `packer_executor` | Führt Packer-Builds aus (strukturiertes Logging) |
+| `terraform_executor` | Führt `terraform init/plan/apply/destroy` aus (Postgres-Remote-State) |
+| `openstack_auth` | Materialisiert per-Task `clouds.yaml` aus dem verschlüsselten Credentials-Envelope |
+| `openstack_service` | OpenStack-Operationen, v.a. Image-Management |
+| `build_lock` | Redis-Lock um den Packer-Build, damit parallele Tasks nicht dasselbe Image doppelt bauen |
+
 ## Mehr
 
 - Architektur und projektübergreifende Doku: [.github-Repo](https://github.com/six7-click-n-deploy/.github)
