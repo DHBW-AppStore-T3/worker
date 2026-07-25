@@ -39,13 +39,9 @@ class Failure(Exception):
     string. The backend's celery event listener parses that JSON back via
     a ``Failure\\('<json>'\\)`` regex over the traceback.
 
-    Pickling notes: Celery pickles exceptions to ship them through
-    ``task-failed`` events. Because the public ``__init__`` takes six
-    positional arguments while ``args`` only has the JSON string,
-    ``Exception.__reduce__`` couldn't round-trip — Celery wrapped us in
-    ``UnpickleableExceptionWrapper``. We override ``__reduce__`` to
-    reconstruct via the dedicated classmethod ``_from_payload`` which
-    accepts the single JSON string directly.
+    ``__reduce__`` is overridden so pickle reconstructs the exception via
+    the ``_from_payload`` classmethod, which accepts the single JSON string
+    directly.
     """
 
     def __init__(
@@ -76,10 +72,9 @@ class Failure(Exception):
 
     @classmethod
     def _from_payload(cls, payload: str) -> "Failure":
-        """Reconstruct a Failure from the JSON payload it serialised itself into.
+        """Reconstruct a Failure from its serialised JSON payload.
 
-        Used by ``__reduce__`` so pickle can round-trip the exception
-        without re-wrapping the JSON in a second ``json.dumps`` call.
+        Used by ``__reduce__`` so pickle can round-trip the exception.
         """
         data = json.loads(payload)
         instance = cls.__new__(cls)
@@ -98,10 +93,7 @@ class Failure(Exception):
 
     def __repr__(self) -> str:
         # Pin the repr format that the backend's celery event listener
-        # relies on (regex ``Failure\('(.+)'\)``). Python's default repr
-        # for a single-arg exception already matches, but spelling it out
-        # makes the contract explicit and decouples us from interpreter
-        # changes that affect the default formatting.
+        # relies on (regex ``Failure\('(.+)'\)``).
         return f"Failure({self.args[0]!r})" if self.args else "Failure()"
 
     def to_dict(self) -> dict[str, Any]:
@@ -110,14 +102,6 @@ class Failure(Exception):
 
 
 # --- Variable encoding for Packer/Terraform CLI ----------------------------
-#
-# The previous helper (`flatten_vars_to_strings`) called `s.replace("\\", "")`
-# on every value, which silently destroyed escaped quotes inside JSON-encoded
-# nested structures (e.g. `users={"Team-1":[{"email":"foo"}]}`). HCL then
-# rejected the malformed value during `terraform plan`, but the failure
-# surfaced only as the opaque message "Terraform plan failed" because we did
-# not forward the plan's stderr. Both bugs are fixed here and at the call
-# sites below.
 
 
 def _looks_like_file_var_value(value: Any) -> bool:
@@ -131,18 +115,12 @@ def _looks_like_file_var_value(value: Any) -> bool:
     failure can drop ``@openstack:file:*``-marked variables before
     passing the var-set to ``terraform destroy``. Terraform
     validates *all* declared variables on every command — including
-    destroy — so a half-filled or apply-only file-var would
-    otherwise block the cleanup with the same schema error that
-    killed the deploy.
+    destroy — so an apply-only file-var would otherwise block the
+    cleanup with a schema error.
 
-    Strict signature: a slot must carry ``content_b64`` to qualify
-    as a file-var. Rows that survived an earlier
-    response-side-strip-then-persisted accident (metadata triplet
-    only, no bytes) are NOT auto-stripped here — they need a hand
-    cleanup. The strictness is intentional: a too-lenient detector
-    would silently drop legitimate non-file map variables that
-    happen to share the metadata keys, and the project decided to
-    only support the freshly-persisted contract going forward.
+    A slot must carry ``content_b64`` to qualify as a file-var; the
+    strictness avoids dropping legitimate non-file map variables that
+    happen to share the metadata keys.
     """
     if not isinstance(value, dict) or not value:
         return False
@@ -167,17 +145,11 @@ def _strip_file_vars(terraform_vars: dict[str, Any]) -> dict[str, Any]:
 def _scrub_nested_nones(value: Any) -> Any:
     """Recursively drop ``None`` entries from nested dicts/lists.
 
-    ``encode_terraform_vars`` historically only filtered ``None`` at the
-    top level, which left nested ``null`` values inside dicts/lists to
-    surface as literal HCL ``null`` after the JSON round-trip. That
-    works for variables whose HCL declaration allows ``null``, but
-    misbehaves when a buggy default (see Bug #7) or an upstream slot
-    value carries a stray ``None`` inside a ``map(list(string))`` slot
-    — Terraform then rejects the value with a type-mismatch error.
-
-    Defensive cleaner: dicts have their ``None``-valued keys removed,
-    lists have their ``None`` entries filtered out, and both are walked
-    recursively. Scalars (including bools) pass through untouched.
+    A stray ``None`` inside a ``map(list(string))`` slot would surface as
+    literal HCL ``null`` after the JSON round-trip and trip Terraform's
+    type check. Dicts have their ``None``-valued keys removed, lists have
+    their ``None`` entries filtered out, and both are walked recursively.
+    Scalars (including bools) pass through untouched.
     """
     if isinstance(value, dict):
         cleaned: dict[Any, Any] = {}
@@ -222,18 +194,10 @@ def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
 
     For HCL ``list(...)``-typed variables, we emit a JSON array literal
     (e.g. ``["NAT"]``) — that's the only form Packer accepts via ``-var``
-    for typed-list variables. The historical comma-joined form (``NAT``
-    for ``["NAT"]``) would be reinterpreted by Packer as an unquoted
-    identifier reference (→ "Variables may not be used here"), because
-    Packer parses each ``-var`` value as an HCL expression against the
-    declared type. JSON arrays happen to be valid HCL list literals, so
-    a single representation covers both syntaxes.
-
-    Earlier templates that declared list-y arguments as plain ``string``
-    and split them internally were migrated to typed ``list(string)`` in
-    v1.0.15 — there is no longer a code path that expects comma-joining.
-    The destructive backslash-stripping the old helper performed is
-    dropped; string values are passed through verbatim.
+    for typed-list variables, since Packer parses each ``-var`` value as
+    an HCL expression against the declared type. JSON arrays are valid
+    HCL list literals, so a single representation covers both syntaxes.
+    String values are passed through verbatim.
     """
     result: dict[str, str] = {}
     for k, v in d.items():
@@ -277,12 +241,9 @@ PHASE_TERRAFORM_APPLY = "TERRAFORM_APPLY"
 PHASE_OUTPUTS_AND_CLEANUP = "OUTPUTS_AND_CLEANUP"
 PHASE_TERRAFORM_DESTROY = "TERRAFORM_DESTROY"
 PHASE_CLEANUP = "CLEANUP"
-# Pause/resume share the deploy/destroy preamble (clone → clouds.yaml →
-# terraform init for the pg-backed state pull) but their hot phase is
-# a CLI-driven server stop/start, not a terraform apply or destroy.
-# Naming the phase distinctly so the frontend stepper renders an honest
-# label instead of reusing TERRAFORM_DESTROY for an action that doesn't
-# touch terraform at all.
+# Pause/resume share the deploy/destroy preamble but their hot phase is
+# a CLI-driven server stop/start, so they get distinct phase names rather
+# than reusing TERRAFORM_DESTROY.
 PHASE_SERVER_STOP = "SERVER_STOP"
 PHASE_SERVER_START = "SERVER_START"
 
@@ -319,15 +280,13 @@ def _phases_for_templates(templates: list[_PackerTemplate]) -> tuple[str, ...]:
     * One template with key ``"default"`` (legacy layout) →
       ``_PHASES_WITH_PACKER`` verbatim. The phase names stay
       ``PACKER_INIT`` / ``PACKER_VALIDATE`` / ``PACKER_BUILD`` with no
-      key suffix so a legacy app's stepper looks byte-identical to the
-      pre-discovery world.
+      key suffix.
     * Multi (any other shape) → one
       ``PACKER_INIT:<key>`` / ``PACKER_VALIDATE:<key>`` /
-      ``PACKER_BUILD:<key>`` trio per template, inserted in the same
-      position the original Packer phases occupied in
-      ``_PHASES_WITH_PACKER``. Templates are emitted in the order the
-      caller passes them in (discovery returns them sorted by key, so
-      the stepper order is deterministic).
+      ``PACKER_BUILD:<key>`` trio per template, inserted where the Packer
+      phases sit in ``_PHASES_WITH_PACKER``. Templates are emitted in the
+      order passed in (discovery returns them sorted by key, so the
+      stepper order is deterministic).
     """
     if not templates:
         return _PHASES_WITHOUT_PACKER
@@ -430,11 +389,9 @@ class _PhaseTracker:
             # update so the bar doesn't reset.
             self._logger.phase(phase_name)
             return
-        # Buffer the readable phase header AND emit the live progress event.
-        # Send the full phase-name sequence with every event so the UI can
-        # render every stepper slot with its real (template-key-suffixed)
-        # label immediately, instead of having to guess template keys
-        # from observation order.
+        # Buffer the readable phase header and emit the live progress event.
+        # The full phase-name sequence rides on every event so the UI can
+        # render each stepper slot with its real label immediately.
         self._logger.phase(phase_name)
         self._logger.progress(
             phase_name,
@@ -498,6 +455,75 @@ def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_
     return None
 
 
+def _extract_commit_info(repo_path: str) -> dict[str, Any]:
+    """Read the checked-out commit's metadata from a cloned repo.
+
+    Returns the dict shape persisted into the task result and the
+    ``Failure`` payload. Callers wrap this in their own try/except so a
+    repo without a readable HEAD degrades to a warning, not a hard fail.
+    """
+    repo = git.Repo(repo_path)
+    commit = repo.head.commit
+    return {
+        "hash": commit.hexsha,
+        "message": commit.message.strip(),
+        "author": str(commit.author),
+        "date": commit.committed_datetime.isoformat(),
+    }
+
+
+def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag: str) -> dict[str, str]:
+    """Reconstruct the per-template Glance image-name map.
+
+    Legacy single-template apps (or apps with no Packer at all) keep the
+    flat ``{"default": "<app_id>-<tag>"}`` shape; multi-image apps get one
+    ``<app_id>-<key>-<tag>`` entry per template. Used by destroy/redeploy,
+    which must name the same images the original deploy built so
+    Terraform's variable validation matches the pg-backend state.
+    """
+    if not templates or (len(templates) == 1 and templates[0].key == "default"):
+        return {"default": f"{app_id}-{image_tag}"}
+    return {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+
+
+def _apply_image_name_vars(target: dict[str, Any], image_names: dict[str, str], *, legacy: bool) -> None:
+    """Inject the image-name variable(s) into a Terraform var-set.
+
+    Legacy layout gets a single flat ``image_name``; multi-image apps get
+    one ``image_name_<key>`` per template. ``legacy`` is decided by the
+    caller so this stays a pure mapping of the existing branch bodies.
+    """
+    if legacy:
+        target["image_name"] = image_names["default"]
+    else:
+        for key, name in image_names.items():
+            target[f"image_name_{key}"] = name
+
+
+def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path: str | None, task_logger: Any) -> None:
+    """Best-effort teardown shared by every task's ``finally`` block.
+
+    Shreds the per-task clouds.yaml first (so the credential file is gone
+    even if the repo cleanup below fails or hangs), then removes the
+    cloned repo. Both steps swallow their own errors as warnings so the
+    task's real result/exception is never masked by cleanup noise.
+    """
+    if clouds_config is not None:
+        try:
+            clouds_config.__exit__(None, None, None)
+        except Exception as e:
+            task_logger.warning(
+                f"Per-task clouds.yaml cleanup failed: {e}",
+                category=LogCategory.WARNING,
+            )
+    if repo_path:
+        try:
+            git_service.cleanup_repository(repo_path)
+            task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
+        except Exception as e:
+            task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
 def _build_one_packer_image(
     tmpl,
     *,
@@ -517,14 +543,12 @@ def _build_one_packer_image(
     Skips the build when the image already exists in Glance, and
     coordinates concurrent workers via ``PackerBuildLock`` (only one
     worker builds a given image; the others wait and reuse it). Raises
-    ``Exception("Packer error: ...")`` on any failure, matching the
-    previous inline loop body.
+    ``Exception("Packer error: ...")`` on any failure.
     """
     log_prefix = "" if is_legacy else f"[{tmpl.key}] "
 
-    # Phase names: legacy stays unsuffixed so the stepper for a pre-multi
-    # app is byte-identical; multi-template apps get one ``PHASE:<key>``
-    # trio per template.
+    # Phase names: legacy stays unsuffixed; multi-template apps get one
+    # ``PHASE:<key>`` trio per template.
     init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
     validate_phase = PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
     build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
@@ -743,22 +767,17 @@ def deploy_application(
 
             # Get commit info
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.resource_info(
                     "git_commit",
-                    commit.hexsha[:8],
-                    hash=commit.hexsha,
-                    message=commit.message.strip(),
-                    author=str(commit.author),
+                    commit_info["hash"][:8],
+                    hash=commit_info["hash"],
+                    message=commit_info["message"],
+                    author=commit_info["author"],
                 )
-                task_logger.success(f"Repository cloned at commit {commit.hexsha[:8]}", category=LogCategory.STATUS)
+                task_logger.success(
+                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
+                )
             except Exception as e:
                 task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
 
@@ -777,17 +796,11 @@ def deploy_application(
             category=LogCategory.STATUS,
         )
 
-        # Cache the built image by commit SHA, not by release tag.
-        # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
-        # silently serves stale images when the underlying commit changes. The
-        # short SHA is content-addressed: a new commit always misses the cache.
-        #
-        # Multi-image apps declare one Packer template per subdirectory
-        # under ``packer/<key>/``. Each gets its own cached image,
-        # named ``<app_id>-<key>-<tag>``. Legacy single-template apps
-        # (``packer/template.pkr.hcl``) keep the original
-        # ``<app_id>-<tag>`` shape so a redeploy of a pre-multi app
-        # hits the same Glance entry it built before.
+        # Cache the built image by commit SHA, not by release tag:
+        # `release` is often a moving ref (e.g. "main"), so the
+        # content-addressed short SHA ensures a new commit misses the cache.
+        # Multi-image apps name each template's image ``<app_id>-<key>-<tag>``;
+        # legacy single-template apps keep the flat ``<app_id>-<tag>`` shape.
         try:
             templates = _discover_packer_templates(repo_path)
         except PackerTemplateDiscoveryError as e:
@@ -873,35 +886,25 @@ def deploy_application(
                 raise Exception("Terraform init failed")
             task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
-            # Merge user_vars with teams for Terraform. Pass nested
-            # structures through encode_terraform_vars unchanged — the
-            # previous implementation stripped backslashes and corrupted
-            # escaped quotes inside the JSON for ``users``, which is what
-            # caused the silent ``terraform plan`` failure.
+            # Merge user_vars with teams for Terraform. Nested structures
+            # pass through encode_terraform_vars unchanged.
             terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
             # Per-template image-name injection. Legacy single-template
-            # apps see ``image_name`` (no key suffix) so a pre-multi
-            # template's HCL declaration keeps working unmodified.
-            # Multi-image apps declare one ``image_name_<key>`` per
-            # template and the worker fills them all here.
-            if len(templates) == 1 and templates[0].key == "default":
-                terraform_vars["image_name"] = image_names["default"]
-            else:
-                for key, name in image_names.items():
-                    terraform_vars[f"image_name_{key}"] = name
+            # apps see a flat ``image_name``; multi-image apps declare one
+            # ``image_name_<key>`` per template, filled here.
+            _apply_image_name_vars(
+                terraform_vars,
+                image_names,
+                legacy=len(templates) == 1 and templates[0].key == "default",
+            )
             if teams:
                 terraform_vars["users"] = teams
             terraform_vars = encode_terraform_vars(terraform_vars)
 
-            # File-upload variables can balloon the JSON-encoded value
-            # of a single -var to several hundred KB. The Nova metadata
-            # service caps cloud-init user_data at ~64 KB compressed
-            # (~150-200 KB raw) — beyond that, the boot fails after
-            # apply with an opaque message. We can't know exactly how
-            # the app's template fans the data into user_data, but a
-            # per-variable warning at >120 KB lands the heads-up in
-            # the worker log so the cause is visible without ssh-ing
-            # into a half-broken VM.
+            # File-upload variables can balloon a single -var to hundreds
+            # of KB. The Nova metadata service caps cloud-init user_data at
+            # ~64 KB compressed, so warn per-variable above 120 KB to land
+            # the heads-up in the worker log before a boot failure.
             _log_bytes_per_var_warn = 120 * 1024
             for _vname, _vstr in terraform_vars.items():
                 if isinstance(_vstr, str) and len(_vstr) > _log_bytes_per_var_warn:
@@ -967,20 +970,17 @@ def deploy_application(
                         "Running terraform destroy to clean up partially-applied resources",
                         category=LogCategory.OPERATION,
                     )
-                    # Rebuild the var-set from the raw user_vars,
-                    # this time without the file payloads. Destroy
-                    # doesn't need the cloud-init bytes but Terraform
-                    # still validates every declared var on every
-                    # run. A half-filled file-var carried over from
-                    # the broken apply would otherwise reject the
-                    # cleanup with the same schema error that killed
-                    # the apply, leaving orphan OpenStack resources.
+                    # Rebuild the var-set from the raw user_vars without
+                    # the file payloads. Destroy doesn't need the
+                    # cloud-init bytes, but Terraform validates every
+                    # declared var on every run, so an apply-only file-var
+                    # would otherwise reject the cleanup with a schema error.
                     cleanup_tf_vars = _strip_file_vars(user_vars.get("terraform") or {})
-                    if len(templates) == 1 and templates[0].key == "default":
-                        cleanup_tf_vars["image_name"] = image_names["default"]
-                    else:
-                        for key, name in image_names.items():
-                            cleanup_tf_vars[f"image_name_{key}"] = name
+                    _apply_image_name_vars(
+                        cleanup_tf_vars,
+                        image_names,
+                        legacy=len(templates) == 1 and templates[0].key == "default",
+                    )
                     if teams:
                         cleanup_tf_vars["users"] = teams
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
@@ -994,11 +994,8 @@ def deploy_application(
 
             raise Exception(f"Terraform error: {str(e)}")
 
-        # Final 100% — same phase name as the outputs phase, just with a
-        # closing message. The progress event for OUTPUTS_AND_CLEANUP was
-        # already emitted above when we collected outputs; this second mark
-        # would land on the same index, which is harmless on the bar but
-        # would buffer a duplicate phase header. So just log success.
+        # The OUTPUTS_AND_CLEANUP progress event was already emitted above;
+        # a second mark would land on the same index, so just log success.
         task_logger.success(f"Deployment {deployment_id} completed successfully", category=LogCategory.STATUS)
 
         # Log summary
@@ -1042,20 +1039,7 @@ def deploy_application(
     finally:
         # Shred the per-task clouds.yaml first so the credential file is gone
         # even if the repository cleanup below fails or hangs.
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 @celery_app.task(bind=True, name="tasks.destroy_deployment")
@@ -1143,22 +1127,17 @@ def destroy_deployment(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.resource_info(
                     "git_commit",
-                    commit.hexsha[:8],
-                    hash=commit.hexsha,
-                    message=commit.message.strip(),
-                    author=str(commit.author),
+                    commit_info["hash"][:8],
+                    hash=commit_info["hash"],
+                    message=commit_info["message"],
+                    author=commit_info["author"],
                 )
-                task_logger.success(f"Repository cloned at commit {commit.hexsha[:8]}", category=LogCategory.STATUS)
+                task_logger.success(
+                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
+                )
             except Exception as e:
                 task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
         except Exception as e:
@@ -1182,10 +1161,7 @@ def destroy_deployment(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            image_names = {"default": f"{app_id}-{image_tag}"}
-        else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        image_names = _build_image_names(templates, app_id, image_tag)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1195,19 +1171,17 @@ def destroy_deployment(
         # the var-set to terraform destroy. Files are only consumed
         # at apply-time (cloud-init write_files); destroy doesn't
         # need them, but Terraform validates every declared var on
-        # every run. A half-filled file-var carried over from a
-        # broken deploy would otherwise reject destroy with the same
-        # schema error that killed the deploy in the first place.
+        # every run.
         terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
         terraform_vars = _strip_file_vars(terraform_vars)
         # Inject the per-template image-name variables. Legacy single
         # template (or no Packer at all) keeps the flat ``image_name``;
         # multi-template apps get one ``image_name_<key>`` per template.
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            terraform_vars["image_name"] = image_names["default"]
-        else:
-            for key, name in image_names.items():
-                terraform_vars[f"image_name_{key}"] = name
+        _apply_image_name_vars(
+            terraform_vars,
+            image_names,
+            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+        )
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1235,11 +1209,9 @@ def destroy_deployment(
         # A data source (e.g. the Glance image lookup) is re-read on every
         # destroy refresh. If that image/network was deleted out-of-band,
         # the refresh fails with "Your query returned no results" before any
-        # managed resource is touched — even though the data source isn't
-        # needed to tear down ports/FIPs/VMs (their IDs already live in
-        # state). Retry once with -refresh=false so the teardown proceeds
-        # purely from state. Scoped to this exact error so genuine destroy
-        # failures still surface.
+        # managed resource is touched. Retry once with -refresh=false so the
+        # teardown proceeds purely from state. Scoped to this exact error so
+        # genuine destroy failures still surface.
         if not success and "Your query returned no results" in f"{stdout or ''}{stderr or ''}":
             task_logger.warning(
                 "Destroy blocked by a stale data source (image/network deleted "
@@ -1289,20 +1261,7 @@ def destroy_deployment(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 # ----------------------------------------------------------------
@@ -1310,23 +1269,12 @@ def destroy_deployment(
 # ----------------------------------------------------------------
 #
 # Both tasks share the destroy preamble (git clone at the same release
-# tag → per-task clouds.yaml → terraform init pointed at the
-# pg backend) so we can pull the canonical terraform state and read
-# back which compute instances belong to this deployment. The hot
-# phase is then a CLI-driven stop/start loop — terraform itself is
-# untouched, the state file is left as-is, and the next deploy/destroy
-# can resume from exactly the same point.
-#
-# Why state pull and not server tagging?
-#   * No app template needs to be modified — the template's existing
-#     ``openstack_compute_instance_v2`` resources are the source of
-#     truth. Tag-based discovery would require every app to set a
-#     specific tag, easy to forget.
-#   * The pg backend already holds the canonical state, so the pull
-#     is local-Postgres-fast.
-#
-# CLI idempotency means the loop can re-run on retry without us
-# tracking which servers already stopped/started.
+# tag → per-task clouds.yaml → terraform init pointed at the pg backend)
+# so we can pull the canonical terraform state and read back which
+# compute instances belong to this deployment. The hot phase is a
+# CLI-driven stop/start loop; terraform state is left untouched. Server
+# discovery goes through the state (not tags) so no app template needs
+# to opt in, and CLI idempotency lets the loop re-run safely on retry.
 
 
 def _extract_compute_instance_ids(state_json: str | None) -> list[str]:
@@ -1569,20 +1517,7 @@ def _run_compute_lifecycle(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 @celery_app.task(bind=True, name="tasks.pause_deployment")
@@ -1656,22 +1591,11 @@ def resume_deployment(
 # ----------------------------------------------------------------
 #
 # Replace exactly one compute instance via
-# ``terraform apply -replace=<addr> -target=<addr>``. Everything else
-# in the deployment stays untouched — the rest of the team VMs keep
-# running, networks/SGs/FIPs persist. Conceptually a destroy+create
-# of a single resource, surfaced to the user as a "Redeploy" button.
-#
-# Trust model:
-#   * The address must already exist in the cached TF state — the
-#     backend enforces this BEFORE dispatch (see
-#     ``redeploy_deployment_resource`` in
-#     ``backend/app/routers/deployments.py``), but we double-check
-#     the address shape here as defense in depth. Two CLI flags
-#     (``-target`` / ``-replace``) take the address verbatim; subprocess
-#     argv isolation means the shell can't interpret meta-characters,
-#     but a malformed address would still confuse terraform itself.
-#   * Same per-task clouds.yaml + pg backend schema as deploy/destroy,
-#     so the apply sees the same state file.
+# ``terraform apply -replace=<addr> -target=<addr>``. Everything else in
+# the deployment stays untouched. The backend whitelists the address
+# against the cached TF state before dispatch; we re-check the address
+# shape here as defense in depth. Same per-task clouds.yaml + pg backend
+# schema as deploy/destroy, so the apply sees the same state file.
 
 _REDEPLOY_ADDRESS_RE = re.compile(
     r"""^
@@ -1906,16 +1830,9 @@ def redeploy_resource(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.success(
-                    f"Repository cloned at commit {commit.hexsha[:8]}",
+                    f"Repository cloned at commit {commit_info['hash'][:8]}",
                     category=LogCategory.STATUS,
                 )
             except Exception as e:
@@ -1940,40 +1857,31 @@ def redeploy_resource(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            image_names = {"default": f"{app_id}-{image_tag}"}
-        else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        image_names = _build_image_names(templates, app_id, image_tag)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
 
-        # Build the terraform var-set exactly like the original deploy
-        # did. We KEEP file variables here: ``terraform apply -replace``
-        # destroys the targeted VM and recreates it, so cloud-init runs
-        # fresh and needs the original ``write_files`` payload —
-        # otherwise the replaced VM comes back empty (no assignment
-        # files, no /etc/profile.d snippets, …) even though users and
-        # passwords from the rendered user_data are preserved.
-        #
-        # The backend already pre-filters these vars at dispatch time
-        # for non-recreating lifecycles (destroy/pause/resume) — see
+        # Build the terraform var-set like the original deploy. We KEEP
+        # file variables here: ``terraform apply -replace`` recreates the
+        # targeted VM, so cloud-init runs fresh and needs the original
+        # ``write_files`` payload. The backend pre-filters these vars for
+        # non-recreating lifecycles (destroy/pause/resume) — see
         # ``_dispatch_lifecycle_task`` in backend/app/routers/deployments.py.
         terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
-        # Bug #9: the original deploy's persisted ``user_vars`` were
-        # keyed on the roster at deploy time. Membership may have
-        # shifted since (team renames, members added/removed); ship
-        # the apply only the slots that still match the *current*
-        # roster so terraform doesn't choke on orphan keys.
+        # The persisted ``user_vars`` were keyed on the roster at deploy
+        # time. Membership may have shifted since (team renames, members
+        # added/removed); ship the apply only the slots that still match
+        # the current roster so terraform doesn't choke on orphan keys.
         terraform_vars = _reconcile_scoped_vars_to_roster(terraform_vars, teams, task_logger)
         # Inject the per-template image-name variables (legacy: flat
         # ``image_name``; multi: one ``image_name_<key>`` per template).
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            terraform_vars["image_name"] = image_names["default"]
-        else:
-            for key, name in image_names.items():
-                terraform_vars[f"image_name_{key}"] = name
+        _apply_image_name_vars(
+            terraform_vars,
+            image_names,
+            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+        )
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -2000,12 +1908,10 @@ def redeploy_resource(
             PHASE_TERRAFORM_APPLY,
             f"Applying replace for {resource_address}",
         )
-        # The two flags work together: ``-replace`` taints the single
-        # resource so terraform plans a destroy+create on it,
-        # ``-target`` scopes the apply to that resource (and anything
-        # it depends on). Without ``-target`` the apply would touch
-        # the whole deployment graph; without ``-replace`` it would
-        # often detect "no changes" and short-circuit.
+        # ``-replace`` taints the single resource so terraform plans a
+        # destroy+create on it; ``-target`` scopes the apply to that
+        # resource (and its dependencies) so the rest of the graph is
+        # untouched.
         success, stdout, stderr = terraform.apply(
             variables=terraform_vars,
             targets=[resource_address],
@@ -2054,17 +1960,4 @@ def redeploy_resource(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)

@@ -5,10 +5,8 @@ Three concerns are kept separate here:
 * **Buffer** — every log entry is appended to an in-memory list so the worker
   task can hand the whole transcript back to the backend on completion.
 * **Console sink** — entries are also rendered once to the standard Python
-  logger so they appear in the worker container's stdout. The earlier version
-  re-rendered each entry into both the buffer and the Python logger from
-  inside the same method; the rewrite moves rendering into a dedicated sink
-  to make the double-printing obvious if it ever comes back.
+  logger so they appear in the worker container's stdout. Rendering lives in
+  a dedicated sink so the buffer and the Python logger stay independent.
 * **Event sink** — an optional callable that ships every entry to a
   downstream consumer. The deploy task wires the Celery event bus here so
   the backend's listener can stream entries to the browser.
@@ -192,8 +190,8 @@ class LogEntry:
         if self.truncated:
             d["truncated"] = True
         if self.extra:
-            # Merge into top-level for backwards compatibility with the old
-            # consumer code that flat-merged context into the entry dict.
+            # Merge into top-level so consumers see context fields flat on
+            # the entry dict.
             for k, v in self.extra.items():
                 if k not in d:
                     d[k] = v
@@ -273,11 +271,7 @@ also turns into a ``task-log`` event on the bus. ``None`` disables it.
 
 
 class StructuredLogger:
-    """Buffer + console + optional event-bus emitter for one deployment task.
-
-    Public method shape mirrors the previous logger so existing call sites in
-    ``tasks.py`` and the executors compile unchanged.
-    """
+    """Buffer + console + optional event-bus emitter for one deployment task."""
 
     LOG_EVENT_NAME = "task-log"
     PROGRESS_EVENT_NAME = "task-progress"
@@ -318,13 +312,9 @@ class StructuredLogger:
         if emit_event and self._event_emitter is not None:
             try:
                 # Celery's EventReceiver injects its own ``timestamp``
-                # field (Unix-time float) into every event and runs
-                # arithmetic on it; if our payload also carries
-                # ``timestamp`` (as an ISO string from LogEntry.to_dict)
-                # the receiver crashes with ``TypeError: unsupported
-                # operand type(s) for -: 'str' and 'int'``. Pop it here
-                # and re-key as ``iso_timestamp`` so consumers still
-                # have the human-readable form.
+                # field (Unix-time float) and does arithmetic on it, so a
+                # payload carrying an ISO-string ``timestamp`` would crash
+                # it. Re-key ours as ``iso_timestamp``.
                 payload = entry.to_dict()
                 if "timestamp" in payload:
                     payload["iso_timestamp"] = payload.pop("timestamp")
@@ -345,20 +335,16 @@ class StructuredLogger:
         **fields: Any,
     ) -> LogEntry:
         # ``message`` is positional-only (note the ``/``) so a context
-        # kwarg literally named ``message`` — e.g. a git commit message
-        # passed via ``resource_info(..., message=commit.message)`` —
-        # ends up in ``**fields`` rather than colliding with the named
-        # parameter. The kwarg is then routed into ``extra`` below.
+        # kwarg literally named ``message`` (e.g. a git commit message via
+        # ``resource_info(..., message=...)``) lands in ``**fields`` rather
+        # than colliding with the parameter.
         cleaned = clean_text(str(message))
         truncated = False
         if len(cleaned) > max_chars:
             cleaned = truncate_text(cleaned, max_lines=50, max_chars=max_chars)
             truncated = True
         # Slot keys are recognised dataclass fields. Anything else lands
-        # in ``extra``. ``message`` is allowed to appear as a context
-        # kwarg here without overwriting the entry's main message — it
-        # just becomes another ``extra`` entry, renamed to avoid
-        # confusion with the top-level field once serialised.
+        # in ``extra``.
         slot_keys = {
             "operation",
             "duration_ms",
@@ -436,26 +422,18 @@ class StructuredLogger:
     ) -> None:
         """Send a progress update without buffering a per-step transcript entry.
 
-        The buffered transcript shouldn't grow by 11 progress markers per
-        deploy — those are noise once the run is done. We still emit the
-        Celery custom event so the listener can update the DB and the UI.
+        The buffered transcript shouldn't grow by a progress marker per
+        step; we still emit the Celery custom event so the listener can
+        update the DB and the UI.
 
-        ``phase_names`` is the full ordered list of phases for this task
-        (e.g. ``("STARTING", "OPENSTACK_SETUP", ..., "PACKER_BUILD:database",
-        "PACKER_INIT:webserver", ...)`` for a multi-image deploy). When
-        provided, the UI can render every stepper slot with its real
-        label immediately, without having to wait for the worker to
-        traverse each phase or to guess template keys from observation
-        order. The payload is small (< 1 KB even for 20+ phases) and is
-        safe to repeat on every progress event — the listener just
-        overwrites its cached copy.
+        ``phase_names`` is the full ordered list of phases for this task.
+        When provided, the UI can render every stepper slot with its real
+        label immediately. The payload is small and safe to repeat on
+        every event — the listener overwrites its cached copy.
 
-        Important: do NOT put a ``timestamp`` field in the payload. Celery
-        injects one itself (as a Unix-time float) and uses it in
-        ``adjust_timestamp`` math; if we override it with an ISO string
-        the EventReceiver crashes with ``TypeError: unsupported operand
-        type(s) for -: 'str' and 'int'``. Pass the ISO time as
-        ``iso_timestamp`` if it's needed downstream.
+        Do NOT put a ``timestamp`` field in the payload: Celery injects one
+        itself (as a Unix-time float) and would crash on an ISO string.
+        Pass the ISO time as ``iso_timestamp`` if needed downstream.
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
