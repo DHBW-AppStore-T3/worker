@@ -455,6 +455,75 @@ def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_
     return None
 
 
+def _extract_commit_info(repo_path: str) -> dict[str, Any]:
+    """Read the checked-out commit's metadata from a cloned repo.
+
+    Returns the dict shape persisted into the task result and the
+    ``Failure`` payload. Callers wrap this in their own try/except so a
+    repo without a readable HEAD degrades to a warning, not a hard fail.
+    """
+    repo = git.Repo(repo_path)
+    commit = repo.head.commit
+    return {
+        "hash": commit.hexsha,
+        "message": commit.message.strip(),
+        "author": str(commit.author),
+        "date": commit.committed_datetime.isoformat(),
+    }
+
+
+def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag: str) -> dict[str, str]:
+    """Reconstruct the per-template Glance image-name map.
+
+    Legacy single-template apps (or apps with no Packer at all) keep the
+    flat ``{"default": "<app_id>-<tag>"}`` shape; multi-image apps get one
+    ``<app_id>-<key>-<tag>`` entry per template. Used by destroy/redeploy,
+    which must name the same images the original deploy built so
+    Terraform's variable validation matches the pg-backend state.
+    """
+    if not templates or (len(templates) == 1 and templates[0].key == "default"):
+        return {"default": f"{app_id}-{image_tag}"}
+    return {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+
+
+def _apply_image_name_vars(target: dict[str, Any], image_names: dict[str, str], *, legacy: bool) -> None:
+    """Inject the image-name variable(s) into a Terraform var-set.
+
+    Legacy layout gets a single flat ``image_name``; multi-image apps get
+    one ``image_name_<key>`` per template. ``legacy`` is decided by the
+    caller so this stays a pure mapping of the existing branch bodies.
+    """
+    if legacy:
+        target["image_name"] = image_names["default"]
+    else:
+        for key, name in image_names.items():
+            target[f"image_name_{key}"] = name
+
+
+def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path: str | None, task_logger: Any) -> None:
+    """Best-effort teardown shared by every task's ``finally`` block.
+
+    Shreds the per-task clouds.yaml first (so the credential file is gone
+    even if the repo cleanup below fails or hangs), then removes the
+    cloned repo. Both steps swallow their own errors as warnings so the
+    task's real result/exception is never masked by cleanup noise.
+    """
+    if clouds_config is not None:
+        try:
+            clouds_config.__exit__(None, None, None)
+        except Exception as e:
+            task_logger.warning(
+                f"Per-task clouds.yaml cleanup failed: {e}",
+                category=LogCategory.WARNING,
+            )
+    if repo_path:
+        try:
+            git_service.cleanup_repository(repo_path)
+            task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
+        except Exception as e:
+            task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
 def _build_one_packer_image(
     tmpl,
     *,
@@ -698,22 +767,17 @@ def deploy_application(
 
             # Get commit info
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.resource_info(
                     "git_commit",
-                    commit.hexsha[:8],
-                    hash=commit.hexsha,
-                    message=commit.message.strip(),
-                    author=str(commit.author),
+                    commit_info["hash"][:8],
+                    hash=commit_info["hash"],
+                    message=commit_info["message"],
+                    author=commit_info["author"],
                 )
-                task_logger.success(f"Repository cloned at commit {commit.hexsha[:8]}", category=LogCategory.STATUS)
+                task_logger.success(
+                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
+                )
             except Exception as e:
                 task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
 
@@ -828,11 +892,11 @@ def deploy_application(
             # Per-template image-name injection. Legacy single-template
             # apps see a flat ``image_name``; multi-image apps declare one
             # ``image_name_<key>`` per template, filled here.
-            if len(templates) == 1 and templates[0].key == "default":
-                terraform_vars["image_name"] = image_names["default"]
-            else:
-                for key, name in image_names.items():
-                    terraform_vars[f"image_name_{key}"] = name
+            _apply_image_name_vars(
+                terraform_vars,
+                image_names,
+                legacy=len(templates) == 1 and templates[0].key == "default",
+            )
             if teams:
                 terraform_vars["users"] = teams
             terraform_vars = encode_terraform_vars(terraform_vars)
@@ -912,11 +976,11 @@ def deploy_application(
                     # declared var on every run, so an apply-only file-var
                     # would otherwise reject the cleanup with a schema error.
                     cleanup_tf_vars = _strip_file_vars(user_vars.get("terraform") or {})
-                    if len(templates) == 1 and templates[0].key == "default":
-                        cleanup_tf_vars["image_name"] = image_names["default"]
-                    else:
-                        for key, name in image_names.items():
-                            cleanup_tf_vars[f"image_name_{key}"] = name
+                    _apply_image_name_vars(
+                        cleanup_tf_vars,
+                        image_names,
+                        legacy=len(templates) == 1 and templates[0].key == "default",
+                    )
                     if teams:
                         cleanup_tf_vars["users"] = teams
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
@@ -975,20 +1039,7 @@ def deploy_application(
     finally:
         # Shred the per-task clouds.yaml first so the credential file is gone
         # even if the repository cleanup below fails or hangs.
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 @celery_app.task(bind=True, name="tasks.destroy_deployment")
@@ -1076,22 +1127,17 @@ def destroy_deployment(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.resource_info(
                     "git_commit",
-                    commit.hexsha[:8],
-                    hash=commit.hexsha,
-                    message=commit.message.strip(),
-                    author=str(commit.author),
+                    commit_info["hash"][:8],
+                    hash=commit_info["hash"],
+                    message=commit_info["message"],
+                    author=commit_info["author"],
                 )
-                task_logger.success(f"Repository cloned at commit {commit.hexsha[:8]}", category=LogCategory.STATUS)
+                task_logger.success(
+                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
+                )
             except Exception as e:
                 task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
         except Exception as e:
@@ -1115,10 +1161,7 @@ def destroy_deployment(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            image_names = {"default": f"{app_id}-{image_tag}"}
-        else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        image_names = _build_image_names(templates, app_id, image_tag)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1134,11 +1177,11 @@ def destroy_deployment(
         # Inject the per-template image-name variables. Legacy single
         # template (or no Packer at all) keeps the flat ``image_name``;
         # multi-template apps get one ``image_name_<key>`` per template.
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            terraform_vars["image_name"] = image_names["default"]
-        else:
-            for key, name in image_names.items():
-                terraform_vars[f"image_name_{key}"] = name
+        _apply_image_name_vars(
+            terraform_vars,
+            image_names,
+            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+        )
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1218,20 +1261,7 @@ def destroy_deployment(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 # ----------------------------------------------------------------
@@ -1487,20 +1517,7 @@ def _run_compute_lifecycle(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
 
 
 @celery_app.task(bind=True, name="tasks.pause_deployment")
@@ -1813,16 +1830,9 @@ def redeploy_resource(
         try:
             repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
-                repo = git.Repo(repo_path)
-                commit = repo.head.commit
-                commit_info = {
-                    "hash": commit.hexsha,
-                    "message": commit.message.strip(),
-                    "author": str(commit.author),
-                    "date": commit.committed_datetime.isoformat(),
-                }
+                commit_info = _extract_commit_info(repo_path)
                 task_logger.success(
-                    f"Repository cloned at commit {commit.hexsha[:8]}",
+                    f"Repository cloned at commit {commit_info['hash'][:8]}",
                     category=LogCategory.STATUS,
                 )
             except Exception as e:
@@ -1847,10 +1857,7 @@ def redeploy_resource(
             raise Exception(f"Packer template discovery failed: {e}")
 
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            image_names = {"default": f"{app_id}-{image_tag}"}
-        else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        image_names = _build_image_names(templates, app_id, image_tag)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1870,11 +1877,11 @@ def redeploy_resource(
         terraform_vars = _reconcile_scoped_vars_to_roster(terraform_vars, teams, task_logger)
         # Inject the per-template image-name variables (legacy: flat
         # ``image_name``; multi: one ``image_name_<key>`` per template).
-        if not templates or (len(templates) == 1 and templates[0].key == "default"):
-            terraform_vars["image_name"] = image_names["default"]
-        else:
-            for key, name in image_names.items():
-                terraform_vars[f"image_name_{key}"] = name
+        _apply_image_name_vars(
+            terraform_vars,
+            image_names,
+            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+        )
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1953,17 +1960,4 @@ def redeploy_resource(
         )
 
     finally:
-        if clouds_config is not None:
-            try:
-                clouds_config.__exit__(None, None, None)
-            except Exception as e:
-                task_logger.warning(
-                    f"Per-task clouds.yaml cleanup failed: {e}",
-                    category=LogCategory.WARNING,
-                )
-        if repo_path:
-            try:
-                git_service.cleanup_repository(repo_path)
-                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
-            except Exception as e:
-                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+        _cleanup_task_resources(clouds_config, repo_path, task_logger)
