@@ -8,10 +8,9 @@ Two layouts are supported:
        packer/variables.pkr.hcl
 
    Produces a single ``_PackerTemplate(key="default", ...)``. This is
-   what every existing app used before multi-image support, and the
-   discovery output keeps byte-identical with the pre-discovery world
-   for that case: same image name (``<app_id>-<tag>``), same lock key,
-   same phase names without any ``[key]`` suffix.
+   the layout used by single-image apps: same image name
+   (``<app_id>-<tag>``), same lock key, same phase names without any
+   ``[key]`` suffix.
 
 2. Multi-template subdirectory layout::
 
