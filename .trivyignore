@@ -108,3 +108,7 @@ CVE-2026-56865
 # False positive from Trivy scanning internal pip vendored SBOM metadata.
 CVE-2025-47273
 
+# GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.
+# Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
+GHSA-6v7p-g79w-8964
+
