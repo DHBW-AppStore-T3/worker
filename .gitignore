@@ -59,6 +59,10 @@ poetry.lock
 .coverage
 .coverage.*
 htmlcov/
+# Graphify
+graphify-out/cache/
+graphify-out/.graphify_python
+graphify-out/.graphify_root
 .pytest_cache/
 nosetests.xml
 coverage.xml
