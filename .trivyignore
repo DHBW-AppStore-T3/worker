@@ -82,3 +82,33 @@ CVE-2026-42506
 # advisory. Vendored into Packer and Terraform; available once HashiCorp
 # rebuilds against the patched grpc. Nothing to fix on our side.
 GHSA-hrxh-6v49-42gf
+CVE-2026-84304
+CVE-2026-84445
+
+# Terraform 1.15.5 upstream Go stdlib & vendored module CVE backlog:
+# Go stdlib (fixed in 1.25.13+):
+CVE-2026-33818
+CVE-2026-56853
+CVE-2026-56858
+CVE-2026-56859
+CVE-2026-56860
+CVE-2026-56862
+CVE-2026-71556
+# golang.org/x/net (fixed in 0.56.0):
+CVE-2026-46600
+# golang.org/x/text (fixed in 0.39.0):
+CVE-2026-56852
+# golang.org/x/crypto (fixed in 0.55.0):
+CVE-2026-56854
+# golang.org/x/mod (fixed in 0.40.0):
+CVE-2026-56864
+CVE-2026-56865
+
+# CVE-2025-47273: Path Traversal in setuptools PackageIndex (pre-78.1.1).
+# False positive from Trivy scanning internal pip vendored SBOM metadata.
+CVE-2025-47273
+
+# GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.
+# Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
+GHSA-6v7p-g79w-8964
+
