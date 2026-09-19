@@ -1,7 +1,5 @@
 # Worker
 
-[![Coverage](https://img.shields.io/endpoint?url=https://six7-click-n-deploy.github.io/worker/badge.json)](https://six7-click-n-deploy.github.io/worker/)
-
 Celery-Worker des App Stores. Konsumiert Deployment-Tasks aus RabbitMQ, klont das App-Repository, führt Packer + Terraform aus und provisioniert auf OpenStack.
 
 ## Setup
