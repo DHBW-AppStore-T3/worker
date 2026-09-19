@@ -8,3 +8,10 @@ Details zu diesem Repo:
 - Architektur: `claude_docs/architecture/`
 - Entscheidungen: `claude_docs/decisions/`
 - Debugging: `claude_docs/debugging/`
+
+## Lokale Befehle
+- Einzeltest (TDD): `poetry run pytest tests/unit/test_foo.py -v`
+- Unit-Tests: `poetry run pytest -m unit -v`
+- Integrationstests: `poetry run pytest -m integration -v`
+- Linting & Formatter: `poetry run ruff check . && poetry run black --check . && poetry run isort --check-only .`
+
