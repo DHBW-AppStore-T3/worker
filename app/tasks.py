@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,10 @@ from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_p
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
+
+# Field separator for the Packer content hash, so a path ending and a
+# file's first bytes can never run together into the same digest input.
+SEP = b"\0"
 
 
 def _tfstate_schema_name(deployment_id: str) -> str:
@@ -472,18 +477,72 @@ def _extract_commit_info(repo_path: str) -> dict[str, Any]:
     }
 
 
-def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag: str) -> dict[str, str]:
+def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str, Any], is_legacy: bool) -> str:
+    """Hash of everything that determines what a Packer build produces.
+
+    This is the image cache key. It deliberately covers two things and
+    nothing else:
+
+    * the entire ``packer/`` tree - templates, variables and scripts. The
+      whole directory rather than one template's subdirectory, so a change
+      to a shared ``_common/`` helper cannot be missed and quietly serve a
+      stale image.
+    * the resolved Packer variables *for this template*, minus the
+      injected ``image_name`` - that is derived from this hash, so
+      including it would be circular.
+
+    Keying on the git commit instead, as this used to, had two problems.
+    It rebuilt an 80 GB Windows image for a README or Terraform edit that
+    could not possibly change it, and - the real bug - it missed a change
+    to a Packer wizard variable: same commit, different
+    ``source_image_name``, same image name, stale image silently reused.
+    """
+    digest = hashlib.sha256()
+    packer_dir = os.path.join(repo_path, "packer")
+    for root, dirs, files in os.walk(packer_dir):
+        # Sorted so the hash never depends on filesystem ordering.
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, packer_dir).replace(os.sep, "/")
+            digest.update(rel.encode("utf-8") + SEP)
+            try:
+                with open(full, "rb") as handle:
+                    digest.update(handle.read())
+            except OSError:
+                # Fold the failure in rather than hashing as if the file
+                # were simply absent.
+                digest.update(b"<unreadable>")
+            digest.update(SEP)
+
+    if is_legacy:
+        template_vars = dict(user_vars.get("packer") or {})
+    else:
+        template_vars = dict((user_vars.get("packer") or {}).get(template_key) or {})
+    template_vars.pop("image_name", None)
+    digest.update(json.dumps(template_vars, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def _build_image_names(
+    templates: list[_PackerTemplate],
+    app_id: str,
+    repo_path: str,
+    user_vars: dict[str, Any],
+) -> dict[str, str]:
     """Reconstruct the per-template Glance image-name map.
 
     Legacy single-template apps (or apps with no Packer at all) keep the
-    flat ``{"default": "<app_id>-<tag>"}`` shape; multi-image apps get one
-    ``<app_id>-<key>-<tag>`` entry per template. Used by destroy/redeploy,
+    flat ``{"default": "<app_id>-<hash>"}`` shape; multi-image apps get one
+    ``<app_id>-<key>-<hash>`` entry per template. Used by destroy/redeploy,
     which must name the same images the original deploy built so
-    Terraform's variable validation matches the pg-backend state.
+    Terraform's variable validation matches the pg-backend state - they
+    clone the same tag and carry the same ``user_vars``, so the hash
+    recomputes identically.
     """
     if not templates or (len(templates) == 1 and templates[0].key == "default"):
-        return {"default": f"{app_id}-{image_tag}"}
-    return {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        return {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
+    return {t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates}
 
 
 def _apply_image_name_vars(target: dict[str, Any], image_names: dict[str, str], *, legacy: bool) -> None:
@@ -806,11 +865,12 @@ def deploy_application(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         if len(templates) == 1 and templates[0].key == "default":
-            image_names = {"default": f"{app_id}-{image_tag}"}
+            image_names = {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
         else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+            image_names = {
+                t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates
+            }
 
         # Decide once whether this deployment needs a Packer build, and
         # adapt the phase total accordingly so the percent bar is honest.
@@ -1161,8 +1221,7 @@ def destroy_deployment(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_names = _build_image_names(templates, app_id, repo_path, user_vars)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1888,8 +1947,7 @@ def redeploy_resource(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_names = _build_image_names(templates, app_id, repo_path, user_vars)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
