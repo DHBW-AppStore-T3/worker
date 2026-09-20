@@ -282,9 +282,18 @@ class OpenStackService:
         """
         rc, stdout, stderr = self._run(
             [
-                "openstack", "image", "list", "--private",
-                "--sort", "created_at:desc",
-                "-c", "ID", "-c", "Name", "-f", "json",
+                "openstack",
+                "image",
+                "list",
+                "--private",
+                "--sort",
+                "created_at:desc",
+                "-c",
+                "ID",
+                "-c",
+                "Name",
+                "-f",
+                "json",
             ],
             timeout=60,
         )
