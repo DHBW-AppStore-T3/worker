@@ -674,6 +674,119 @@ class TestDestroyDeployment:
         assert "Terraform destroy failed" in str(exc.value)
 
 
+# --- Terraform-only apps (no packer/ directory) -----------------------------
+
+
+@pytest.mark.unit
+class TestTerraformOnlyAppImageName:
+    """Deploy and destroy must agree on the ``image_name`` var-set.
+
+    Regression guard. ``deploy_application`` used to build its own
+    image-name map inline, and that copy lacked the ``not templates``
+    arm that ``_build_image_names`` has. For an app with no ``packer/``
+    directory the two therefore disagreed: deploy passed no
+    ``image_name`` at all, destroy passed one. Terraform rejects a
+    CLI ``-var`` for a variable the module does not declare, so such an
+    app deployed cleanly and then could never be torn down - its
+    OpenStack resources stayed allocated.
+
+    Both tasks now go through ``_build_image_names``, so the assertion
+    that matters is that the two var-sets carry the same image keys.
+    """
+
+    @staticmethod
+    def _image_keys(variables: dict) -> set:
+        return {k for k in variables if k == "image_name" or k.startswith("image_name_")}
+
+    def test_deploy_passes_flat_image_name_without_packer(self, mocker, tmp_path):
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _, tf_inst = _make_terraform_executor_mock(mocker)
+
+        result = deploy_application.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}},
+            teams=None,
+            openstack_envelope={"project_id": "p1"},
+        )
+
+        assert result["status"] == "success"
+        applied = tf_inst.apply.call_args.kwargs["variables"]
+        assert self._image_keys(applied) == {"image_name"}
+
+    def test_deploy_and_destroy_agree_without_packer(self, mocker, tmp_path):
+        """The var-sets the two tasks hand Terraform carry identical image keys."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _, deploy_tf = _make_terraform_executor_mock(mocker)
+
+        task_args = dict(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}},
+            teams=None,
+            openstack_envelope={"project_id": "p1"},
+        )
+        deploy_application.run(**task_args)
+        deployed = deploy_tf.apply.call_args.kwargs["variables"]
+
+        _silence_events(mocker, destroy_deployment)
+        _, destroy_tf = _make_terraform_executor_mock(mocker)
+        destroy_deployment.run(**task_args)
+        destroyed = destroy_tf.destroy.call_args.kwargs["variables"]
+
+        assert self._image_keys(deployed) == self._image_keys(destroyed)
+        assert deployed["image_name"] == destroyed["image_name"]
+
+    def test_multi_image_app_still_uses_suffixed_names(self, mocker, tmp_path):
+        """The legacy predicate must not collapse a real multi-image app."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, destroy_deployment)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch(
+            "app.tasks._discover_packer_templates",
+            return_value=[_FakeTemplate("web"), _FakeTemplate("db")],
+        )
+        _, tf_inst = _make_terraform_executor_mock(mocker)
+
+        destroy_deployment.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}, "packer": {"web": {}, "db": {}}},
+            teams=None,
+            openstack_envelope={"project_id": "p1"},
+        )
+
+        variables = tf_inst.destroy.call_args.kwargs["variables"]
+        assert self._image_keys(variables) == {"image_name_web", "image_name_db"}
+
+
 # --- pause / resume ---------------------------------------------------------
 
 
