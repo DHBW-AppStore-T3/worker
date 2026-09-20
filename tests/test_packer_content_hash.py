@@ -8,7 +8,6 @@ direction - a needless 45-minute Windows rebuild, or a silently stale
 image.
 """
 
-
 import pytest
 
 from app.services.packer_discovery import _PackerTemplate
