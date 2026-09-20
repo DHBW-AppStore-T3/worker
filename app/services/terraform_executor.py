@@ -111,6 +111,19 @@ def _stream_subprocess(
             os.killpg(process.pid, 9)
         reader.join(timeout=2)
         return 124, "\n".join(output_lines), "Timeout"
+    except BaseException:
+        # Anything that unwinds us other than a timeout: a Celery revoke
+        # (billiard raises ``Terminated``), a soft time limit, or worker
+        # shutdown. ``start_new_session=True`` put the child in its own
+        # process group, so it does NOT die with us - a revoked deploy
+        # would otherwise leave packer or terraform running against the
+        # tenant with nobody watching, still holding the build lock and
+        # still creating instances. Kill the group, then re-raise so
+        # Celery still sees the task as terminated.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(process.pid, 9)
+        reader.join(timeout=2)
+        raise
 
     reader.join(timeout=5)
     return returncode, "\n".join(output_lines), ""

@@ -1052,6 +1052,7 @@ def destroy_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    sweep_build_artifacts: bool = False,
 ):
     """Tear down a deployment via ``terraform destroy``.
 
@@ -1227,6 +1228,37 @@ def destroy_deployment(
                 task_logger.command_output("terraform_destroy_stderr", stderr, returncode=1)
             raise Exception("Terraform destroy failed")
         task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
+
+        # Cancel path only. Packer cleans up its own build instance and
+        # throwaway keypair on a normal exit, but a cancelled deploy kills
+        # it before that happens. None of it is in Terraform state - the
+        # build instance belongs to Packer - so the destroy above cannot
+        # reach it. Reap it by the exact image name this deploy was
+        # building, so a parallel build of another app is never touched.
+        if sweep_build_artifacts:
+            phase_tracker.mark(PHASE_CLEANUP, "Reaping build artifacts")
+            sweeper = OpenStackService(env_vars=openstack_env)
+            for image_name in image_names.values():
+                for server_id in sweeper.servers_by_name(image_name):
+                    ok, err = sweeper.server_delete(server_id)
+                    if ok:
+                        task_logger.success(
+                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
+                            category=LogCategory.STATUS,
+                        )
+                    else:
+                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
+                ok, err = sweeper.image_delete_by_name(image_name)
+                if not ok:
+                    task_logger.warning(f"Could not delete partial image '{image_name}': {err}")
+            for keypair in sweeper.unused_packer_keypairs():
+                if sweeper.keypair_delete(keypair):
+                    task_logger.info(f"Deleted stale Packer keypair {keypair}")
+            # The Redis build lock is token-owned, so this task cannot
+            # release a lock it never held. It self-heals instead: the
+            # heartbeat dies with the revoked task and the key expires
+            # after its 5-minute TTL.
+            task_logger.info("Build lock left to expire (5 min TTL; heartbeat died with the revoked task)")
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
