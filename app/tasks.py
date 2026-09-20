@@ -524,6 +524,99 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     return digest.hexdigest()[:12]
 
 
+# How many superseded images to keep per template, beyond the current one.
+# Zero reclaims the most space but makes any rollback to a previous release
+# pay for a full rebuild - 20-45 minutes for the Windows image. Keeping one
+# generation leaves the obvious "undo the last deploy" fast while still
+# bounding growth; unbounded growth is what took this project to 340 GiB of
+# images, 160 GiB of it superseded Windows builds nothing referenced.
+SUPERSEDED_IMAGE_RETENTION = 1
+
+# A content-addressed image name ends in the 12 hex characters of
+# _packer_content_hash. Matching that exact shape - rather than a loose
+# prefix - is what makes pruning safe: a base image, a hand-uploaded image
+# or another app's image cannot accidentally match.
+_IMAGE_HASH_RE = r"[0-9a-f]{12}"
+
+
+def _superseded_images(
+    candidates: list[tuple[str, str]],
+    app_id: str,
+    template_keys: list[str],
+    keep_names: set[str],
+    in_use_ids: set[str],
+    retention: int = SUPERSEDED_IMAGE_RETENTION,
+) -> list[tuple[str, str]]:
+    """Decide which of this app's images are safe to delete.
+
+    ``candidates`` is (id, name) newest first. Pure and total, so the
+    decision is testable without touching OpenStack - the caller does the
+    listing and the deleting.
+
+    An image is deletable only when all of these hold:
+
+    * its name matches this app's content-addressed shape, for one of the
+      templates this app actually has;
+    * it is not a name this deploy just built (``keep_names``);
+    * no existing server was booted from it;
+    * it is not among the newest ``retention`` superseded generations.
+    """
+    is_legacy = not template_keys or template_keys == ["default"]
+    patterns = (
+        [re.compile(f"^{re.escape(app_id)}-{_IMAGE_HASH_RE}$")]
+        if is_legacy
+        else [re.compile(f"^{re.escape(app_id)}-{re.escape(k)}-{_IMAGE_HASH_RE}$") for k in template_keys]
+    )
+
+    # Grouped per template, because retention is per template: in a
+    # two-image app one template's history must not evict the other's.
+    per_template: dict[int, list[tuple[str, str]]] = {}
+    for image_id, name in candidates:
+        if name in keep_names or image_id in in_use_ids:
+            continue
+        for idx, pattern in enumerate(patterns):
+            if pattern.match(name):
+                per_template.setdefault(idx, []).append((image_id, name))
+                break
+
+    doomed: list[tuple[str, str]] = []
+    for rows in per_template.values():
+        # candidates arrive newest first, so the tail is the oldest.
+        doomed.extend(rows[retention:])
+    return doomed
+
+
+def _prune_superseded_images(
+    sweeper: OpenStackService,
+    app_id: str,
+    template_keys: list[str],
+    keep_names: set[str],
+    task_logger: Any,
+) -> None:
+    """Delete this app's superseded images. Never raises.
+
+    Reclaiming storage must not be able to fail a deployment. Both
+    listings return None on error, treated here as "do not prune": an
+    empty in-use set would otherwise read as permission to delete images
+    that are in fact in use.
+    """
+    try:
+        candidates = sweeper.images_newest_first()
+        in_use = sweeper.image_ids_in_use()
+        if candidates is None or in_use is None:
+            task_logger.warning("Skipping image prune: could not list images or servers")
+            return
+
+        for image_id, name in _superseded_images(candidates, app_id, template_keys, keep_names, in_use):
+            ok, err = sweeper.image_delete_by_id(image_id)
+            if ok:
+                task_logger.info(f"Reclaimed superseded image '{name}'", category=LogCategory.STATUS)
+            else:
+                task_logger.warning(f"Could not delete superseded image '{name}': {err}")
+    except Exception as e:  # noqa: BLE001 - cleanup must never fail a deploy
+        task_logger.warning(f"Image prune skipped after error: {e}")
+
+
 def _build_image_names(
     templates: list[_PackerTemplate],
     app_id: str,
@@ -915,6 +1008,17 @@ def deploy_application(
                     phase_tracker=phase_tracker,
                     task_logger=task_logger,
                 )
+
+            # Every build leaves its predecessor behind and nothing in
+            # OpenStack expires images. Reclaim them now that the current
+            # generation exists and is known good.
+            _prune_superseded_images(
+                openstack_service,
+                app_id,
+                [t.key for t in templates],
+                set(image_names.values()),
+                task_logger,
+            )
 
         # Phase 4: Terraform
         terraform_dir = os.path.join(repo_path, "terraform")
