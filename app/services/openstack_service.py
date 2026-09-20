@@ -258,3 +258,68 @@ class OpenStackService:
             logger.error(f"Failed to delete keypair {name}: {stderr}")
             return False
         return True
+
+    # ------------------------------------------------------------------
+    # Image retention
+    #
+    # Every Packer build produces a new content-addressed image and the
+    # old one is left behind: nothing in OpenStack expires them, and this
+    # project has no image-storage quota to make it visible. It had
+    # reached 340 GiB, of which 160 GiB was superseded Windows images no
+    # deployment referenced.
+    #
+    # Both listers return None rather than an empty result when the CLI
+    # call fails. The caller must treat None as "do not prune": an empty
+    # in-use set would otherwise read as "nothing is in use" and delete
+    # images that are.
+    # ------------------------------------------------------------------
+
+    def images_newest_first(self) -> list[tuple[str, str]] | None:
+        """Return (id, name) for this project's private images, newest first.
+
+        None means the listing failed and callers must not draw conclusions
+        from it.
+        """
+        rc, stdout, stderr = self._run(
+            [
+                "openstack", "image", "list", "--private",
+                "--sort", "created_at:desc",
+                "-c", "ID", "-c", "Name", "-f", "json",
+            ],
+            timeout=60,
+        )
+        if rc != 0:
+            logger.error(f"Failed to list images: {stderr}")
+            return None
+        try:
+            return [(i["ID"], i["Name"]) for i in json.loads(stdout) if i.get("ID") and i.get("Name")]
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            logger.error(f"Failed to parse image list: {e}")
+            return None
+
+    def image_ids_in_use(self) -> set[str] | None:
+        """Image IDs that existing servers were booted from.
+
+        None means the listing failed - see the note above on why that is
+        not the same as an empty set.
+        """
+        rc, stdout, stderr = self._run(
+            ["openstack", "server", "list", "--long", "-f", "json"],
+            timeout=60,
+        )
+        if rc != 0:
+            logger.error(f"Failed to list servers for image usage: {stderr}")
+            return None
+        try:
+            return {s["Image ID"] for s in json.loads(stdout) if s.get("Image ID")}
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse server list: {e}")
+            return None
+
+    def image_delete_by_id(self, image_id: str) -> tuple[bool, str | None]:
+        """Delete a Glance image by ID."""
+        rc, _stdout, stderr = self._run(["openstack", "image", "delete", image_id], timeout=120)
+        if rc != 0:
+            logger.error(f"Failed to delete image {image_id}: {stderr}")
+            return (False, stderr)
+        return (True, None)
