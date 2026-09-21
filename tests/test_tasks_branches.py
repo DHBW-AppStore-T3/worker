@@ -674,6 +674,82 @@ class TestDestroyDeployment:
         assert "Terraform destroy failed" in str(exc.value)
 
 
+# --- image pruning wiring ---------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPruneSupersededImagesWiring:
+    """The deploy path must actually invoke the prune.
+
+    tests/test_superseded_images.py covers ``_superseded_images``, the pure
+    decision function, but nothing asserted that a deploy calls
+    ``_prune_superseded_images`` at all. That left the feature's only
+    integration point unguarded - and it moved when the Packer block was
+    extracted into ``_build_all_packer_images``, which is exactly the kind
+    of change a wiring test exists to catch.
+    """
+
+    def test_deploy_prunes_after_building_images(self, mocker, tmp_path):
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
+        _make_openstack_service_mock(mocker, image_exists=False)
+        _make_build_lock_mock(mocker, held=True)
+        _make_packer_mock(mocker)
+        _make_terraform_executor_mock(mocker)
+        prune = mocker.patch("app.tasks._prune_superseded_images")
+
+        deploy_application.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}, "packer": {}},
+            teams=None,
+            openstack_envelope={"project_id": "p1"},
+        )
+
+        assert prune.call_count == 1
+        args = prune.call_args.args
+        # (openstack_service, app_id, template_keys, keep_names, logger)
+        assert args[1] == "myapp"
+        assert args[2] == ["default"]
+        # The name this deploy just built must be protected from its own prune.
+        assert len(args[3]) == 1
+
+    def test_terraform_only_app_never_prunes(self, mocker, tmp_path):
+        """No templates means nothing was built, so there is nothing to reclaim."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _make_terraform_executor_mock(mocker)
+        prune = mocker.patch("app.tasks._prune_superseded_images")
+
+        deploy_application.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}},
+            teams=None,
+            openstack_envelope={"project_id": "p1"},
+        )
+
+        prune.assert_not_called()
+
+
 # --- Terraform-only apps (no packer/ directory) -----------------------------
 
 
@@ -737,15 +813,15 @@ class TestTerraformOnlyAppImageName:
         mocker.patch("app.tasks._discover_packer_templates", return_value=[])
         _, deploy_tf = _make_terraform_executor_mock(mocker)
 
-        task_args = dict(
-            deployment_id="dep-1",
-            app_id="myapp",
-            app_git_link="https://git/repo.git",
-            release="v1",
-            user_vars={"terraform": {}},
-            teams=None,
-            openstack_envelope={"project_id": "p1"},
-        )
+        task_args = {
+            "deployment_id": "dep-1",
+            "app_id": "myapp",
+            "app_git_link": "https://git/repo.git",
+            "release": "v1",
+            "user_vars": {"terraform": {}},
+            "teams": None,
+            "openstack_envelope": {"project_id": "p1"},
+        }
         deploy_application.run(**task_args)
         deployed = deploy_tf.apply.call_args.kwargs["variables"]
 
