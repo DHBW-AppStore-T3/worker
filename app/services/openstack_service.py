@@ -156,3 +156,179 @@ class OpenStackService:
         if rc == 0:
             return (True, None)
         return (False, stderr.strip() or "openstack server start failed")
+
+    # ------------------------------------------------------------------
+    # Orphan reaping (used by cancel)
+    # ------------------------------------------------------------------
+    #
+    # When a deploy is cancelled mid-flight, Packer never reaches its own
+    # cleanup step, so the build instance, the temporary keypair it
+    # generated and (rarely) a half-registered Glance image are left
+    # behind. Terraform state covers nothing of this: the build instance
+    # is Packer's, not Terraform's. These helpers let the cancel task
+    # reap them by name.
+    #
+    # Every method is idempotent and never raises: cancel runs as a
+    # best-effort sweep and one missing resource must not abort the rest.
+
+    def servers_by_name(self, name: str) -> list[str]:
+        """Return the IDs of every server with this exact name."""
+        rc, stdout, stderr = self._run(
+            ["openstack", "server", "list", "--name", name, "-f", "json"],
+            timeout=30,
+        )
+        if rc != 0:
+            logger.error(f"Failed to list servers named '{name}': {stderr}")
+            return []
+        try:
+            return [s["ID"] for s in json.loads(stdout) if s.get("ID")]
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse server list: {e}")
+            return []
+
+    def server_delete(self, server_id: str) -> tuple[bool, str | None]:
+        """Delete a server and wait for it to disappear."""
+        rc, _stdout, stderr = self._run(
+            ["openstack", "server", "delete", "--wait", server_id],
+            timeout=300,
+        )
+        if rc != 0:
+            # Already gone is a success for our purposes.
+            if "could not be found" in (stderr or "").lower() or "no server with" in (stderr or "").lower():
+                return (True, None)
+            logger.error(f"Failed to delete server {server_id}: {stderr}")
+            return (False, stderr)
+        return (True, None)
+
+    def image_delete_by_name(self, image_name: str) -> tuple[bool, str | None]:
+        """Delete a Glance image by exact name, if it exists.
+
+        Only ever called for the image name this deployment's build was
+        producing, so it cannot touch an unrelated app's image.
+        """
+        exists, image_id = self.check_image_exists(image_name)
+        if not exists or not image_id:
+            return (True, None)
+        rc, _stdout, stderr = self._run(
+            ["openstack", "image", "delete", image_id],
+            timeout=120,
+        )
+        if rc != 0:
+            logger.error(f"Failed to delete image {image_id}: {stderr}")
+            return (False, stderr)
+        return (True, None)
+
+    def unused_packer_keypairs(self) -> list[str]:
+        """Packer-generated keypairs that no server is still using.
+
+        Packer names its throwaway keypair ``packer_<uuid>``. Deleting
+        every match would race a build running in parallel, so we only
+        return the ones no current server references.
+        """
+        rc, stdout, stderr = self._run(["openstack", "keypair", "list", "-f", "json"], timeout=30)
+        if rc != 0:
+            logger.error(f"Failed to list keypairs: {stderr}")
+            return []
+        try:
+            names = [k["Name"] for k in json.loads(stdout) if str(k.get("Name", "")).startswith("packer_")]
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse keypair list: {e}")
+            return []
+        if not names:
+            return []
+
+        rc, stdout, stderr = self._run(
+            ["openstack", "server", "list", "--long", "-f", "json"],
+            timeout=60,
+        )
+        if rc != 0:
+            # Can't prove they are unused, so leave them alone.
+            logger.warning(f"Could not list servers to check keypair usage: {stderr}")
+            return []
+        try:
+            in_use = {s.get("Key Name") for s in json.loads(stdout)}
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [n for n in names if n not in in_use]
+
+    def keypair_delete(self, name: str) -> bool:
+        """Delete a keypair by name. Missing is treated as success."""
+        rc, _stdout, stderr = self._run(["openstack", "keypair", "delete", name], timeout=60)
+        if rc != 0 and "could not be found" not in (stderr or "").lower():
+            logger.error(f"Failed to delete keypair {name}: {stderr}")
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Image retention
+    #
+    # Every Packer build produces a new content-addressed image and the
+    # old one is left behind: nothing in OpenStack expires them, and this
+    # project has no image-storage quota to make it visible. It had
+    # reached 340 GiB, of which 160 GiB was superseded Windows images no
+    # deployment referenced.
+    #
+    # Both listers return None rather than an empty result when the CLI
+    # call fails. The caller must treat None as "do not prune": an empty
+    # in-use set would otherwise read as "nothing is in use" and delete
+    # images that are.
+    # ------------------------------------------------------------------
+
+    def images_newest_first(self) -> list[tuple[str, str]] | None:
+        """Return (id, name) for this project's private images, newest first.
+
+        None means the listing failed and callers must not draw conclusions
+        from it.
+        """
+        rc, stdout, stderr = self._run(
+            [
+                "openstack",
+                "image",
+                "list",
+                "--private",
+                "--sort",
+                "created_at:desc",
+                "-c",
+                "ID",
+                "-c",
+                "Name",
+                "-f",
+                "json",
+            ],
+            timeout=60,
+        )
+        if rc != 0:
+            logger.error(f"Failed to list images: {stderr}")
+            return None
+        try:
+            return [(i["ID"], i["Name"]) for i in json.loads(stdout) if i.get("ID") and i.get("Name")]
+        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            logger.error(f"Failed to parse image list: {e}")
+            return None
+
+    def image_ids_in_use(self) -> set[str] | None:
+        """Image IDs that existing servers were booted from.
+
+        None means the listing failed - see the note above on why that is
+        not the same as an empty set.
+        """
+        rc, stdout, stderr = self._run(
+            ["openstack", "server", "list", "--long", "-f", "json"],
+            timeout=60,
+        )
+        if rc != 0:
+            logger.error(f"Failed to list servers for image usage: {stderr}")
+            return None
+        try:
+            return {s["Image ID"] for s in json.loads(stdout) if s.get("Image ID")}
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.error(f"Failed to parse server list: {e}")
+            return None
+
+    def image_delete_by_id(self, image_id: str) -> tuple[bool, str | None]:
+        """Delete a Glance image by ID."""
+        rc, _stdout, stderr = self._run(["openstack", "image", "delete", image_id], timeout=120)
+        if rc != 0:
+            logger.error(f"Failed to delete image {image_id}: {stderr}")
+            return (False, stderr)
+        return (True, None)

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,10 @@ from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_p
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
+
+# Field separator for the Packer content hash, so a path ending and a
+# file's first bytes can never run together into the same digest input.
+SEP = b"\0"
 
 
 def _tfstate_schema_name(deployment_id: str) -> str:
@@ -472,18 +477,165 @@ def _extract_commit_info(repo_path: str) -> dict[str, Any]:
     }
 
 
-def _build_image_names(templates: list[_PackerTemplate], app_id: str, image_tag: str) -> dict[str, str]:
+def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str, Any], is_legacy: bool) -> str:
+    """Hash of everything that determines what a Packer build produces.
+
+    This is the image cache key. It deliberately covers two things and
+    nothing else:
+
+    * the entire ``packer/`` tree - templates, variables and scripts. The
+      whole directory rather than one template's subdirectory, so a change
+      to a shared ``_common/`` helper cannot be missed and quietly serve a
+      stale image.
+    * the resolved Packer variables *for this template*, minus the
+      injected ``image_name`` - that is derived from this hash, so
+      including it would be circular.
+
+    Keying on the git commit instead, as this used to, had two problems.
+    It rebuilt an 80 GB Windows image for a README or Terraform edit that
+    could not possibly change it, and - the real bug - it missed a change
+    to a Packer wizard variable: same commit, different
+    ``source_image_name``, same image name, stale image silently reused.
+    """
+    digest = hashlib.sha256()
+    packer_dir = os.path.join(repo_path, "packer")
+    for root, dirs, files in os.walk(packer_dir):
+        # Sorted so the hash never depends on filesystem ordering.
+        dirs.sort()
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, packer_dir).replace(os.sep, "/")
+            digest.update(rel.encode("utf-8") + SEP)
+            try:
+                with open(full, "rb") as handle:
+                    digest.update(handle.read())
+            except OSError:
+                # Fold the failure in rather than hashing as if the file
+                # were simply absent.
+                digest.update(b"<unreadable>")
+            digest.update(SEP)
+
+    if is_legacy:
+        template_vars = dict(user_vars.get("packer") or {})
+    else:
+        template_vars = dict((user_vars.get("packer") or {}).get(template_key) or {})
+    template_vars.pop("image_name", None)
+    digest.update(json.dumps(template_vars, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+# How many superseded images to keep per template, beyond the current one.
+# Zero reclaims the most space but makes any rollback to a previous release
+# pay for a full rebuild - 20-45 minutes for the Windows image. Keeping one
+# generation leaves the obvious "undo the last deploy" fast while still
+# bounding growth; unbounded growth is what took this project to 340 GiB of
+# images, 160 GiB of it superseded Windows builds nothing referenced.
+SUPERSEDED_IMAGE_RETENTION = 1
+
+# A content-addressed image name ends in the 12 hex characters of
+# _packer_content_hash. Matching that exact shape - rather than a loose
+# prefix - is what makes pruning safe: a base image, a hand-uploaded image
+# or another app's image cannot accidentally match.
+_IMAGE_HASH_RE = r"[0-9a-f]{12}"
+
+
+def _superseded_images(
+    candidates: list[tuple[str, str]],
+    app_id: str,
+    template_keys: list[str],
+    keep_names: set[str],
+    in_use_ids: set[str],
+    retention: int = SUPERSEDED_IMAGE_RETENTION,
+) -> list[tuple[str, str]]:
+    """Decide which of this app's images are safe to delete.
+
+    ``candidates`` is (id, name) newest first. Pure and total, so the
+    decision is testable without touching OpenStack - the caller does the
+    listing and the deleting.
+
+    An image is deletable only when all of these hold:
+
+    * its name matches this app's content-addressed shape, for one of the
+      templates this app actually has;
+    * it is not a name this deploy just built (``keep_names``);
+    * no existing server was booted from it;
+    * it is not among the newest ``retention`` superseded generations.
+    """
+    is_legacy = not template_keys or template_keys == ["default"]
+    patterns = (
+        [re.compile(f"^{re.escape(app_id)}-{_IMAGE_HASH_RE}$")]
+        if is_legacy
+        else [re.compile(f"^{re.escape(app_id)}-{re.escape(k)}-{_IMAGE_HASH_RE}$") for k in template_keys]
+    )
+
+    # Grouped per template, because retention is per template: in a
+    # two-image app one template's history must not evict the other's.
+    per_template: dict[int, list[tuple[str, str]]] = {}
+    for image_id, name in candidates:
+        if name in keep_names or image_id in in_use_ids:
+            continue
+        for idx, pattern in enumerate(patterns):
+            if pattern.match(name):
+                per_template.setdefault(idx, []).append((image_id, name))
+                break
+
+    doomed: list[tuple[str, str]] = []
+    for rows in per_template.values():
+        # candidates arrive newest first, so the tail is the oldest.
+        doomed.extend(rows[retention:])
+    return doomed
+
+
+def _prune_superseded_images(
+    sweeper: OpenStackService,
+    app_id: str,
+    template_keys: list[str],
+    keep_names: set[str],
+    task_logger: Any,
+) -> None:
+    """Delete this app's superseded images. Never raises.
+
+    Reclaiming storage must not be able to fail a deployment. Both
+    listings return None on error, treated here as "do not prune": an
+    empty in-use set would otherwise read as permission to delete images
+    that are in fact in use.
+    """
+    try:
+        candidates = sweeper.images_newest_first()
+        in_use = sweeper.image_ids_in_use()
+        if candidates is None or in_use is None:
+            task_logger.warning("Skipping image prune: could not list images or servers")
+            return
+
+        for image_id, name in _superseded_images(candidates, app_id, template_keys, keep_names, in_use):
+            ok, err = sweeper.image_delete_by_id(image_id)
+            if ok:
+                task_logger.info(f"Reclaimed superseded image '{name}'", category=LogCategory.STATUS)
+            else:
+                task_logger.warning(f"Could not delete superseded image '{name}': {err}")
+    except Exception as e:  # noqa: BLE001 - cleanup must never fail a deploy
+        task_logger.warning(f"Image prune skipped after error: {e}")
+
+
+def _build_image_names(
+    templates: list[_PackerTemplate],
+    app_id: str,
+    repo_path: str,
+    user_vars: dict[str, Any],
+) -> dict[str, str]:
     """Reconstruct the per-template Glance image-name map.
 
     Legacy single-template apps (or apps with no Packer at all) keep the
-    flat ``{"default": "<app_id>-<tag>"}`` shape; multi-image apps get one
-    ``<app_id>-<key>-<tag>`` entry per template. Used by destroy/redeploy,
+    flat ``{"default": "<app_id>-<hash>"}`` shape; multi-image apps get one
+    ``<app_id>-<key>-<hash>`` entry per template. Used by destroy/redeploy,
     which must name the same images the original deploy built so
-    Terraform's variable validation matches the pg-backend state.
+    Terraform's variable validation matches the pg-backend state - they
+    clone the same tag and carry the same ``user_vars``, so the hash
+    recomputes identically.
     """
     if not templates or (len(templates) == 1 and templates[0].key == "default"):
-        return {"default": f"{app_id}-{image_tag}"}
-    return {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+        return {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
+    return {t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates}
 
 
 def _apply_image_name_vars(target: dict[str, Any], image_names: dict[str, str], *, legacy: bool) -> None:
@@ -806,11 +958,12 @@ def deploy_application(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         if len(templates) == 1 and templates[0].key == "default":
-            image_names = {"default": f"{app_id}-{image_tag}"}
+            image_names = {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
         else:
-            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
+            image_names = {
+                t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates
+            }
 
         # Decide once whether this deployment needs a Packer build, and
         # adapt the phase total accordingly so the percent bar is honest.
@@ -855,6 +1008,17 @@ def deploy_application(
                     phase_tracker=phase_tracker,
                     task_logger=task_logger,
                 )
+
+            # Every build leaves its predecessor behind and nothing in
+            # OpenStack expires images. Reclaim them now that the current
+            # generation exists and is known good.
+            _prune_superseded_images(
+                openstack_service,
+                app_id,
+                [t.key for t in templates],
+                set(image_names.values()),
+                task_logger,
+            )
 
         # Phase 4: Terraform
         terraform_dir = os.path.join(repo_path, "terraform")
@@ -1052,6 +1216,7 @@ def destroy_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    sweep_build_artifacts: bool = False,
 ):
     """Tear down a deployment via ``terraform destroy``.
 
@@ -1160,8 +1325,7 @@ def destroy_deployment(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_names = _build_image_names(templates, app_id, repo_path, user_vars)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1227,6 +1391,37 @@ def destroy_deployment(
                 task_logger.command_output("terraform_destroy_stderr", stderr, returncode=1)
             raise Exception("Terraform destroy failed")
         task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
+
+        # Cancel path only. Packer cleans up its own build instance and
+        # throwaway keypair on a normal exit, but a cancelled deploy kills
+        # it before that happens. None of it is in Terraform state - the
+        # build instance belongs to Packer - so the destroy above cannot
+        # reach it. Reap it by the exact image name this deploy was
+        # building, so a parallel build of another app is never touched.
+        if sweep_build_artifacts:
+            phase_tracker.mark(PHASE_CLEANUP, "Reaping build artifacts")
+            sweeper = OpenStackService(env_vars=openstack_env)
+            for image_name in image_names.values():
+                for server_id in sweeper.servers_by_name(image_name):
+                    ok, err = sweeper.server_delete(server_id)
+                    if ok:
+                        task_logger.success(
+                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
+                            category=LogCategory.STATUS,
+                        )
+                    else:
+                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
+                ok, err = sweeper.image_delete_by_name(image_name)
+                if not ok:
+                    task_logger.warning(f"Could not delete partial image '{image_name}': {err}")
+            for keypair in sweeper.unused_packer_keypairs():
+                if sweeper.keypair_delete(keypair):
+                    task_logger.info(f"Deleted stale Packer keypair {keypair}")
+            # The Redis build lock is token-owned, so this task cannot
+            # release a lock it never held. It self-heals instead: the
+            # heartbeat dies with the revoked task and the key expires
+            # after its 5-minute TTL.
+            task_logger.info("Build lock left to expire (5 min TTL; heartbeat died with the revoked task)")
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
@@ -1856,8 +2051,7 @@ def redeploy_resource(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_names = _build_image_names(templates, app_id, image_tag)
+        image_names = _build_image_names(templates, app_id, repo_path, user_vars)
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
