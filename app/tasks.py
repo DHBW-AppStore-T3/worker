@@ -552,6 +552,7 @@ def _is_legacy_keys(template_keys: list[str]) -> bool:
     """
     return not template_keys or template_keys == ["default"]
 
+
 # How many superseded images to keep per template, beyond the current one.
 # Zero reclaims the most space but makes any rollback to a previous release
 # pay for a full rebuild - 20-45 minutes for the Windows image. Keeping one
@@ -643,6 +644,7 @@ def _prune_superseded_images(
                 task_logger.warning(f"Could not delete superseded image '{name}': {err}")
     except Exception as e:  # noqa: BLE001 - cleanup must never fail a deploy
         task_logger.warning(f"Image prune skipped after error: {e}")
+
 
 def _build_image_names(
     templates: list[_PackerTemplate],
@@ -851,11 +853,13 @@ def _prepare_workspace(
         "Cloning repository" if initial_deploy else "Cloning repository at original release tag",
     )
     rt.logger.info(
-        f"Cloning repository: {app_git_link}"
-        if initial_deploy
-        else (
-            f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-            "so terraform code matches the pg-backend state)"
+        (
+            f"Cloning repository: {app_git_link}"
+            if initial_deploy
+            else (
+                f"Cloning {app_git_link} at {release} (same ref as the original deploy "
+                "so terraform code matches the pg-backend state)"
+            )
         ),
         category=LogCategory.OPERATION,
     )
