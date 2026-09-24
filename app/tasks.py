@@ -295,7 +295,7 @@ def _phases_for_templates(templates: list[_PackerTemplate]) -> tuple[str, ...]:
     """
     if not templates:
         return _PHASES_WITHOUT_PACKER
-    if len(templates) == 1 and templates[0].key == "default":
+    if _is_legacy_layout(templates):
         return _PHASES_WITH_PACKER
 
     idx = next(
@@ -524,6 +524,34 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     return digest.hexdigest()[:12]
 
 
+def _is_legacy_layout(templates: list[_PackerTemplate]) -> bool:
+    """True when the app uses the flat, single-image variable shape.
+
+    Two repo layouts map onto that shape: the legacy
+    ``packer/template.pkr.hcl`` single-template layout, and a
+    Terraform-only app with no ``packer/`` directory at all. Both
+    declare a flat ``image_name`` rather than one ``image_name_<key>``
+    per template, so every caller that has to pick between the two
+    shapes asks this one question.
+
+    Keeping it in a single predicate is deliberate: this condition was
+    previously spelled out at six call sites in two subtly different
+    forms, and the variant that omitted the ``not templates`` arm made
+    deploy and destroy disagree about Terraform-only apps - they
+    deployed without ``image_name`` and were then torn down with it,
+    which Terraform rejects as an undeclared variable.
+    """
+    return _is_legacy_keys([t.key for t in templates])
+
+
+def _is_legacy_keys(template_keys: list[str]) -> bool:
+    """``_is_legacy_layout`` over template keys rather than templates.
+
+    Image pruning works from names it parsed back out of Glance, so it
+    only ever has the keys. Same question, same answer, one definition.
+    """
+    return not template_keys or template_keys == ["default"]
+
 # How many superseded images to keep per template, beyond the current one.
 # Zero reclaims the most space but makes any rollback to a previous release
 # pay for a full rebuild - 20-45 minutes for the Windows image. Keeping one
@@ -561,7 +589,7 @@ def _superseded_images(
     * no existing server was booted from it;
     * it is not among the newest ``retention`` superseded generations.
     """
-    is_legacy = not template_keys or template_keys == ["default"]
+    is_legacy = _is_legacy_keys(template_keys)
     patterns = (
         [re.compile(f"^{re.escape(app_id)}-{_IMAGE_HASH_RE}$")]
         if is_legacy
@@ -616,7 +644,6 @@ def _prune_superseded_images(
     except Exception as e:  # noqa: BLE001 - cleanup must never fail a deploy
         task_logger.warning(f"Image prune skipped after error: {e}")
 
-
 def _build_image_names(
     templates: list[_PackerTemplate],
     app_id: str,
@@ -625,15 +652,20 @@ def _build_image_names(
 ) -> dict[str, str]:
     """Reconstruct the per-template Glance image-name map.
 
-    Legacy single-template apps (or apps with no Packer at all) keep the
-    flat ``{"default": "<app_id>-<hash>"}`` shape; multi-image apps get one
-    ``<app_id>-<key>-<hash>`` entry per template. Used by destroy/redeploy,
-    which must name the same images the original deploy built so
-    Terraform's variable validation matches the pg-backend state - they
-    clone the same tag and carry the same ``user_vars``, so the hash
-    recomputes identically.
+    Legacy single-template apps keep the flat
+    ``{"default": "<app_id>-<hash>"}`` shape; multi-image apps get one
+    ``<app_id>-<key>-<hash>`` entry per template. Shared by deploy,
+    destroy and redeploy so all three name the same images: destroy and
+    redeploy clone the same tag and carry the same ``user_vars``, so the
+    content hash recomputes identically.
+
+    Terraform-only apps (no templates) return the flat entry too. It is
+    never used as an actual Glance image name - nothing was built - but
+    it keeps ``image_name`` populated for the apps that declare the
+    variable anyway, which is what the app-developer guide's minimal
+    example does.
     """
-    if not templates or (len(templates) == 1 and templates[0].key == "default"):
+    if _is_legacy_layout(templates):
         return {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
     return {t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates}
 
@@ -674,6 +706,197 @@ def _cleanup_task_resources(clouds_config: PerTaskCloudsConfig | None, repo_path
             task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
         except Exception as e:
             task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
+class _TaskRuntime:
+    """Per-task wiring shared by every Celery task in this module.
+
+    All four task bodies (deploy, destroy, redeploy and the pause/resume
+    pair) opened with the same seventy-odd lines: build a correlated
+    logger, bridge it onto Celery's event bus, start a phase tracker,
+    declare the same mutable locals, resolve the tfstate backend
+    coordinates, and define the same two or three closures over those
+    locals. ``_run_compute_lifecycle``'s docstring used to say it
+    "mirrors destroy_deployment's preamble exactly" - that is the
+    duplication this type removes.
+
+    The mutable attributes (``repo_path``, ``terraform_dir``,
+    ``openstack_env``, ``clouds_config``) are filled in as the task
+    progresses and are read back by :meth:`collect_state`,
+    :meth:`collect_outputs` and :meth:`cleanup`. That late binding is
+    deliberate and matches the closures it replaces: the collectors are
+    called from ``except`` blocks where ``terraform_dir`` may still be
+    ``None``, and must see whatever the task had reached by then.
+    """
+
+    def __init__(
+        self,
+        bound_task: Any,
+        deployment_id: str,
+        *,
+        log_prefix: str,
+        phases: tuple[str, ...],
+    ) -> None:
+        self.deployment_id = deployment_id
+        self.logger = get_logger(f"{log_prefix}:{deployment_id}", correlation_id=deployment_id)
+
+        def _emit(event_name: str, payload: dict[str, Any]) -> None:
+            # ``deployment_id`` rides along on every event so the backend
+            # listener doesn't need a DB lookup to route it.
+            bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
+
+        self.logger.set_event_emitter(_emit)
+        self.phase_tracker = _PhaseTracker(self.logger, phases)
+
+        # Terraform's pg backend lives in a worker-only Postgres, one
+        # schema per deployment so state and locks stay isolated.
+        self.tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
+        self.tfstate_schema = _tfstate_schema_name(deployment_id)
+
+        self.repo_path: str | None = None
+        self.terraform_dir: str | None = None
+        self.openstack_env: dict[str, str] = {}
+        self.clouds_config: PerTaskCloudsConfig | None = None
+
+    def set_phases(self, phases: tuple[str, ...]) -> None:
+        """Swap the phase set mid-task, keeping the same logger.
+
+        Deploy starts pessimistic (assume Packer) and re-plans once the
+        clone reveals how many templates the repo actually has, so the
+        percent bar stays honest.
+        """
+        self.phase_tracker = _PhaseTracker(self.logger, phases)
+
+    def mark(self, phase: str, message: str) -> None:
+        self.phase_tracker.mark(phase, message)
+
+    def stream_line(self, tool: str, line: str) -> None:
+        """Feed one line of subprocess output into the task log."""
+        self.logger.tool_output_line(tool, line)
+
+    def collect_state(self, *, local_fallback: bool = False) -> str | None:
+        return collect_terraform_state_helper(
+            self.terraform_dir,
+            self.openstack_env,
+            self.tfstate_conn_str,
+            self.tfstate_schema,
+            self.logger,
+            local_fallback=local_fallback,
+        )
+
+    def collect_outputs(self) -> Any:
+        return collect_terraform_outputs_helper(
+            self.terraform_dir,
+            self.openstack_env,
+            self.tfstate_conn_str,
+            self.tfstate_schema,
+            self.logger,
+        )
+
+    def cleanup(self) -> None:
+        _cleanup_task_resources(self.clouds_config, self.repo_path, self.logger)
+
+
+def _prepare_workspace(
+    rt: _TaskRuntime,
+    *,
+    app_id: str,
+    app_git_link: str,
+    release: str,
+    openstack_envelope: dict[str, Any] | None,
+    action: str,
+    resource_info: dict[str, Any] | None = None,
+    capture_commit: bool = True,
+    start_message: str | None = None,
+    initial_deploy: bool = False,
+) -> dict[str, Any] | None:
+    """Run the four phases every task opens with, and return the commit info.
+
+    STARTING -> OPENSTACK_SETUP -> GIT_CLONE -> CREDS_MATERIALISE. On
+    return the runtime has ``repo_path`` and ``openstack_env`` populated
+    and the per-task clouds.yaml exists on disk; the caller's ``finally``
+    is responsible for shredding it via :meth:`_TaskRuntime.cleanup`.
+
+    ``capture_commit`` is False for pause/resume, which never need the
+    commit metadata. A failure to read it is a warning everywhere else -
+    the clone succeeded, so the task can still run.
+
+    ``initial_deploy`` selects the wording. These lines are streamed to the
+    user's browser, and the defaults are written for the three tasks that
+    re-clone an existing deployment at its original tag. The first deploy
+    has no "original deploy" to match, and it can tell the user what to
+    actually do about a missing credential.
+    """
+    rt.mark(PHASE_STARTING, start_message or f"Starting {action}")
+    rt.logger.resource_info(
+        "deployment",
+        rt.deployment_id,
+        app_id=app_id,
+        git_url=app_git_link,
+        release=release,
+        **(resource_info or {}),
+    )
+
+    rt.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
+    if not openstack_envelope:
+        raise Exception(
+            "OpenStack credential envelope missing — user must upload credentials before deploying"
+            if initial_deploy
+            else f"OpenStack credential envelope missing - cannot {action} without credentials"
+        )
+    rt.logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
+
+    rt.mark(
+        PHASE_GIT_CLONE,
+        "Cloning repository" if initial_deploy else "Cloning repository at original release tag",
+    )
+    rt.logger.info(
+        f"Cloning repository: {app_git_link}"
+        if initial_deploy
+        else (
+            f"Cloning {app_git_link} at {release} (same ref as the original deploy "
+            "so terraform code matches the pg-backend state)"
+        ),
+        category=LogCategory.OPERATION,
+    )
+    commit_info: dict[str, Any] | None = None
+    try:
+        rt.repo_path = git_service.clone_release(
+            git_url=app_git_link,
+            deployment_id=rt.deployment_id,
+            tag=release,
+        )
+        if capture_commit:
+            try:
+                commit_info = _extract_commit_info(rt.repo_path)
+                rt.logger.resource_info(
+                    "git_commit",
+                    commit_info["hash"][:8],
+                    hash=commit_info["hash"],
+                    message=commit_info["message"],
+                    author=commit_info["author"],
+                )
+                rt.logger.success(
+                    f"Repository cloned at commit {commit_info['hash'][:8]}",
+                    category=LogCategory.STATUS,
+                )
+            except Exception as e:
+                rt.logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
+        else:
+            rt.logger.success("Repository cloned", category=LogCategory.STATUS)
+    except Exception as e:
+        raise Exception(f"Git clone failed: {str(e)}")
+
+    # Materialise the per-task clouds.yaml inside repo_path with mode 0600.
+    # Lives only for the duration of this task; shredded by rt.cleanup().
+    rt.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
+    rt.logger.operation_start("openstack_credentials_materialise")
+    rt.clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=rt.repo_path)
+    rt.openstack_env = rt.clouds_config.__enter__()
+    rt.logger.operation_end("openstack_credentials_materialise", success=True)
+    rt.logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+
+    return commit_info
 
 
 def _build_one_packer_image(
@@ -812,6 +1035,66 @@ def _build_one_packer_image(
         build_lock.release()
 
 
+def _build_all_packer_images(
+    rt: _TaskRuntime,
+    *,
+    app_id: str,
+    templates: list[_PackerTemplate],
+    image_names: dict[str, str],
+    openstack_envelope: dict[str, Any],
+    user_vars: dict[str, Any],
+) -> None:
+    """Build every Packer image this deployment needs, or skip cleanly.
+
+    Each build is guarded by a Redis lock keyed on
+    ``(project_id, image_name)`` so two parallel workers cannot both kick
+    off a build for the same image and end up with duplicate Glance
+    entries plus wasted compute. For multi-image apps each template has
+    its own lock and image-exists check, so two workers can build
+    different images of the same app in parallel.
+
+    A Terraform-only app (no templates) is not an error - it just has
+    nothing to build.
+
+    Superseded images are reclaimed here, after the current generation
+    exists and is known good, because this is where the OpenStack client
+    and the full template set are in scope.
+    """
+    if not templates:
+        rt.logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
+        return
+
+    project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
+    openstack_service = OpenStackService(env_vars=rt.openstack_env)
+    is_legacy = _is_legacy_layout(templates)
+
+    for tmpl in templates:
+        _build_one_packer_image(
+            tmpl,
+            image_name=image_names[tmpl.key],
+            is_legacy=is_legacy,
+            openstack_service=openstack_service,
+            project_id=project_id,
+            repo_path=rt.repo_path,
+            openstack_env=rt.openstack_env,
+            stream_line=rt.stream_line,
+            user_vars=user_vars,
+            phase_tracker=rt.phase_tracker,
+            task_logger=rt.logger,
+        )
+
+    # Every build leaves its predecessor behind and nothing in OpenStack
+    # expires images. Reclaim them now that the current generation exists
+    # and is known good.
+    _prune_superseded_images(
+        openstack_service,
+        app_id,
+        [t.key for t in templates],
+        set(image_names.values()),
+        rt.logger,
+    )
+
+
 @celery_app.task(bind=True, name="tasks.deploy_application")
 def deploy_application(
     self,
@@ -840,113 +1123,41 @@ def deploy_application(
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
     """
-    task_logger = get_logger(f"deploy:{deployment_id}", correlation_id=deployment_id)
+    # Pessimistic phase set - assumes Packer. Re-planned after the git
+    # clone if the cloned repo turns out to have no Packer template.
+    rt = _TaskRuntime(self, deployment_id, log_prefix="deploy", phases=_PHASES_WITH_PACKER)
+    task_logger = rt.logger
 
-    # Wire the per-deployment logger to Celery's event bus. Every buffered
-    # log entry now becomes a ``task-log`` event, and ``task_logger.progress``
-    # emits ``task-progress``. The backend's listener picks both up and
-    # forwards them via the in-process pubsub to any open SSE subscriber.
-    bound_task = self
-
-    def _emit(event_name: str, payload: dict[str, Any]) -> None:
-        # ``deployment_id`` is duplicated into every event so the backend
-        # listener doesn't need a DB lookup to figure out which deployment
-        # the event belongs to.
-        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
-
-    task_logger.set_event_emitter(_emit)
-
-    # Pessimistic phase set — assumes Packer. Demoted after git clone if
-    # the cloned repo turns out to have no Packer template.
-    phase_tracker = _PhaseTracker(task_logger, _PHASES_WITH_PACKER)
-
-    repo_path = None
     tf_state = None
     outputs = None
     commit_info = None
-    terraform_dir = None
-    openstack_env: dict[str, str] = {}
-    clouds_config: PerTaskCloudsConfig | None = None
-
-    # Terraform's pg backend lives in a worker-only Postgres. Configured
-    # at deploy/destroy time by writing a `pg_backend_override.tf` next
-    # to the cloned repo's terraform/ directory. One schema per
-    # deployment isolates state and locks.
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     # Default teams to empty dict if not provided
     if teams is None:
         teams = {}
 
     def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, local_fallback=True
-        )
+        return rt.collect_state(local_fallback=True)
 
     def collect_terraform_outputs():
-        return collect_terraform_outputs_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return rt.collect_outputs()
 
     try:
-        phase_tracker.mark(PHASE_STARTING, "Starting deployment")
-        task_logger.resource_info(
-            "deployment",
-            deployment_id,
+        commit_info = _prepare_workspace(
+            rt,
             app_id=app_id,
-            git_url=app_git_link,
+            app_git_link=app_git_link,
             release=release,
-            user_vars_keys=list(user_vars.keys()),
-            teams_keys=list(teams.keys()),
+            openstack_envelope=openstack_envelope,
+            action="deployment",
+            initial_deploy=True,
+            resource_info={
+                "user_vars_keys": list(user_vars.keys()),
+                "teams_keys": list(teams.keys()),
+            },
         )
-
-        # Phase 1: OpenStack credentials (envelope only — materialised after
-        # the git clone so the per-task clouds.yaml lives inside repo_path).
-        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
-        if not openstack_envelope:
-            raise Exception("OpenStack credential envelope missing — user must upload credentials before deploying")
-        task_logger.success(
-            "OpenStack credential envelope received",
-            category=LogCategory.STATUS,
-        )
-
-        # Phase 2: Git clone
-        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository")
-        task_logger.info(f"Cloning repository: {app_git_link}", category=LogCategory.OPERATION)
-        try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
-
-            # Get commit info
-            try:
-                commit_info = _extract_commit_info(repo_path)
-                task_logger.resource_info(
-                    "git_commit",
-                    commit_info["hash"][:8],
-                    hash=commit_info["hash"],
-                    message=commit_info["message"],
-                    author=commit_info["author"],
-                )
-                task_logger.success(
-                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
-                )
-            except Exception as e:
-                task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
-
-        except Exception as e:
-            raise Exception(f"Git clone failed: {str(e)}")
-
-        # Materialise the per-task clouds.yaml inside repo_path with mode 0600.
-        # Lives only for the duration of this task; shredded by __exit__.
-        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
-        task_logger.operation_start("openstack_credentials_materialise")
-        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
-        openstack_env = clouds_config.__enter__()
-        task_logger.operation_end("openstack_credentials_materialise", success=True)
-        task_logger.success(
-            "Per-task clouds.yaml written",
-            category=LogCategory.STATUS,
-        )
+        repo_path = rt.repo_path
+        openstack_env = rt.openstack_env
 
         # Cache the built image by commit SHA, not by release tag:
         # `release` is often a moving ref (e.g. "main"), so the
@@ -958,12 +1169,7 @@ def deploy_application(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        if len(templates) == 1 and templates[0].key == "default":
-            image_names = {"default": f"{app_id}-{_packer_content_hash(repo_path, 'default', user_vars, True)}"}
-        else:
-            image_names = {
-                t.key: f"{app_id}-{t.key}-{_packer_content_hash(repo_path, t.key, user_vars, False)}" for t in templates
-            }
+        image_names = _build_image_names(templates, app_id, repo_path, user_vars)
 
         # Decide once whether this deployment needs a Packer build, and
         # adapt the phase total accordingly so the percent bar is honest.
@@ -972,58 +1178,22 @@ def deploy_application(
         # phases now so the next progress event lands on the right index.
         # For multi-image apps, ``_phases_for_templates`` expands the
         # Packer phases per template instead.
-        phase_tracker = _PhaseTracker(task_logger, _phases_for_templates(templates))
+        rt.set_phases(_phases_for_templates(templates))
 
-        # The output callback feeds each line of subprocess output into the
-        # task logger as a streaming entry, which then ships it via the
-        # event emitter as a ``task-log`` event. Same callback for Packer
-        # and Terraform — the tool name distinguishes them on the receiver.
-        def _stream_line(tool: str, line: str) -> None:
-            task_logger.tool_output_line(tool, line)
-
-        # Phase 3: Packer (optional) — guarded by a Redis lock keyed on
-        # (project_id, image_name) so two parallel workers can't both kick
-        # off a build for the same image and end up with duplicate Glance
-        # entries plus wasted compute. For multi-image apps each template
-        # has its own lock + image-exists check, so two workers can build
-        # different images of the same app in parallel.
-        if not templates:
-            task_logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
-        else:
-            project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
-            openstack_service = OpenStackService(env_vars=openstack_env)
-            is_legacy = len(templates) == 1 and templates[0].key == "default"
-
-            for tmpl in templates:
-                _build_one_packer_image(
-                    tmpl,
-                    image_name=image_names[tmpl.key],
-                    is_legacy=is_legacy,
-                    openstack_service=openstack_service,
-                    project_id=project_id,
-                    repo_path=repo_path,
-                    openstack_env=openstack_env,
-                    stream_line=_stream_line,
-                    user_vars=user_vars,
-                    phase_tracker=phase_tracker,
-                    task_logger=task_logger,
-                )
-
-            # Every build leaves its predecessor behind and nothing in
-            # OpenStack expires images. Reclaim them now that the current
-            # generation exists and is known good.
-            _prune_superseded_images(
-                openstack_service,
-                app_id,
-                [t.key for t in templates],
-                set(image_names.values()),
-                task_logger,
-            )
+        _build_all_packer_images(
+            rt,
+            app_id=app_id,
+            templates=templates,
+            image_names=image_names,
+            openstack_envelope=openstack_envelope,
+            user_vars=user_vars,
+        )
 
         # Phase 4: Terraform
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
+        rt.terraform_dir = terraform_dir
 
         terraform = None
         terraform_vars: dict[str, Any] = {}
@@ -1031,12 +1201,12 @@ def deploy_application(
             terraform = TerraformExecutor(
                 terraform_dir,
                 env_vars=openstack_env,
-                backend_conn_str=tfstate_conn_str,
-                backend_schema_name=tfstate_schema,
-                output_callback=_stream_line,
+                backend_conn_str=rt.tfstate_conn_str,
+                backend_schema_name=rt.tfstate_schema,
+                output_callback=rt.stream_line,
             )
 
-            phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+            rt.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
             success, stdout, stderr = terraform.init()
             if not success:
                 # Surface the real reason in the per-deployment log; the
@@ -1059,7 +1229,7 @@ def deploy_application(
             _apply_image_name_vars(
                 terraform_vars,
                 image_names,
-                legacy=len(templates) == 1 and templates[0].key == "default",
+                legacy=_is_legacy_layout(templates),
             )
             if teams:
                 terraform_vars["users"] = teams
@@ -1086,7 +1256,7 @@ def deploy_application(
                 keys=list(terraform_vars.keys()),
             )
 
-            phase_tracker.mark(PHASE_TERRAFORM_PLAN, "Planning Terraform deployment")
+            rt.mark(PHASE_TERRAFORM_PLAN, "Planning Terraform deployment")
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
                 if stdout:
@@ -1097,7 +1267,7 @@ def deploy_application(
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
-            phase_tracker.mark(PHASE_TERRAFORM_APPLY, "Applying configuration (this may take minutes)")
+            rt.mark(PHASE_TERRAFORM_APPLY, "Applying configuration (this may take minutes)")
             success, stdout, stderr = terraform.apply(variables=terraform_vars)
             if not success:
                 if stdout:
@@ -1109,7 +1279,7 @@ def deploy_application(
             task_logger.success("Terraform resources created", category=LogCategory.STATUS)
 
             # Collect outputs and state
-            phase_tracker.mark(PHASE_OUTPUTS_AND_CLEANUP, "Collecting outputs")
+            rt.mark(PHASE_OUTPUTS_AND_CLEANUP, "Collecting outputs")
             outputs = collect_terraform_outputs()
             tf_state = collect_terraform_state()
 
@@ -1143,7 +1313,7 @@ def deploy_application(
                     _apply_image_name_vars(
                         cleanup_tf_vars,
                         image_names,
-                        legacy=len(templates) == 1 and templates[0].key == "default",
+                        legacy=_is_legacy_layout(templates),
                     )
                     if teams:
                         cleanup_tf_vars["users"] = teams
@@ -1203,7 +1373,7 @@ def deploy_application(
     finally:
         # Shred the per-task clouds.yaml first so the credential file is gone
         # even if the repository cleanup below fails or hangs.
-        _cleanup_task_resources(clouds_config, repo_path, task_logger)
+        rt.cleanup()
 
 
 @celery_app.task(bind=True, name="tasks.destroy_deployment")
@@ -1234,84 +1404,37 @@ def destroy_deployment(
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
     """
-    task_logger = get_logger(f"destroy:{deployment_id}", correlation_id=deployment_id)
+    rt = _TaskRuntime(self, deployment_id, log_prefix="destroy", phases=_PHASES_DESTROY)
+    task_logger = rt.logger
 
-    bound_task = self
-
-    def _emit(event_name: str, payload: dict[str, Any]) -> None:
-        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
-
-    task_logger.set_event_emitter(_emit)
-    phase_tracker = _PhaseTracker(task_logger, _PHASES_DESTROY)
-
-    repo_path = None
     tf_state: str | None = None
+    # Pre-bound for the same reason as in ``redeploy_resource``: the
+    # ``except`` handler reads it, and anything raised before
+    # ``_prepare_workspace`` returns would leave it unassigned.
     commit_info: dict[str, Any] | None = None
-    terraform_dir: str | None = None
-    openstack_env: dict[str, str] = {}
-    clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     if teams is None:
         teams = {}
 
-    def _stream_line(tool: str, line: str) -> None:
-        task_logger.tool_output_line(tool, line)
-
     def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return rt.collect_state()
 
     try:
-        phase_tracker.mark(PHASE_STARTING, "Starting destroy")
-        task_logger.resource_info(
-            "deployment",
-            deployment_id,
+        commit_info = _prepare_workspace(
+            rt,
             app_id=app_id,
-            git_url=app_git_link,
+            app_git_link=app_git_link,
             release=release,
-            user_vars_keys=list(user_vars.keys()),
-            teams_keys=list(teams.keys()),
+            openstack_envelope=openstack_envelope,
             action="destroy",
+            resource_info={
+                "user_vars_keys": list(user_vars.keys()),
+                "teams_keys": list(teams.keys()),
+                "action": "destroy",
+            },
         )
-
-        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
-        if not openstack_envelope:
-            raise Exception("OpenStack credential envelope missing — cannot destroy without credentials")
-        task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
-
-        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
-        task_logger.info(
-            f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-            "so terraform code matches the pg-backend state)",
-            category=LogCategory.OPERATION,
-        )
-        try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
-            try:
-                commit_info = _extract_commit_info(repo_path)
-                task_logger.resource_info(
-                    "git_commit",
-                    commit_info["hash"][:8],
-                    hash=commit_info["hash"],
-                    message=commit_info["message"],
-                    author=commit_info["author"],
-                )
-                task_logger.success(
-                    f"Repository cloned at commit {commit_info['hash'][:8]}", category=LogCategory.STATUS
-                )
-            except Exception as e:
-                task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
-        except Exception as e:
-            raise Exception(f"Git clone failed: {str(e)}")
-
-        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
-        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
-        openstack_env = clouds_config.__enter__()
-        task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+        repo_path = rt.repo_path
+        openstack_env = rt.openstack_env
 
         # Reconstruct the same image_name map the deploy task used so
         # the variables match what terraform's state expects to
@@ -1330,6 +1453,7 @@ def destroy_deployment(
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
+        rt.terraform_dir = terraform_dir
 
         # Drop ``@openstack:file:*`` variable values before passing
         # the var-set to terraform destroy. Files are only consumed
@@ -1344,7 +1468,7 @@ def destroy_deployment(
         _apply_image_name_vars(
             terraform_vars,
             image_names,
-            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+            legacy=_is_legacy_layout(templates),
         )
         if teams:
             terraform_vars["users"] = teams
@@ -1353,12 +1477,12 @@ def destroy_deployment(
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
-            output_callback=_stream_line,
+            backend_conn_str=rt.tfstate_conn_str,
+            backend_schema_name=rt.tfstate_schema,
+            output_callback=rt.stream_line,
         )
 
-        phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+        rt.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
         success, stdout, stderr = terraform.init()
         if not success:
             if stdout:
@@ -1368,7 +1492,7 @@ def destroy_deployment(
             raise Exception("Terraform init failed")
         task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
-        phase_tracker.mark(PHASE_TERRAFORM_DESTROY, "Destroying resources")
+        rt.mark(PHASE_TERRAFORM_DESTROY, "Destroying resources")
         success, stdout, stderr = terraform.destroy(variables=terraform_vars)
         # A data source (e.g. the Glance image lookup) is re-read on every
         # destroy refresh. If that image/network was deleted out-of-band,
@@ -1399,7 +1523,7 @@ def destroy_deployment(
         # reach it. Reap it by the exact image name this deploy was
         # building, so a parallel build of another app is never touched.
         if sweep_build_artifacts:
-            phase_tracker.mark(PHASE_CLEANUP, "Reaping build artifacts")
+            rt.mark(PHASE_CLEANUP, "Reaping build artifacts")
             sweeper = OpenStackService(env_vars=openstack_env)
             for image_name in image_names.values():
                 for server_id in sweeper.servers_by_name(image_name):
@@ -1423,7 +1547,7 @@ def destroy_deployment(
             # after its 5-minute TTL.
             task_logger.info("Build lock left to expire (5 min TTL; heartbeat died with the revoked task)")
 
-        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
+        rt.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
 
         task_logger.success(f"Deployment {deployment_id} destroyed successfully", category=LogCategory.STATUS)
@@ -1456,7 +1580,7 @@ def destroy_deployment(
         )
 
     finally:
-        _cleanup_task_resources(clouds_config, repo_path, task_logger)
+        rt.cleanup()
 
 
 # ----------------------------------------------------------------
@@ -1531,76 +1655,40 @@ def _run_compute_lifecycle(
     "stopped 4/5; failed: web-1: locked task" instead of just "pause
     failed" without any pointer to which instance is stuck.
     """
-    label = f"{action}:{deployment_id}"
-    task_logger = get_logger(label, correlation_id=deployment_id)
-
-    bound_task = self
-
-    def _emit(event_name: str, payload: dict[str, Any]) -> None:
-        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
-
-    task_logger.set_event_emitter(_emit)
-    phase_tracker = _PhaseTracker(task_logger, phases)
-
-    repo_path = None
-    terraform_dir: str | None = None
-    openstack_env: dict[str, str] = {}
-    clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
+    rt = _TaskRuntime(self, deployment_id, log_prefix=action, phases=phases)
+    task_logger = rt.logger
 
     if teams is None:
         teams = {}
 
-    def _stream_line(tool: str, line: str) -> None:
-        task_logger.tool_output_line(tool, line)
-
     try:
-        phase_tracker.mark(PHASE_STARTING, f"Starting {action}")
-        task_logger.resource_info(
-            "deployment",
-            deployment_id,
+        _prepare_workspace(
+            rt,
             app_id=app_id,
-            git_url=app_git_link,
+            app_git_link=app_git_link,
             release=release,
+            openstack_envelope=openstack_envelope,
             action=action,
+            resource_info={"action": action},
+            capture_commit=False,
         )
-
-        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
-        if not openstack_envelope:
-            raise Exception(f"OpenStack credential envelope missing — cannot {action} without credentials")
-        task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
-
-        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
-        try:
-            repo_path = git_service.clone_release(
-                git_url=app_git_link,
-                deployment_id=deployment_id,
-                tag=release,
-            )
-            task_logger.success("Repository cloned", category=LogCategory.STATUS)
-        except Exception as e:
-            raise Exception(f"Git clone failed: {str(e)}")
-
-        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
-        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
-        openstack_env = clouds_config.__enter__()
-        task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+        repo_path = rt.repo_path
+        openstack_env = rt.openstack_env
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
+        rt.terraform_dir = terraform_dir
 
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
-            output_callback=_stream_line,
+            backend_conn_str=rt.tfstate_conn_str,
+            backend_schema_name=rt.tfstate_schema,
+            output_callback=rt.stream_line,
         )
 
-        phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+        rt.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
         success, stdout, stderr = terraform.init()
         if not success:
             if stdout:
@@ -1630,7 +1718,7 @@ def _run_compute_lifecycle(
             server_ids=server_ids,
         )
 
-        phase_tracker.mark(
+        rt.mark(
             server_phase,
             f"{'Stopping' if server_op == 'stop' else 'Starting'} {len(server_ids)} server(s)",
         )
@@ -1670,7 +1758,7 @@ def _run_compute_lifecycle(
             joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
             raise Exception(f"{action} failed for {len(failures)}/{len(server_ids)} server(s): {joined}")
 
-        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state snapshot")
+        rt.mark(PHASE_CLEANUP, "Pulling final state snapshot")
         # State doesn't change for pause/resume (the resources still
         # exist, just in a different power state), but we pull it
         # again so the task row gets a fresh snapshot for debugging.
@@ -1712,7 +1800,7 @@ def _run_compute_lifecycle(
         )
 
     finally:
-        _cleanup_task_resources(clouds_config, repo_path, task_logger)
+        rt.cleanup()
 
 
 @celery_app.task(bind=True, name="tasks.pause_deployment")
@@ -1953,42 +2041,24 @@ def redeploy_resource(
     Returns the same payload shape as deploy/destroy so the celery
     event listener stays generic.
     """
-    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id)
+    rt = _TaskRuntime(self, deployment_id, log_prefix="redeploy", phases=_PHASES_REDEPLOY)
+    task_logger = rt.logger
 
-    bound_task = self
-
-    def _emit(event_name: str, payload: dict[str, Any]) -> None:
-        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
-
-    task_logger.set_event_emitter(_emit)
-    phase_tracker = _PhaseTracker(task_logger, _PHASES_REDEPLOY)
-
-    repo_path: str | None = None
     tf_state: str | None = None
     outputs: dict[str, Any] | None = None
+    # Pre-bound: the invalid-address guard below raises before
+    # ``_prepare_workspace`` returns, and the ``except`` handler reads
+    # this when it assembles the Failure payload.
     commit_info: dict[str, Any] | None = None
-    terraform_dir: str | None = None
-    openstack_env: dict[str, str] = {}
-    clouds_config: PerTaskCloudsConfig | None = None
-
-    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     if teams is None:
         teams = {}
 
-    def _stream_line(tool: str, line: str) -> None:
-        task_logger.tool_output_line(tool, line)
-
     def collect_terraform_state():
-        return collect_terraform_state_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return rt.collect_state()
 
     def collect_terraform_outputs():
-        return collect_terraform_outputs_helper(
-            terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger
-        )
+        return rt.collect_outputs()
 
     try:
         # Validate the address shape before we do any work. Backend
@@ -1998,47 +2068,23 @@ def redeploy_resource(
         if not resource_address or not _REDEPLOY_ADDRESS_RE.match(resource_address):
             raise Exception(f"redeploy_resource called with invalid resource_address: " f"{resource_address!r}")
 
-        phase_tracker.mark(PHASE_STARTING, f"Starting redeploy of {resource_address}")
-        task_logger.resource_info(
-            "deployment",
-            deployment_id,
+        commit_info = _prepare_workspace(
+            rt,
             app_id=app_id,
-            git_url=app_git_link,
+            app_git_link=app_git_link,
             release=release,
-            user_vars_keys=list(user_vars.keys()),
-            teams_keys=list(teams.keys()),
+            openstack_envelope=openstack_envelope,
             action="redeploy",
-            resource_address=resource_address,
+            start_message=f"Starting redeploy of {resource_address}",
+            resource_info={
+                "user_vars_keys": list(user_vars.keys()),
+                "teams_keys": list(teams.keys()),
+                "action": "redeploy",
+                "resource_address": resource_address,
+            },
         )
-
-        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
-        if not openstack_envelope:
-            raise Exception("OpenStack credential envelope missing — cannot redeploy without credentials")
-        task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
-
-        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
-        task_logger.info(
-            f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-            "so terraform code matches the pg-backend state)",
-            category=LogCategory.OPERATION,
-        )
-        try:
-            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
-            try:
-                commit_info = _extract_commit_info(repo_path)
-                task_logger.success(
-                    f"Repository cloned at commit {commit_info['hash'][:8]}",
-                    category=LogCategory.STATUS,
-                )
-            except Exception as e:
-                task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
-        except Exception as e:
-            raise Exception(f"Git clone failed: {str(e)}")
-
-        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
-        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
-        openstack_env = clouds_config.__enter__()
-        task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+        repo_path = rt.repo_path
+        openstack_env = rt.openstack_env
 
         # Reconstruct the same image_name map the original deploy
         # used so the apply's variable validation matches.
@@ -2056,6 +2102,7 @@ def redeploy_resource(
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
+        rt.terraform_dir = terraform_dir
 
         # Build the terraform var-set like the original deploy. We KEEP
         # file variables here: ``terraform apply -replace`` recreates the
@@ -2074,7 +2121,7 @@ def redeploy_resource(
         _apply_image_name_vars(
             terraform_vars,
             image_names,
-            legacy=not templates or (len(templates) == 1 and templates[0].key == "default"),
+            legacy=_is_legacy_layout(templates),
         )
         if teams:
             terraform_vars["users"] = teams
@@ -2083,12 +2130,12 @@ def redeploy_resource(
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=tfstate_conn_str,
-            backend_schema_name=tfstate_schema,
-            output_callback=_stream_line,
+            backend_conn_str=rt.tfstate_conn_str,
+            backend_schema_name=rt.tfstate_schema,
+            output_callback=rt.stream_line,
         )
 
-        phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+        rt.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
         success, stdout, stderr = terraform.init()
         if not success:
             if stdout:
@@ -2098,7 +2145,7 @@ def redeploy_resource(
             raise Exception("Terraform init failed")
         task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
-        phase_tracker.mark(
+        rt.mark(
             PHASE_TERRAFORM_APPLY,
             f"Applying replace for {resource_address}",
         )
@@ -2122,7 +2169,7 @@ def redeploy_resource(
             category=LogCategory.STATUS,
         )
 
-        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
+        rt.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
         outputs = collect_terraform_outputs()
 
@@ -2154,4 +2201,4 @@ def redeploy_resource(
         )
 
     finally:
-        _cleanup_task_resources(clouds_config, repo_path, task_logger)
+        rt.cleanup()
