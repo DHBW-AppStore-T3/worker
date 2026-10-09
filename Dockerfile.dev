@@ -16,8 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenStack CLI
-RUN pip install --no-cache-dir python-openstackclient
+# Install OpenStack CLI (urllib3 floor: see Dockerfile)
+RUN pip install --no-cache-dir python-openstackclient "urllib3>=2.8.0"
 
 # Install Terraform
 ARG TERRAFORM_VERSION=1.6.6

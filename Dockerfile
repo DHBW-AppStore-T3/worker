@@ -59,8 +59,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # HIGH/CRITICAL here blocks the push.
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# OpenStack CLI installieren
-RUN pip install --no-cache-dir python-openstackclient
+# OpenStack CLI installieren. This layer comes from the GHA build cache
+# for as long as the line is unchanged, so newer transitive deps never
+# arrive by themselves; the urllib3 floor pulls in the fixes for
+# CVE-2026-97687 / CVE-2026-97689 (HIGH, Trivy blocks the push).
+RUN pip install --no-cache-dir python-openstackclient "urllib3>=2.8.0"
 
 # Terraform installieren (platform-aware)
 RUN ARCH="${TARGETARCH:-amd64}" && \
