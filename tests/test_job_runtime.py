@@ -278,3 +278,43 @@ def test_unknown_task_name_fails_the_pending_task(pg):
     assert row["status"] == "FAILED" and "tasks.no_such_task" in row["logs"]
     ((event_type, payload),) = _events(pg, task_id)
     assert event_type == EVENT_FAILED and payload["failure_kind"] == FAILURE_KIND_INFRASTRUCTURE
+
+
+# ----------------------------------------------------------------
+# With the worker's own database role
+# ----------------------------------------------------------------
+@pytest.fixture
+def as_worker_role(pg_url, monkeypatch):
+    """Jobs connect as ``appstore_worker`` (grants of the API's migration, see tests/schema.sql)."""
+    host_part = pg_url.split("@", 1)[1]
+    monkeypatch.setattr(
+        "app.db.settings.DATABASE_URL", f"postgresql://appstore_worker:worker-test-password@{host_part}"
+    )
+
+
+@pytest.mark.timeout(60)
+def test_jobs_need_no_more_than_the_worker_role(pg, pg_url, as_worker_role):
+    ok_id, _ = _task(pg)
+    ok_task.apply(task_id=ok_id, kwargs={"lines": 2})
+    assert _row(pg, ok_id)["status"] == "SUCCESS"
+
+    failed_id, _ = _task(pg)
+    failing_task.apply(task_id=failed_id)
+    assert _row(pg, failed_id)["status"] == "FAILED"
+
+    lost_id, _ = _task(pg, status="RUNNING", claimed_by="dead:1")
+    pg.execute("""UPDATE tasks SET lease_until = now() - interval '1 second' WHERE "taskId" = %s""", (lost_id,))
+    ok_task.apply(task_id=lost_id)
+    assert _row(pg, lost_id)["status"] == "FAILED"
+
+    cancelled_id, _ = _task(pg)
+    canceller = threading.Thread(target=_cancel_like_the_api, args=(pg_url, cancelled_id, 1.5))
+    canceller.start()
+    long_tool_task.apply(task_id=cancelled_id, kwargs={"seconds": 40})
+    canceller.join()
+    row = _row(pg, cancelled_id)
+    assert row["status"] == "CANCELLED" and row["lease_until"] is None
+
+    unknown_id, _ = _task(pg)
+    job_runtime.fail_unknown(unknown_id, "tasks.nope")
+    assert _row(pg, unknown_id)["status"] == "FAILED"

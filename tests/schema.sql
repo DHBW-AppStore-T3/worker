@@ -63,3 +63,23 @@ BEGIN
 END
 $$;
 CREATE TRIGGER task_events_notify AFTER INSERT ON task_events FOR EACH ROW EXECUTE FUNCTION task_events_notify();
+
+-- The worker's role with the grants of migration 5e1f0c2a9b7d; the tests
+-- in tests/test_job_runtime.py run jobs as this role to prove the worker
+-- needs no more than that.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'appstore_worker') THEN
+        CREATE ROLE appstore_worker NOLOGIN;
+    END IF;
+END
+$$;
+ALTER ROLE appstore_worker LOGIN PASSWORD 'worker-test-password';
+GRANT USAGE ON SCHEMA public TO appstore_worker;
+GRANT SELECT, UPDATE, DELETE ON celery_queue TO appstore_worker;
+GRANT INSERT ON task_events TO appstore_worker;
+GRANT SELECT ("taskId", "deploymentId", type, status, claimed_by, lease_until, cancel_requested_at)
+   ON tasks TO appstore_worker;
+GRANT UPDATE (status, started_at, finished_at, logs, outputs_enc, current_phase, progress_pct,
+              claimed_by, lease_until)
+   ON tasks TO appstore_worker;

@@ -33,14 +33,20 @@ VISIBILITY_SECONDS = 3
 
 
 @pytest.fixture
-def worker(pg, tmp_path):
-    """Start ``celery worker`` processes; all of them are stopped at the end."""
+def worker(pg, pg_url, tmp_path):
+    """Start ``celery worker`` processes; all of them are stopped at the end.
+
+    They connect as ``appstore_worker`` with the grants of the API's
+    migration (tests/schema.sql), like in production.
+    """
     procs: list[subprocess.Popen] = []
     heartbeat = tmp_path / "heartbeat"
+    worker_url = f"postgresql://appstore_worker:worker-test-password@{pg_url.split('@', 1)[1]}"
 
     def start() -> subprocess.Popen:
         env = {
             **os.environ,
+            "DATABASE_URL": worker_url,
             "TASK_LEASE_SECONDS": str(LEASE_SECONDS),
             "WORKER_QUEUE_VISIBILITY_SECONDS": str(VISIBILITY_SECONDS),
             "WORKER_HEARTBEAT_FILE": str(heartbeat),

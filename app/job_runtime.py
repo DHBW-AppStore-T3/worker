@@ -137,8 +137,8 @@ def kill_process_group(process: subprocess.Popen, sig: int) -> None:
     with contextlib.suppress(OSError, ProcessLookupError):
         if hasattr(os, "killpg"):
             os.killpg(process.pid, sig)
-        else:  # pragma: no cover - Windows development only
-            process.kill()
+        else:  # pragma: no cover - Windows development only: no process groups, kill the tree
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, check=False)
 
 
 # ----------------------------------------------------------------
@@ -186,12 +186,13 @@ def _fail_lost(conn: psycopg.Connection, task_id: str, deployment_id: str, task_
         failed = conn.execute(
             """
             UPDATE tasks
-               SET status = 'FAILED', finished_at = timezone('UTC', now()), lease_until = NULL,
-                   logs = CASE WHEN logs IS NULL THEN %s ELSE logs || E'\\n\\n' || %s END
+               SET status = 'FAILED', finished_at = timezone('UTC', now()), lease_until = NULL, logs = %s
              WHERE "taskId" = %s AND status = 'RUNNING' AND (lease_until IS NULL OR lease_until < now())
             RETURNING 1
             """,
-            (WORKER_LOST_MESSAGE, WORKER_LOST_MESSAGE, task_id),
+            # The dead worker never wrote a transcript (that happens at the
+            # end of a job), so there is nothing to keep.
+            (WORKER_LOST_MESSAGE, task_id),
         ).fetchone()
         if failed is None:
             return
@@ -476,17 +477,22 @@ class Job:
             previous = conn.execute(
                 'SELECT status FROM tasks WHERE "taskId" = %s FOR UPDATE', (self.task_id,)
             ).fetchone()
+            ours = previous is not None and previous[0] == "RUNNING"
+            # Only write, never read, the result columns: the worker's role
+            # may update them but not select them (migration 5e1f0c2a9b7d).
+            assignments = ["logs = %s", "lease_until = NULL"]
+            params: list[Any] = [logs]
+            if ours:
+                assignments += ["status = %s::taskstatus", "finished_at = timezone('UTC', now())"]
+                params.append(status)
+            if sealed is not None:
+                assignments.append("outputs_enc = %s")
+                params.append(sealed)
             conn.execute(
-                """
-                UPDATE tasks
-                   SET status = CASE WHEN status = 'RUNNING' THEN %s::taskstatus ELSE status END,
-                       finished_at = CASE WHEN status = 'RUNNING' THEN timezone('UTC', now()) ELSE finished_at END,
-                       logs = %s, outputs_enc = COALESCE(%s, outputs_enc), lease_until = NULL
-                 WHERE "taskId" = %s AND claimed_by = %s
-                """,
-                (status, logs, sealed, self.task_id, self.worker),
+                f'UPDATE tasks SET {", ".join(assignments)} WHERE "taskId" = %s AND claimed_by = %s',
+                (*params, self.task_id, self.worker),
             )
-            if previous is not None and previous[0] == "RUNNING" and event_type is not None:
+            if ours and event_type is not None:
                 _insert_events(
                     conn,
                     self.task_id,
