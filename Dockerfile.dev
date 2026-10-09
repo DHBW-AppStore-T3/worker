@@ -38,14 +38,17 @@ RUN curl -sSL https://install.python-poetry.org | python3 - && \
     ln -s /root/.local/bin/poetry /usr/local/bin/poetry
 
 # Copy Poetry files and install dependencies
-COPY pyproject.toml ./
+COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --no-interaction --no-ansi
 
 # Copy application code
 COPY . .
 
-# Create temp directory for repositories
-RUN mkdir -p /tmp/worker_repos
+# Create temp directory for repositories (and the slot users' homes, if
+# WORKER_JOB_UID_BASE is set)
+RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
+    chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
 
-# Starte Celery Worker mit poetry run
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+# Starte Celery Worker mit poetry run (fixed pool; no events, gossip or
+# mingle: the Postgres transport has no fanout, .github#5)
+CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=2", "--without-gossip", "--without-mingle", "--without-heartbeat"]

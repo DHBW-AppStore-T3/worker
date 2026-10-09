@@ -5,11 +5,12 @@
 # revisit when the upstream advisory changes.
 
 # AVD-DS-0002: Dockerfile/Dockerfile.dev run as root.
-# The worker invokes terraform / packer / openstack CLI against
-# bind-mounted git repos. Switching to non-root requires verifying
-# that all three toolchains can write into /tmp/worker_repos and
-# .terraform plugin caches without permission issues — and that
-# bind-mount UIDs line up on macOS + Linux. Tracked in #16.
+# On purpose since .github#7 A: the worker runs as root only to start
+# its tools (terraform / packer / openstack CLI, which run app code) as
+# the worker slot's own unprivileged user (UID 20000+n, app/job_context.py),
+# so that app code cannot read the worker's database URL, Fernet key or
+# Git token. Compose drops every capability except CHOWN, DAC_OVERRIDE,
+# FOWNER, SETUID, SETGID and KILL.
 AVD-DS-0002
 
 # Packer upstream CVE backlog — Packer's latest release (v1.15.3)

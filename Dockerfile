@@ -86,17 +86,31 @@ COPY --from=builder /app/.venv /app/.venv
 # Application Code kopieren
 COPY app/ ./app/
 
-# Arbeitsverzeichnis für Worker
-RUN mkdir -p /tmp/worker_repos
+# Job directories (one per deployment, handed to the slot's user) and the
+# slot users' homes: traversable, not listable, for the slot users.
+RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
+    chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
 
 # Environment für .venv
+# WORKER_JOB_UID_BASE: worker slot n runs its tools (terraform, packer,
+# openstack CLI) as UID 20000+n (.github#7 A, app/job_context.py). That is
+# why the worker runs as root (.trivyignore AVD-DS-0002): only to drop to
+# the slot's user for the tools, which run app code we do not control and
+# must not read the worker's database URL or Fernet key. Compose drops all
+# capabilities except CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID, KILL.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    WORKER_JOB_UID_BASE=20000 \
+    WORKER_HEARTBEAT_FILE=/tmp/worker-heartbeat
 
-# Health check (optional - prüft ob Celery läuft)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD celery -A app.celery_app inspect ping -d celery@$HOSTNAME || exit 1
+# The worker's main process touches the heartbeat file every 30 s
+# (app/celery_app.py, HeartbeatFile). ``celery inspect ping`` needs Celery
+# remote control, which the Postgres transport does not have (.github#5).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
 
-# Celery Worker starten
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+# Celery Worker starten: fixed pool (slot n = UID 20000+n), no Celery
+# events, gossip or mingle (they need a fanout exchange). Concurrency can
+# be overridden by the deployment (command).
+CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "--without-gossip", "--without-mingle", "--without-heartbeat"]
