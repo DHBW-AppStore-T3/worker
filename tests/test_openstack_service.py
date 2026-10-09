@@ -61,11 +61,11 @@ class TestRun:
         assert kwargs["text"] is True
         assert kwargs["timeout"] == 30
 
-    def test_run_merges_env_vars_on_top_of_os_environ(self, service, mocker):
-        """_run merges self.env_vars on top of os.environ in the env kwarg."""
+    def test_run_puts_env_vars_on_top_of_the_minimal_env(self, service, mocker):
+        """_run passes self.env_vars on top of the job's minimal env, nothing else of the worker's (.github#7 A)."""
         mocker.patch.dict(
-            "app.services.openstack_service.os.environ",
-            {"PATH": "/usr/bin", "OS_AUTH_URL": "should-be-overridden"},
+            "os.environ",
+            {"PATH": "/usr/bin", "OS_AUTH_URL": "should-be-overridden", "DATABASE_URL": "secret"},
             clear=True,
         )
         mock_sp = mocker.patch(
@@ -74,8 +74,9 @@ class TestRun:
         )
         service._run(["openstack", "image", "list"])
         env_passed = mock_sp.call_args.kwargs["env"]
-        # os.environ values present
+        # PATH comes from the worker, nothing else of its environment
         assert env_passed["PATH"] == "/usr/bin"
+        assert "DATABASE_URL" not in env_passed
         # env_vars override and add OS_* values
         assert env_passed["OS_AUTH_URL"] == "https://keystone.example.com:5000/v3"
         assert env_passed["OS_USERNAME"] == "test-user"

@@ -1,10 +1,18 @@
 """Pytest configuration and fixtures."""
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# ``app.config`` requires DATABASE_URL. Unit tests never connect; the
+# integration tests use this database (CI: the Postgres service) and build
+# the worker's part of the schema in it (tests/schema.sql).
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/worker_test")
+
+SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
 # ----------------------------------------------------------------
@@ -49,3 +57,32 @@ def mock_git_url():
 def mock_tag():
     """Mock Git tag for testing."""
     return "v1.0.0"
+
+
+# ----------------------------------------------------------------
+# Database (integration tests)
+# ----------------------------------------------------------------
+@pytest.fixture(scope="session")
+def pg_url():
+    """The test database with the worker's tables; skips when it is not reachable."""
+    import psycopg
+
+    from app.pgq import libpq_url
+
+    url = libpq_url(os.environ["DATABASE_URL"])
+    try:
+        with psycopg.connect(url, autocommit=True, connect_timeout=5) as conn:
+            conn.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+    except psycopg.OperationalError as e:
+        pytest.skip(f"no test database at DATABASE_URL: {e}")
+    return url
+
+
+@pytest.fixture
+def pg(pg_url):
+    """An autocommit connection to the test database; tables are emptied afterwards."""
+    import psycopg
+
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        yield conn
+        conn.execute("TRUNCATE task_events, celery_queue, tasks CASCADE")

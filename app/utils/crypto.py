@@ -1,8 +1,8 @@
 """Symmetric encryption mirror for the worker.
 
 Identical surface to `backend/app/utils/crypto.py` so behaviour cannot drift.
-The shared `CREDENTIAL_ENCRYPTION_KEY` lets the worker decrypt envelopes the
-backend pushed onto the Celery queue without ever touching the database.
+The shared `CREDENTIAL_ENCRYPTION_KEY` lets the worker decrypt the envelopes
+that arrive with a task, and seal the task's results for the database.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ def _build_cipher() -> Fernet:
 
 _cipher = _build_cipher()
 
+#: The shared Fernet instance; seals task results (``task_contract.seal_results``).
+cipher = _cipher
+
 
 def encrypt(plaintext: str) -> bytes:
     return _cipher.encrypt(plaintext.encode("utf-8"))
@@ -46,4 +49,4 @@ def decrypt_b64(token_b64: str) -> str:
     return decrypt(base64.b64decode(token_b64.encode("ascii")))
 
 
-__all__ = ["encrypt", "decrypt", "encrypt_b64", "decrypt_b64", "InvalidToken"]
+__all__ = ["cipher", "encrypt", "decrypt", "encrypt_b64", "decrypt_b64", "InvalidToken"]

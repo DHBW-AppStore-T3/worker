@@ -3,18 +3,18 @@ Packer execution utilities with comprehensive structured logging.
 
 ``init`` and ``build`` stream their output line-by-line via
 ``_stream_subprocess`` so the deploy task's per-deployment logger can ship
-each line onto the Celery event bus while the build is still running.
-``validate`` is short and stays as a buffered call.
+each line into the task's live events while the build is still running.
+``validate`` is short and stays as a buffered call. All three run within
+the job's limits (``job_context``: minimal environment, the slot's user).
 """
 
 import json
-import os
-import subprocess
 from typing import Any
 
+from .. import job_context
 from ..config import settings
 from ..utils.logger import LogCategory, get_logger
-from .terraform_executor import OutputCallback, _stream_subprocess
+from .terraform_executor import OutputCallback, _run_buffered, _stream_subprocess
 
 logger = get_logger(__name__)
 
@@ -24,7 +24,7 @@ class PackerExecutor:
 
     ``output_callback`` is optional; when set, each line of subprocess
     output is fed to it as it arrives. Used by the deploy task to forward
-    Packer build output onto the Celery event bus during long builds.
+    Packer build output into the task's live events during long builds.
     """
 
     def __init__(
@@ -39,13 +39,15 @@ class PackerExecutor:
         self.output_callback = output_callback
 
     def _get_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
-        """Get environment variables including OpenStack credentials and Packer debug logging."""
-        env = os.environ.copy()
-        env.update(self.env_vars)
+        """The tool's whole environment: the job's minimum, the OpenStack credentials, debug logging.
+
+        Nothing is inherited from the worker (.github#7 A).
+        """
+        extra = dict(self.env_vars)
         if extra_env:
-            env.update(extra_env)
-        env["PACKER_LOG"] = "1"
-        return env
+            extra.update(extra_env)
+        extra["PACKER_LOG"] = "1"
+        return job_context.current().env(extra)
 
     def init(self) -> tuple[bool, str, str]:
         """Initialize Packer (install required plugins). Streams output."""
@@ -98,9 +100,7 @@ class PackerExecutor:
             cmd.append(".")
 
             logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
-            )
+            result = _run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
             success = result.returncode == 0
 
             if result.stdout:

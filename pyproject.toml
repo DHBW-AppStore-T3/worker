@@ -7,7 +7,7 @@ package-mode = false
 authors = [
     "Your Name <your.email@example.com>"
 ]
-keywords = ["celery", "redis", "terraform", "packer", "git", "worker"]
+keywords = ["celery", "postgres", "terraform", "packer", "git", "worker"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -18,9 +18,11 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
-celery = {extras = ["redis"], version = "^5.3.4"}
-sqlalchemy = "^2.0.23"
-psycopg2-binary = "^2.9.9"
+# Broker: the API's Postgres through the pgq transport (app/pgq.py,
+# .github#5); no RabbitMQ, no Redis.
+celery = "^5.3.4"
+# psycopg 3: transport, task events, leases, cancel LISTEN, build lock.
+psycopg = {extras = ["binary"], version = ">=3.2"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.14.2"
 gitpython = ">=3.1.62"
@@ -28,7 +30,6 @@ python-dotenv = "^1.0.0"
 pyyaml = "^6.0.1"
 watchdog = "^4.0"
 cryptography = ">=50.0.1"
-redis = "^5.0"
 msgpack = ">=1.2.1"
 
 [tool.poetry.group.dev.dependencies]

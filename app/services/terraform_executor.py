@@ -4,10 +4,14 @@ Terraform execution utilities with comprehensive structured logging.
 Each long-running command (init, plan, apply, destroy) streams its
 combined stdout/stderr line-by-line through an optional ``output_callback``
 so a higher-level consumer (the deploy task's per-deployment logger) can
-forward each line onto the Celery event bus while the command is still
+forward each line into the task's live events while the command is still
 running. The full output is also kept in memory and returned at the end
 in the same ``(success, stdout, stderr)`` tuple as before, so existing
 callers keep working unchanged.
+
+Every tool run goes through :mod:`app.job_context` (minimal environment,
+the worker slot's own user, .github#7 A) and :mod:`app.job_runtime` (a
+cancel stops the running tool and the job, .github#5).
 """
 
 import contextlib
@@ -18,6 +22,7 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from .. import job_context, job_runtime
 from ..config import settings
 from ..utils.logger import LogCategory, get_logger
 
@@ -69,7 +74,12 @@ def _stream_subprocess(
     process group is killed (children inherit the same group via
     ``start_new_session``) so terraform's child providers don't survive
     as orphans.
+
+    The tool runs as the job's slot user (``job_context``) and is
+    registered with the running job, so a cancel kills its process group;
+    a cancelled job raises ``JobCancelled`` before and after the tool.
     """
+    job_runtime.check_cancelled()
     process = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -80,6 +90,7 @@ def _stream_subprocess(
         # Terraform fills its 64 KiB pipe buffer
         env=env,
         start_new_session=True,
+        **job_context.current().popen_kwargs(),
     )
     output_lines: list[str] = []
 
@@ -102,31 +113,52 @@ def _stream_subprocess(
     reader = threading.Thread(target=_drain_stdout, name=f"{tool_name}-reader", daemon=True)
     reader.start()
 
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Kill the whole process group — terraform spawns provider plugins
-        # as children and a plain process.kill() would orphan them.
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, 9)
-        reader.join(timeout=2)
-        return 124, "\n".join(output_lines), "Timeout"
-    except BaseException:
-        # Anything that unwinds us other than a timeout: a Celery revoke
-        # (billiard raises ``Terminated``), a soft time limit, or worker
-        # shutdown. ``start_new_session=True`` put the child in its own
-        # process group, so it does NOT die with us - a revoked deploy
-        # would otherwise leave packer or terraform running against the
-        # tenant with nobody watching, still holding the build lock and
-        # still creating instances. Kill the group, then re-raise so
-        # Celery still sees the task as terminated.
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, 9)
-        reader.join(timeout=2)
-        raise
+    with job_runtime.track(process):
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the whole process group — terraform spawns provider plugins
+            # as children and a plain process.kill() would orphan them.
+            job_runtime.kill_process_group(process, 9)
+            reader.join(timeout=2)
+            return 124, "\n".join(output_lines), "Timeout"
+        except BaseException:
+            # Anything that unwinds us other than a timeout: a soft time
+            # limit or worker shutdown. ``start_new_session=True`` put the
+            # child in its own process group, so it does NOT die with us -
+            # the job would otherwise leave packer or terraform running
+            # against the tenant with nobody watching, still holding the
+            # build lock and still creating instances. Kill the group, then
+            # re-raise.
+            job_runtime.kill_process_group(process, 9)
+            reader.join(timeout=2)
+            raise
 
     reader.join(timeout=5)
+    job_runtime.check_cancelled()
     return returncode, "\n".join(output_lines), ""
+
+
+def _run_buffered(cmd: list[str], *, cwd: str | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess:
+    """A short tool call (seconds), like ``subprocess.run``, within the job's limits.
+
+    Runs as the job's slot user in a session of its own. It is not killed by
+    a cancel - it ends within its timeout - but a cancelled job raises
+    ``JobCancelled`` before and right after it.
+    """
+    job_runtime.check_cancelled()
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        start_new_session=True,
+        **job_context.current().popen_kwargs(),
+    )
+    job_runtime.check_cancelled()
+    return result
 
 
 class TerraformExecutor:
@@ -139,8 +171,7 @@ class TerraformExecutor:
 
     ``output_callback`` is optional; if set, each line of subprocess output
     is fed to it as it arrives. The deploy task uses this to forward lines
-    onto its per-deployment logger which then ships them to the backend
-    via Celery custom events.
+    onto its per-deployment logger, which writes them as live task events.
     """
 
     def __init__(
@@ -159,11 +190,15 @@ class TerraformExecutor:
         self.output_callback = output_callback
 
     def _get_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
-        """Get environment variables including OpenStack credentials and Terraform debug logging."""
-        env = os.environ.copy()
-        env.update(self.env_vars)
+        """The tool's whole environment: the job's minimum plus the OpenStack credentials.
+
+        Nothing is inherited from the worker (.github#7 A): app code run by
+        terraform (``local-exec``) must not see the worker's database URL,
+        Fernet key or Git token.
+        """
+        extra = dict(self.env_vars)
         if extra_env:
-            env.update(extra_env)
+            extra.update(extra_env)
         # ``TF_LOG`` is honoured by the terraform CLI and emits an enormous
         # amount of provider/RPC trace to stderr — useful when debugging
         # the worker itself, but it drowns the human-readable error block
@@ -171,15 +206,13 @@ class TerraformExecutor:
         # ``WORKER_TF_LOG`` if you really want it.
         tf_log = os.environ.get("WORKER_TF_LOG", "")
         if tf_log:
-            env["TF_LOG"] = tf_log
-        else:
-            env.pop("TF_LOG", None)
+            extra["TF_LOG"] = tf_log
         # PG_CONN_STR is read by Terraform's pg backend. Putting it in env
         # (not -backend-config="conn_str=...") keeps the password out of
         # the process listing and command logs.
         if self.backend_conn_str:
-            env["PG_CONN_STR"] = self.backend_conn_str
-        return env
+            extra["PG_CONN_STR"] = self.backend_conn_str
+        return job_context.current().env(extra)
 
     def _write_pg_backend_override(self) -> None:
         """Write ``pg_backend_override.tf`` so init configures the pg backend.
@@ -421,9 +454,7 @@ class TerraformExecutor:
         try:
             cmd = [self.terraform_path, "output", "-json"]
             logger.debug(f"[TF] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
-            )
+            result = _run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
             if result.returncode != 0:
                 logger.warning(
                     "Terraform output retrieval failed", category=LogCategory.OPERATION, returncode=result.returncode
@@ -450,14 +481,7 @@ class TerraformExecutor:
         """
         try:
             cmd = [self.terraform_path, "state", "pull"]
-            result = subprocess.run(
-                cmd,
-                cwd=self.working_dir,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=self._get_env(),
-            )
+            result = _run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
             if result.returncode != 0:
                 logger.warning(
                     "Terraform state pull failed",

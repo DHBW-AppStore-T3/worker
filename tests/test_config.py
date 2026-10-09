@@ -20,8 +20,8 @@ class TestConfiguration:
         """Test that required settings attributes exist."""
         from app.config import settings
 
+        assert hasattr(settings, "DATABASE_URL")
         assert hasattr(settings, "CELERY_BROKER_URL")
-        assert hasattr(settings, "CELERY_RESULT_BACKEND")
         assert hasattr(settings, "TEMP_REPO_BASE_PATH")
         assert hasattr(settings, "GIT_ACCESS_TOKEN")
         assert hasattr(settings, "CREDENTIAL_ENCRYPTION_KEY")
@@ -30,7 +30,7 @@ class TestConfiguration:
         os.environ,
         {
             "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
-            "CELERY_BROKER_URL": "amqp://test@localhost",
+            "DATABASE_URL": "postgresql+psycopg2://appstore_worker:pw@postgres:5432/appstore",
             "GIT_ACCESS_TOKEN": "test-token",
         },
         clear=True,
@@ -43,5 +43,23 @@ class TestConfiguration:
 
         reload(config)
 
-        assert "amqp" in config.settings.CELERY_BROKER_URL
+        # The broker defaults to the database, through the pgq transport.
+        assert config.settings.celery_broker_url == "pgq+postgresql://appstore_worker:pw@postgres:5432/appstore"
         assert config.settings.GIT_ACCESS_TOKEN == "test-token"
+
+    @patch.dict(
+        os.environ,
+        {
+            "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
+            "DATABASE_URL": "postgresql://u:p@db/x",
+            "CELERY_BROKER_URL": "pgq+postgresql://other@db/y",
+        },
+        clear=True,
+    )
+    def test_explicit_broker_url_wins(self):
+        from importlib import reload
+
+        from app import config
+
+        reload(config)
+        assert config.settings.celery_broker_url == "pgq+postgresql://other@db/y"

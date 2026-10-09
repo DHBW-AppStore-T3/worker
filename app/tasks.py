@@ -6,8 +6,11 @@ from typing import Any
 
 import git
 
+from . import job_context, job_runtime
 from .celery_app import celery_app
 from .config import settings
+from .failure import Failure
+from .job_task import JobTask
 from .services import (
     OpenStackService,
     PackerBuildLock,
@@ -35,75 +38,6 @@ def _tfstate_schema_name(deployment_id: str) -> str:
     backend-config plumbing.
     """
     return f"deployment_{deployment_id.replace('-', '_')}"
-
-
-class Failure(Exception):
-    """Custom exception that carries deployment details for Celery.
-
-    The full failure payload is serialised once into ``args[0]`` as a JSON
-    string. The backend's celery event listener parses that JSON back via
-    a ``Failure\\('<json>'\\)`` regex over the traceback.
-
-    ``__reduce__`` is overridden so pickle reconstructs the exception via
-    the ``_from_payload`` classmethod, which accepts the single JSON string
-    directly.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        deployment_id: str,
-        logs_dict: list[dict[str, Any]] | dict[str, Any],
-        tf_state: str | None = None,
-        commit_info: dict[str, Any] | None = None,
-        terraform_outputs: dict[str, Any] | None = None,
-    ):
-        self.deployment_id = deployment_id
-        self.logs_dict = logs_dict
-        self.tf_state = tf_state
-        self.commit_info = commit_info
-        self.terraform_outputs = terraform_outputs
-
-        # Encode all data as JSON in the exception message
-        data = {
-            "error": message,
-            "deployment_id": deployment_id,
-            "logs": logs_dict,
-            "tf_state": tf_state,
-            "commit_info": commit_info,
-            "terraform_outputs": terraform_outputs,
-        }
-        super().__init__(json.dumps(data))
-
-    @classmethod
-    def _from_payload(cls, payload: str) -> "Failure":
-        """Reconstruct a Failure from its serialised JSON payload.
-
-        Used by ``__reduce__`` so pickle can round-trip the exception.
-        """
-        data = json.loads(payload)
-        instance = cls.__new__(cls)
-        instance.deployment_id = data.get("deployment_id", "")
-        instance.logs_dict = data.get("logs")
-        instance.tf_state = data.get("tf_state")
-        instance.commit_info = data.get("commit_info")
-        instance.terraform_outputs = data.get("terraform_outputs")
-        Exception.__init__(instance, payload)
-        return instance
-
-    def __reduce__(self):
-        # The single-arg constructor here is ``_from_payload``; args[0] is
-        # the JSON string we built in __init__.
-        return (Failure._from_payload, (self.args[0] if self.args else "{}",))
-
-    def __repr__(self) -> str:
-        # Pin the repr format that the backend's celery event listener
-        # relies on (regex ``Failure\('(.+)'\)``).
-        return f"Failure({self.args[0]!r})" if self.args else "Failure()"
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert exception data to dict for serialization"""
-        return json.loads(str(self))
 
 
 # --- Variable encoding for Packer/Terraform CLI ----------------------------
@@ -715,7 +649,7 @@ class _TaskRuntime:
 
     All four task bodies (deploy, destroy, redeploy and the pause/resume
     pair) opened with the same seventy-odd lines: build a correlated
-    logger, bridge it onto Celery's event bus, start a phase tracker,
+    logger, bridge it onto the task's live events, start a phase tracker,
     declare the same mutable locals, resolve the tfstate backend
     coordinates, and define the same two or three closures over those
     locals. ``_run_compute_lifecycle``'s docstring used to say it
@@ -743,8 +677,7 @@ class _TaskRuntime:
         self.logger = get_logger(f"{log_prefix}:{deployment_id}", correlation_id=deployment_id)
 
         def _emit(event_name: str, payload: dict[str, Any]) -> None:
-            # ``deployment_id`` rides along on every event so the backend
-            # listener doesn't need a DB lookup to route it.
+            # JobTask.send_event writes it to task_events (.github#5).
             bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
 
         self.logger.set_event_emitter(_emit)
@@ -899,6 +832,9 @@ def _prepare_workspace(
     rt.openstack_env = rt.clouds_config.__enter__()
     rt.logger.operation_end("openstack_credentials_materialise", success=True)
     rt.logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+    # The tools run as the worker slot's own user (.github#7 A): give them
+    # the job directory, clouds.yaml included (.git stays with the worker).
+    job_context.current().hand_over(rt.repo_path)
 
     return commit_info
 
@@ -936,6 +872,9 @@ def _build_one_packer_image(
     wait_announced = False
     try:
         while True:
+            # Waiting for another worker's build can take long; a cancel
+            # must not wait for it.
+            job_runtime.check_cancelled()
             # If the image already exists, skip the build and the lock.
             exists, image_id = openstack_service.check_image_exists(image_name)
             if exists:
@@ -1050,7 +989,7 @@ def _build_all_packer_images(
 ) -> None:
     """Build every Packer image this deployment needs, or skip cleanly.
 
-    Each build is guarded by a Redis lock keyed on
+    Each build is guarded by a Postgres advisory lock keyed on
     ``(project_id, image_name)`` so two parallel workers cannot both kick
     off a build for the same image and end up with duplicate Glance
     entries plus wasted compute. For multi-image apps each template has
@@ -1099,7 +1038,7 @@ def _build_all_packer_images(
     )
 
 
-@celery_app.task(bind=True, name="tasks.deploy_application")
+@celery_app.task(bind=True, base=JobTask, name="tasks.deploy_application")
 def deploy_application(
     self,
     deployment_id: str,
@@ -1352,7 +1291,7 @@ def deploy_application(
             "terraform_outputs": outputs,
         }
 
-        # Return result (sent via task-succeeded event)
+        # JobTask records it in the task row.
         return result
 
     except Exception as e:
@@ -1380,7 +1319,7 @@ def deploy_application(
         rt.cleanup()
 
 
-@celery_app.task(bind=True, name="tasks.destroy_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.destroy_deployment")
 def destroy_deployment(
     self,
     deployment_id: str,
@@ -1402,8 +1341,8 @@ def destroy_deployment(
     deploy of the same commit doesn't have to rebuild it.
 
     All progress and log events flow through the same ``StructuredLogger``
-    + Celery custom-event pipeline as deploy, so the frontend's live
-    SSE stream renders the destroy run identically to a deploy.
+    + task-event pipeline as deploy, so the frontend's live SSE stream
+    renders the destroy run identically to a deploy.
 
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
@@ -1545,11 +1484,9 @@ def destroy_deployment(
             for keypair in sweeper.unused_packer_keypairs():
                 if sweeper.keypair_delete(keypair):
                     task_logger.info(f"Deleted stale Packer keypair {keypair}")
-            # The Redis build lock is token-owned, so this task cannot
-            # release a lock it never held. It self-heals instead: the
-            # heartbeat dies with the revoked task and the key expires
-            # after its 5-minute TTL.
-            task_logger.info("Build lock left to expire (5 min TTL; heartbeat died with the revoked task)")
+            # The build lock needs no cleanup: it is a session-level
+            # advisory lock, released when the cancelled job's database
+            # session ended.
 
         rt.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
@@ -1807,7 +1744,7 @@ def _run_compute_lifecycle(
         rt.cleanup()
 
 
-@celery_app.task(bind=True, name="tasks.pause_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.pause_deployment")
 def pause_deployment(
     self,
     deployment_id: str,
@@ -1841,7 +1778,7 @@ def pause_deployment(
     )
 
 
-@celery_app.task(bind=True, name="tasks.resume_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.resume_deployment")
 def resume_deployment(
     self,
     deployment_id: str,
@@ -2022,7 +1959,7 @@ def _reconcile_scoped_vars_to_roster(
     return reconciled
 
 
-@celery_app.task(bind=True, name="tasks.redeploy_resource")
+@celery_app.task(bind=True, base=JobTask, name="tasks.redeploy_resource")
 def redeploy_resource(
     self,
     deployment_id: str,
@@ -2042,8 +1979,8 @@ def redeploy_resource(
     (e.g. ``openstack_compute_instance_v2.team_ide["Team-A"]``) the
     user clicked.
 
-    Returns the same payload shape as deploy/destroy so the celery
-    event listener stays generic.
+    Returns the same payload shape as deploy/destroy so the job runtime
+    records every task the same way.
     """
     rt = _TaskRuntime(self, deployment_id, log_prefix="redeploy", phases=_PHASES_REDEPLOY)
     task_logger = rt.logger

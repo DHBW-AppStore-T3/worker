@@ -154,7 +154,7 @@ class TestPackerValidate:
 
     def test_validate_no_variables_command_shape(self, mocker, executor, working_dir):
         """validate with no variables runs [packer, validate, '.']."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         success, stdout, stderr = executor.validate("template.pkr.hcl")
 
@@ -170,7 +170,7 @@ class TestPackerValidate:
 
     def test_validate_encodes_dict_variable_as_json(self, mocker, executor):
         """dict variable values are JSON-encoded via json.dumps."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
         variables = {"mapping": {"a": 1, "b": 2}}
 
         executor.validate("template.pkr.hcl", variables=variables)
@@ -182,7 +182,7 @@ class TestPackerValidate:
 
     def test_validate_encodes_list_variable_as_json(self, mocker, executor):
         """list variable values are JSON-encoded via json.dumps."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
         variables = {"items": [1, 2, 3]}
 
         executor.validate("template.pkr.hcl", variables=variables)
@@ -192,7 +192,7 @@ class TestPackerValidate:
 
     def test_validate_encodes_primitive_variable_via_str(self, mocker, executor):
         """primitive variable values are stringified via str()."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
         variables = {"name": "foo", "count": 5, "enabled": True}
 
         executor.validate("template.pkr.hcl", variables=variables)
@@ -204,7 +204,7 @@ class TestPackerValidate:
 
     def test_validate_dot_appended_after_vars(self, mocker, executor):
         """validate appends '.' as the final command element after vars."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         executor.validate("template.pkr.hcl", variables={"x": "y"})
 
@@ -214,7 +214,7 @@ class TestPackerValidate:
     def test_validate_success_returncode_zero(self, mocker, executor):
         """validate returns (True, stdout, stderr) on rc=0."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             return_value=self._make_completed(returncode=0, stdout="good", stderr=""),
         )
 
@@ -226,7 +226,7 @@ class TestPackerValidate:
     def test_validate_failure_nonzero_returncode(self, mocker, executor):
         """validate returns (False, stdout, stderr) when rc != 0."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             return_value=self._make_completed(returncode=2, stdout="", stderr="Error: bad template"),
         )
 
@@ -238,7 +238,7 @@ class TestPackerValidate:
     def test_validate_exception_returns_false_empty_stdout_message(self, mocker, executor):
         """validate catches exceptions and returns (False, '', str(e))."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="packer", timeout=60),
         )
 
@@ -250,7 +250,7 @@ class TestPackerValidate:
 
     def test_validate_env_has_packer_log_enabled(self, mocker, executor):
         """validate's subprocess env contains PACKER_LOG=1."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         executor.validate("template.pkr.hcl")
 

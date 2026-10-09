@@ -209,13 +209,14 @@ class TestStreamSubprocess:
 class TestGetEnv:
     """Verify _get_env merging rules for env_vars, extra_env, TF_LOG, PG_CONN_STR."""
 
-    def test_env_vars_layered_on_os_environ(self, mocker, tmp_path):
-        """env_vars merge on top of os.environ; os.environ keys still present."""
+    def test_env_vars_on_top_of_the_minimal_env(self, mocker, tmp_path):
+        """env_vars go on top of the job's minimal env; the worker's own env is not inherited (.github#7 A)."""
         mocker.patch.dict(os.environ, {"FROM_OS": "yes"}, clear=False)
         ex = TerraformExecutor(str(tmp_path), env_vars={"CUSTOM": "v"})
         env = ex._get_env()
-        assert env["FROM_OS"] == "yes"
+        assert "FROM_OS" not in env
         assert env["CUSTOM"] == "v"
+        assert env["TF_IN_AUTOMATION"] == "1"
 
     def test_extra_env_wins_over_env_vars(self, mocker, tmp_path):
         """extra_env passed to _get_env overrides instance env_vars."""

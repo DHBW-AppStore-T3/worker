@@ -8,8 +8,9 @@ Three concerns are kept separate here:
   logger so they appear in the worker container's stdout. Rendering lives in
   a dedicated sink so the buffer and the Python logger stay independent.
 * **Event sink** — an optional callable that ships every entry to a
-  downstream consumer. The deploy task wires the Celery event bus here so
-  the backend's listener can stream entries to the browser.
+  downstream consumer. The deploy task wires the task's live events here
+  (``JobTask.send_event`` -> ``task_events``) so the API can stream entries
+  to the browser.
 
 A single ``StructuredLogger`` orchestrates these. The class is threadsafe:
 ``Popen`` line readers may write from a reader thread while the main task
@@ -141,7 +142,7 @@ class LogEntry:
 
     Putting ``stdout``/``stderr``/``tool``/``phase`` etc. on the dataclass
     instead of leaving everything in a generic context dict means consumers
-    (the frontend, the backend listener, the JSON exporter) can render those
+    (the frontend, the API's live stream, the JSON exporter) can render those
     fields specifically — e.g. monospace blocks for tool output rather than a
     bag of strings inside ``extra``.
     """
@@ -260,7 +261,7 @@ class _ConsoleSink:
 EventEmitter = Callable[[str, dict[str, Any]], None]
 """Signature: ``emit(event_name, payload_dict) -> None``.
 
-The deploy task plugs Celery's ``self.send_event`` here so every log entry
+The deploy task plugs the task's ``send_event`` here so every log entry
 also turns into a ``task-log`` event on the bus. ``None`` disables it.
 """
 
@@ -297,7 +298,7 @@ class StructuredLogger:
     # ----- emitter wiring (settable post-construction) --------------------
 
     def set_event_emitter(self, emitter: EventEmitter | None) -> None:
-        """Attach or detach the Celery-event sink at runtime.
+        """Attach or detach the live-event sink at runtime.
 
         ``tasks.py`` constructs the logger before it can capture ``self`` for
         ``send_event``, so we need a setter.
@@ -311,10 +312,9 @@ class StructuredLogger:
         self._console.write(entry)
         if emit_event and self._event_emitter is not None:
             try:
-                # Celery's EventReceiver injects its own ``timestamp``
-                # field (Unix-time float) and does arithmetic on it, so a
-                # payload carrying an ISO-string ``timestamp`` would crash
-                # it. Re-key ours as ``iso_timestamp``.
+                # The ISO time travels as ``iso_timestamp``, the name the
+                # frontend reads (Celery's event receiver, which reserved
+                # ``timestamp`` for a float, is gone since .github#5).
                 payload = entry.to_dict()
                 if "timestamp" in payload:
                     payload["iso_timestamp"] = payload.pop("timestamp")
@@ -400,7 +400,7 @@ class StructuredLogger:
         """Mark a major deployment phase.
 
         Live progress is emitted separately via ``progress()`` so the
-        listener can update the DB ``progress_pct`` column. ``phase()`` only
+        worker can update the DB ``progress_pct`` column. ``phase()`` only
         adds a transcript marker.
         """
         self._record(
@@ -423,17 +423,16 @@ class StructuredLogger:
         """Send a progress update without buffering a per-step transcript entry.
 
         The buffered transcript shouldn't grow by a progress marker per
-        step; we still emit the Celery custom event so the listener can
-        update the DB and the UI.
+        step; we still emit the live event so the task row and the UI can
+        follow the phase.
 
         ``phase_names`` is the full ordered list of phases for this task.
         When provided, the UI can render every stepper slot with its real
         label immediately. The payload is small and safe to repeat on
-        every event — the listener overwrites its cached copy.
+        every event — the consumer overwrites its cached copy.
 
-        Do NOT put a ``timestamp`` field in the payload: Celery injects one
-        itself (as a Unix-time float) and would crash on an ISO string.
-        Pass the ISO time as ``iso_timestamp`` if needed downstream.
+        The ISO time goes into ``iso_timestamp``, the name the frontend
+        reads.
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
@@ -447,8 +446,8 @@ class StructuredLogger:
                 "iso_timestamp": _now_iso(),
             }
             if phase_names is not None:
-                # Keep as a plain list — Celery uses JSON serialisation
-                # by default and tuples are coerced anyway.
+                # Keep as a plain list — events are stored as JSON and
+                # tuples are coerced anyway.
                 payload["phase_names"] = list(phase_names)
             with contextlib.suppress(Exception):
                 self._event_emitter(self.PROGRESS_EVENT_NAME, payload)

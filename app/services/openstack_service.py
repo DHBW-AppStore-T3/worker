@@ -4,8 +4,10 @@ OpenStack service for image management
 
 import json
 import logging
-import os
 import subprocess
+
+from .. import job_context
+from .terraform_executor import _run_buffered
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +44,10 @@ class OpenStackService:
         ``(returncode, stdout, stderr)`` so callers can decide how to
         report; structured-output methods JSON-decode stdout themselves.
         """
-        env = os.environ.copy()
-        env.update(self.env_vars)
+        # The job's minimum environment, not the worker's (.github#7 A).
+        env = job_context.current().env(self.env_vars)
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
+            result = _run_buffered(args, cwd=None, env=env, timeout=timeout)
             return (result.returncode, result.stdout or "", result.stderr or "")
         except subprocess.TimeoutExpired:
             return (-1, "", f"Timeout after {timeout}s running: {' '.join(args)}")
