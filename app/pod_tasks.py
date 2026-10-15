@@ -114,6 +114,7 @@ def render_settings() -> RenderSettings:
         node_selector=json.loads(settings.K8S_STUDENT_NODE_SELECTOR or "{}"),
         tolerations=tuple(json.loads(settings.K8S_STUDENT_TOLERATIONS or "[]")),
         extra_egress_except=tuple(c.strip() for c in settings.K8S_EXTRA_EGRESS_EXCEPT.split(",") if c.strip()),
+        environment=settings.K8S_ENVIRONMENT,
     )
 
 

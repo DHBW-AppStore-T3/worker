@@ -247,6 +247,12 @@ def test_a_namespace_of_another_deployment_is_never_touched(cluster):
     assert cluster.kinds(NS) == []
 
 
+def test_the_namespace_names_the_installation_when_configured(cluster, monkeypatch):
+    monkeypatch.setattr(settings, "K8S_ENVIRONMENT", "appstore-staging")
+    deploy()
+    assert cluster.namespace_labels[NS]["appstore.dhbw/environment"] == "appstore-staging"
+
+
 def test_the_api_gets_read_access_to_the_namespace_when_configured(cluster, monkeypatch):
     monkeypatch.setattr(settings, "K8S_API_SERVICE_ACCOUNT", "appstore-api")
     deploy()

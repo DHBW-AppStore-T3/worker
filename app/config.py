@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     K8S_API_SERVICE_ACCOUNT: str = ""
     K8S_API_NAMESPACE: str = ""
     K8S_READER_CLUSTER_ROLE: str = "appstore-reader"
+    # The installation this worker belongs to (e.g. its namespace), where
+    # several share one cluster: set as a label on every namespace it
+    # creates; the admission policy lets it touch only those.
+    K8S_ENVIRONMENT: str = ""
 
     # A claimed message stays hidden from other workers this long; the
     # worker's main process renews it every third of it while it holds the
