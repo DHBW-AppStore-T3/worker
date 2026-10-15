@@ -1,6 +1,6 @@
 """Tool subprocesses get a minimal environment and their own user (.github#7 A).
 
-App code runs inside the worker (Terraform ``local-exec``, Packer
+App code runs inside the worker (OpenTofu ``local-exec``, Packer
 provisioners); since .github#5 the worker also holds a database login.
 None of the worker's secrets may reach a tool's environment.
 """
@@ -14,14 +14,13 @@ from app import job_context
 from app.job_context import JobContext
 from app.services.openstack_service import OpenStackService
 from app.services.packer_executor import PackerExecutor
-from app.services.terraform_executor import TerraformExecutor
+from app.services.terraform_executor import StateBackend, TerraformExecutor
 
 WORKER_SECRETS = {
     "DATABASE_URL": "postgresql://appstore_worker:secret@postgres/appstore",
     "CELERY_BROKER_URL": "pgq+postgresql://appstore_worker:secret@postgres/appstore",
     "CREDENTIAL_ENCRYPTION_KEY": "fernet-key",
     "GIT_ACCESS_TOKEN": "ghp_token",
-    "TFSTATE_DATABASE_URL": "postgresql://tf:secret@postgres-tfstate/tfstate",
 }
 ALLOWED_BASE = {"PATH", "HOME", "LANG", "CHECKPOINT_DISABLE", "TF_IN_AUTOMATION", "TF_INPUT"}
 
@@ -44,11 +43,19 @@ class TestMinimalEnvironment:
         executor = TerraformExecutor(
             str(tmp_path),
             env_vars={"OS_CLOUD": "openstack", "OS_CLIENT_CONFIG_FILE": "/job/clouds.yaml"},
-            backend_conn_str="postgresql://tf:secret@postgres-tfstate/tfstate",
-            backend_schema_name="deployment_x",
+            state_backend=StateBackend(address="http://api/internal/tfstate/d", username="t", password="tok"),
         )
         env = executor._get_env()
-        assert set(env) == ALLOWED_BASE | {"OS_CLOUD", "OS_CLIENT_CONFIG_FILE", "PG_CONN_STR"}
+        http = {
+            "TF_HTTP_ADDRESS",
+            "TF_HTTP_LOCK_ADDRESS",
+            "TF_HTTP_UNLOCK_ADDRESS",
+            "TF_HTTP_LOCK_METHOD",
+            "TF_HTTP_UNLOCK_METHOD",
+            "TF_HTTP_USERNAME",
+            "TF_HTTP_PASSWORD",
+        }
+        assert set(env) == ALLOWED_BASE | {"OS_CLOUD", "OS_CLIENT_CONFIG_FILE"} | http
         for key in ("DATABASE_URL", "CELERY_BROKER_URL", "CREDENTIAL_ENCRYPTION_KEY", "GIT_ACCESS_TOKEN"):
             assert key not in env
         assert "secret@postgres/appstore" not in " ".join(env.values())

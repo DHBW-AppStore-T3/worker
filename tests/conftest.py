@@ -11,6 +11,8 @@ import pytest
 # integration tests use this database (CI: the Postgres service) and build
 # the worker's part of the schema in it (tests/schema.sql).
 os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/worker_test")
+# The suite runs with the published CI key, which production refuses.
+os.environ.setdefault("APP_ENV", "development")
 
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
@@ -85,4 +87,4 @@ def pg(pg_url):
 
     with psycopg.connect(pg_url, autocommit=True) as conn:
         yield conn
-        conn.execute("TRUNCATE task_events, celery_queue, tasks CASCADE")
+        conn.execute("TRUNCATE task_events, celery_queue, tasks, deployments CASCADE")

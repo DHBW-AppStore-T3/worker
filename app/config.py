@@ -1,7 +1,37 @@
+import base64
+import binascii
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Keys that are public (committed in CI files or examples): never acceptable
+# outside development (.github#7 O; same list as the API).
+_PUBLIC_FERNET_KEYS = frozenset(
+    {
+        "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",  # CI test key (backend/worker)
+        "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",  # OpenAPI export placeholder
+    }
+)
+
+
+def _fernet_key_problem(key: str) -> str | None:
+    """Why ``key`` is not a usable Fernet key, or None."""
+    try:
+        raw = base64.urlsafe_b64decode(key.encode())
+    except (binascii.Error, ValueError):
+        return "is not url-safe base64"
+    if len(raw) != 32:
+        return "does not decode to 32 bytes"
+    return None
 
 
 class Settings(BaseSettings):
+    # "development" allows the published test keys and any https Keystone
+    # when OPENSTACK_ALLOWED_AUTH_URLS is empty; anything else is production
+    # and refuses to start with a test key (.github#7 O).
+    APP_ENV: Literal["development", "production"] = "production"
+
     # Database (.github#5): the worker's own role ``appstore_worker`` on the
     # application database. It may use the task queue, append task events
     # and write the result columns of ``tasks``, nothing else (no users, no
@@ -15,20 +45,26 @@ class Settings(BaseSettings):
     # Worker settings
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
 
-    # Terraform/Packer paths (installed in container)
-    TERRAFORM_PATH: str = "/usr/local/bin/terraform"
+    # OpenTofu/Packer paths (installed in container)
+    TOFU_PATH: str = "/usr/local/bin/tofu"
     PACKER_PATH: str = "/usr/local/bin/packer"
+    # TF_LOG for OpenTofu (e.g. DEBUG); off by default, it drowns the errors.
+    WORKER_TF_LOG: str = ""
 
     # Symmetric Fernet key shared with the backend. Decrypts the credential
     # envelopes that arrive with a task, and seals the task's results
     # (``tasks.outputs_enc``).
     CREDENTIAL_ENCRYPTION_KEY: str
 
-    # Terraform remote state — Postgres connection string for the worker-only
-    # `postgres-tfstate` container. Empty string means "no remote backend"
-    # (legacy local-state behaviour, only useful for unit tests). In production
-    # this is always set; an empty value at task time will raise.
-    TFSTATE_DATABASE_URL: str = ""
+    # The API as the worker reaches it (internal service URL, no /api
+    # prefix). OpenTofu keeps each VM deployment's state there, through the
+    # API's HTTP state backend, authenticated with the task's own token.
+    APPSTORE_API_URL: str = "http://localhost:8000"
+
+    # Keystone URLs a credential may point to, comma-separated; same
+    # setting as the API (.github#7 C). Empty: in development any https
+    # URL, in production none.
+    OPENSTACK_ALLOWED_AUTH_URLS: str = ""
 
     # Git: app repositories are public and fetched anonymously, only from
     # these hosts (comma-separated, exact names; the API checks the same
@@ -62,6 +98,20 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore",
     )
+
+    @property
+    def is_development(self) -> bool:
+        return self.APP_ENV == "development"
+
+    @model_validator(mode="after")
+    def _refuse_unsafe_production_settings(self) -> "Settings":
+        """A malformed Fernet key never starts; in production neither does a published one."""
+        problem = _fernet_key_problem(self.CREDENTIAL_ENCRYPTION_KEY)
+        if problem:
+            raise ValueError(f"CREDENTIAL_ENCRYPTION_KEY {problem}")
+        if not self.is_development and self.CREDENTIAL_ENCRYPTION_KEY in _PUBLIC_FERNET_KEYS:
+            raise ValueError("unsafe production configuration: CREDENTIAL_ENCRYPTION_KEY is a published test key")
+        return self
 
     @property
     def celery_broker_url(self) -> str:

@@ -1,7 +1,7 @@
 # Worker — Lokale Setup-Gotchas
 
 ## 1. Worker startet nicht standalone
-- **Gotcha:** Der Versuch, den Worker isoliert per `poetry run celery ...` auf dem Host zu starten, scheitert in der Regel an fehlenden Abhängigkeiten (`terraform` Binary, `packer` Binary, RabbitMQ, Redis, `postgres-tfstate`).
+- **Gotcha:** Der Versuch, den Worker isoliert per `poetry run celery ...` auf dem Host zu starten, scheitert in der Regel an fehlenden Abhängigkeiten (`tofu` Binary, `packer` Binary, die Datenbank mit dem Schema der API, die API selbst als State-Backend).
 - **Best Practice:** Entwicklung und Testen über das `deployment`-Repo via `make dev-up` und `make shell-worker`.
 
 ## 2. Formatierungs-Konflikt zwischen Black, isort und Ruff

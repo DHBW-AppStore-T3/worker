@@ -41,7 +41,7 @@ Task-Nachricht (Postgres-Queue `celery_queue`, .github#5)
 ## Kernkomponenten in `app/`
 
 - **`celery_app.py`**: Initialisierung und Konfiguration des Celery-Workers (`task_acks_late=True`, `worker_prefetch_multiplier=1`).
-- **`config.py`**: Pydantic BaseSettings für Umgebungsvariablen (`DATABASE_URL` der Rolle `appstore_worker`, `TFSTATE_DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, Lease-/Slot-Einstellungen).
+- **`config.py`**: Pydantic BaseSettings für Umgebungsvariablen (`DATABASE_URL` der Rolle `appstore_worker`, `APPSTORE_API_URL` (State-Backend der API), `OPENSTACK_ALLOWED_AUTH_URLS`, `CREDENTIAL_ENCRYPTION_KEY`, `APP_ENV`, Lease-/Slot-Einstellungen).
 - **`job_task.py` / `job_runtime.py`**: Basisklasse aller Tasks; Prolog/Epilog auf der Task-Zeile, Lease, Cancel, Event-Schreiber (.github#5).
 - **`job_context.py`**: Minimal-Umgebung und UID je Slot für Terraform/Packer/OpenStack-CLI (.github#7 A).
 - **`pgq.py` / `task_contract.py`**: Kombu-Transport und Event-/Ergebnis-Vertrag, identisch mit dem Backend.

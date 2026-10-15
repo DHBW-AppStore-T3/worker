@@ -32,7 +32,7 @@ FROM python:3.11-slim AS runtime
 
 # Build arguments für Multi-Platform Support
 ARG TARGETARCH
-ARG TERRAFORM_VERSION=1.15.5
+ARG TOFU_VERSION=1.12.6
 ARG PACKER_VERSION=1.15.3
 
 WORKDIR /app
@@ -65,22 +65,24 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # CVE-2026-97687 / CVE-2026-97689 (HIGH, Trivy blocks the push).
 RUN pip install --no-cache-dir python-openstackclient "urllib3>=2.8.0"
 
-# Terraform installieren (platform-aware)
-RUN ARCH="${TARGETARCH:-amd64}" && \
-    echo "Installing Terraform ${TERRAFORM_VERSION} for ${ARCH}" && \
-    wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    unzip -qo terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    mv terraform /usr/local/bin/ && \
-    rm -f terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
-    terraform --version
+# OpenTofu, not Terraform (dhbw-appstore), and Packer, each checked against
+# its release's SHA256SUMS before it is installed.
+RUN ARCH="${TARGETARCH:-amd64}" && cd /tmp && \
+    BASE=https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION} && \
+    curl -fsSLO ${BASE}/tofu_${TOFU_VERSION}_linux_${ARCH}.zip && \
+    curl -fsSLO ${BASE}/tofu_${TOFU_VERSION}_SHA256SUMS && \
+    grep " tofu_${TOFU_VERSION}_linux_${ARCH}.zip\$" tofu_${TOFU_VERSION}_SHA256SUMS | sha256sum -c - && \
+    unzip -qo tofu_${TOFU_VERSION}_linux_${ARCH}.zip tofu -d /usr/local/bin && \
+    rm tofu_${TOFU_VERSION}_* && \
+    tofu --version
 
-# Packer installieren (platform-aware)
-RUN ARCH="${TARGETARCH:-amd64}" && \
-    echo "Installing Packer ${PACKER_VERSION} for ${ARCH}" && \
-    wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    unzip -qo packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    mv packer /usr/local/bin/ && \
-    rm -f packer_${PACKER_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
+RUN ARCH="${TARGETARCH:-amd64}" && cd /tmp && \
+    BASE=https://releases.hashicorp.com/packer/${PACKER_VERSION} && \
+    curl -fsSLO ${BASE}/packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
+    curl -fsSLO ${BASE}/packer_${PACKER_VERSION}_SHA256SUMS && \
+    grep " packer_${PACKER_VERSION}_linux_${ARCH}.zip\$" packer_${PACKER_VERSION}_SHA256SUMS | sha256sum -c - && \
+    unzip -qo packer_${PACKER_VERSION}_linux_${ARCH}.zip packer -d /usr/local/bin && \
+    rm packer_${PACKER_VERSION}_* && \
     packer --version
 
 # Virtual Environment vom Builder kopieren
@@ -95,7 +97,7 @@ RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
     chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
 
 # Environment für .venv
-# WORKER_JOB_UID_BASE: worker slot n runs its tools (terraform, packer,
+# WORKER_JOB_UID_BASE: worker slot n runs its tools (OpenTofu, packer,
 # openstack CLI) as UID 20000+n (.github#7 A, app/job_context.py). That is
 # why the worker runs as root (.trivyignore AVD-DS-0002): only to drop to
 # the slot's user for the tools, which run app code we do not control and

@@ -60,7 +60,8 @@ class GitService:
             except git.GitCommandError:
                 logger.info("fetching the commit was refused; fetching tag %s instead", tag)
                 origin.fetch(
-                    refspec=f"refs/tags/{tag}:refs/tags/{tag}", depth=1,
+                    refspec=f"refs/tags/{tag}:refs/tags/{tag}",
+                    depth=1,
                     kill_after_timeout=FETCH_TIMEOUT_SECONDS,
                 )
             try:

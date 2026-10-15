@@ -16,6 +16,8 @@ import os
 
 import pytest
 
+import app.tasks as tasks_mod
+from app.services.terraform_executor import StateBackend
 from app.tasks import (
     _PHASES_WITH_PACKER,
     Failure,
@@ -26,17 +28,30 @@ from app.tasks import (
     _reconcile_scoped_vars_to_roster,
     _scrub_nested_nones,
     _strip_file_vars,
-    _tfstate_schema_name,
     deploy_application,
     destroy_deployment,
     encode_packer_vars,
-    encode_terraform_vars,
     pause_deployment,
     redeploy_resource,
     resume_deployment,
+    terraform_var_values,
 )
+from app.utils import crypto
 
 # --- Helpers ----------------------------------------------------------------
+
+# A credential envelope as the API sends it (ciphertext omitted: the
+# clouds.yaml writer is mocked). Development allows any https Keystone.
+_ENVELOPE = {"project_id": "p1", "auth_url": "https://keystone.example/v3"}
+_BACKEND = StateBackend(address="http://api/internal/tfstate/dep-1", username="task-1", password="tok")
+
+
+@pytest.fixture(autouse=True)
+def _state_backend(mocker):
+    """The tasks run via ``.run()``, without a Celery request id or token:
+    hand every runtime the same state backend (``TestStateToken`` covers
+    how it is really built)."""
+    return mocker.patch("app.tasks._TaskRuntime.state_backend", autospec=True, return_value=_BACKEND)
 
 
 class _FakeTemplate:
@@ -141,35 +156,19 @@ def _seed_terraform_dir(repo_path: str) -> str:
 
 
 @pytest.mark.unit
-class TestEncodeTerraformVars:
-    """Verify the encoding helper produces CLI-safe strings."""
+class TestTerraformVarValues:
+    """Values for the JSON var file keep their JSON types."""
 
-    def test_dict_value_is_json_encoded(self):
-        """A dict value is serialised to a JSON object literal, not str()."""
-        out = encode_terraform_vars({"users": {"Team-1": [{"email": "a@b"}]}})
-        # Must round-trip through JSON, not Python repr (no single quotes).
-        assert json.loads(out["users"]) == {"Team-1": [{"email": "a@b"}]}
-
-    def test_list_value_is_json_encoded(self):
-        """A list value comes out as a JSON array literal."""
-        out = encode_terraform_vars({"ports": [22, 80]})
-        assert out["ports"] == "[22, 80]"
-
-    def test_bool_lowercased(self):
-        """HCL accepts only lowercase booleans, never Python's ``True``."""
-        out = encode_terraform_vars({"flag": True, "off": False})
-        assert out["flag"] == "true"
-        assert out["off"] == "false"
+    def test_structures_and_scalars_keep_their_types(self):
+        out = terraform_var_values({"users": {"Team-1": [{"email": "a@b"}]}, "ports": [22, 80], "flag": True, "n": 2})
+        assert out == {"users": {"Team-1": [{"email": "a@b"}]}, "ports": [22, 80], "flag": True, "n": 2}
 
     def test_none_top_level_dropped(self):
-        """A top-level ``None`` value is omitted entirely (no -var emitted)."""
-        out = encode_terraform_vars({"keep": "x", "drop": None})
-        assert out == {"keep": "x"}
+        """An unset variable is left out, so its declared default applies."""
+        assert terraform_var_values({"keep": "x", "drop": None}) == {"keep": "x"}
 
     def test_nested_none_scrubbed(self):
-        """Nested ``None`` keys/items are stripped recursively before encoding."""
-        out = encode_terraform_vars({"m": {"a": None, "b": [1, None, 2]}})
-        assert json.loads(out["m"]) == {"b": [1, 2]}
+        assert terraform_var_values({"m": {"a": None, "b": [1, None, 2]}}) == {"m": {"b": [1, 2]}}
 
 
 @pytest.mark.unit
@@ -226,17 +225,6 @@ class TestScrubNestedNones:
     def test_drops_none_in_list(self):
         """``None`` entries are filtered out of lists."""
         assert _scrub_nested_nones([1, None, 2]) == [1, 2]
-
-
-@pytest.mark.unit
-class TestSchemaName:
-    """Schema names are unquoted identifiers — hyphens become underscores."""
-
-    def test_replaces_hyphens(self):
-        """UUIDs with hyphens are converted into a single ``deployment_<safe>``."""
-        out = _tfstate_schema_name("11111111-2222-3333-4444-555555555555")
-        assert "-" not in out
-        assert out.startswith("deployment_")
 
 
 @pytest.mark.unit
@@ -361,7 +349,7 @@ class TestDeployApplication:
             release="v1",
             user_vars={"packer": {"flavor": "m1.small"}, "terraform": {"region": "eu"}},
             teams={"T1": [{"email": "a@x"}]},
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
@@ -402,14 +390,14 @@ class TestDeployApplication:
             commit_sha=sha,
             user_vars={"terraform": {}},
             teams={"T1": [{"email": "a@x", "user_id": "u-1", "username": "a"}]},
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
         assert gs.clone_commit.call_args.kwargs["commit_sha"] == sha
         assert gs.clone_commit.call_args.kwargs["tag"] == "v1"
         tf_vars = tf_inst.apply.call_args.kwargs["variables"]
-        assert json.loads(tf_vars["users"]) == {"T1": [{"email": "a@x"}]}
+        assert tf_vars["users"] == {"T1": [{"email": "a@x"}]}
         logged = json.dumps(result["logs"])
         assert "s3cret-pw" not in logged
         assert "user_accounts" in logged
@@ -437,7 +425,7 @@ class TestDeployApplication:
             release="v1",
             user_vars={"packer": {"web": {"f": "x"}, "db": {"f": "y"}}, "terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
@@ -469,7 +457,7 @@ class TestDeployApplication:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
@@ -508,7 +496,7 @@ class TestDeployApplication:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
@@ -539,7 +527,7 @@ class TestDeployApplication:
                 release="v1",
                 user_vars={"terraform": {}},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
             )
 
         # Terraform init/plan/apply must NOT have been called.
@@ -570,7 +558,7 @@ class TestDeployApplication:
                 release="v1",
                 user_vars={"terraform": {}},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
             )
 
         assert "Terraform apply failed" in str(exc.value)
@@ -618,7 +606,7 @@ class TestDeployApplication:
             user_vars={"terraform": {}},
             teams=None,
             openstack_envelope={
-                "project_id": "p1",
+                **_ENVELOPE,
                 "password": secret,  # opaque encrypted blob in real life
             },
         )
@@ -648,11 +636,12 @@ class TestDeployApplication:
             release="v1",
             user_vars={"terraform": {"mapping": {"k": "v"}, "list": [1, 2]}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
         applied_vars = tf_inst.apply.call_args.kwargs["variables"]
-        assert json.loads(applied_vars["mapping"]) == {"k": "v"}
-        assert applied_vars["list"] == "[1, 2]"
+        # The var file keeps JSON types: a map stays a map.
+        assert applied_vars["mapping"] == {"k": "v"}
+        assert applied_vars["list"] == [1, 2]
 
 
 # --- destroy_deployment -----------------------------------------------------
@@ -682,7 +671,7 @@ class TestDestroyDeployment:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
         assert result["status"] == "success"
         assert result["terraform_outputs"] == {}
@@ -709,7 +698,7 @@ class TestDestroyDeployment:
                 release="v1",
                 user_vars={"terraform": {}},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
             )
         assert "Terraform destroy failed" in str(exc.value)
 
@@ -752,7 +741,7 @@ class TestPruneSupersededImagesWiring:
             release="v1",
             user_vars={"terraform": {}, "packer": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert prune.call_count == 1
@@ -784,7 +773,7 @@ class TestPruneSupersededImagesWiring:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         prune.assert_not_called()
@@ -833,7 +822,7 @@ class TestTerraformOnlyAppImageName:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         assert result["status"] == "success"
@@ -860,7 +849,7 @@ class TestTerraformOnlyAppImageName:
             "release": "v1",
             "user_vars": {"terraform": {}},
             "teams": None,
-            "openstack_envelope": {"project_id": "p1"},
+            "openstack_envelope": _ENVELOPE,
         }
         deploy_application.run(**task_args)
         deployed = deploy_tf.apply.call_args.kwargs["variables"]
@@ -896,7 +885,7 @@ class TestTerraformOnlyAppImageName:
             release="v1",
             user_vars={"terraform": {}, "packer": {"web": {}, "db": {}}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
 
         variables = tf_inst.destroy.call_args.kwargs["variables"]
@@ -941,7 +930,7 @@ class TestPauseResume:
             release="v1",
             user_vars={},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
         )
         assert result["status"] == "success"
         method = getattr(os_inst, f"server_{server_op}")
@@ -975,7 +964,7 @@ class TestPauseResume:
                 release="v1",
                 user_vars={},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
             )
         assert "No compute instances" in str(exc.value)
         os_inst.server_stop.assert_not_called()
@@ -1016,7 +1005,7 @@ class TestPauseResume:
                 release="v1",
                 user_vars={},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
             )
         msg = str(exc.value)
         assert "bad-1" in msg
@@ -1051,7 +1040,7 @@ class TestRedeployResource:
             release="v1",
             user_vars={"terraform": {}},
             teams=None,
-            openstack_envelope={"project_id": "p1"},
+            openstack_envelope=_ENVELOPE,
             resource_address=addr,
         )
         assert result["status"] == "success"
@@ -1071,7 +1060,92 @@ class TestRedeployResource:
                 release="v1",
                 user_vars={"terraform": {}},
                 teams=None,
-                openstack_envelope={"project_id": "p1"},
+                openstack_envelope=_ENVELOPE,
                 resource_address="; rm -rf /",
             )
         assert "invalid resource_address" in str(exc.value)
+
+
+# --- the state token ----------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestStateToken:
+    """OpenTofu reaches the deployment's state only with the task's own token."""
+
+    @staticmethod
+    def _runtime(mocker, task_id, token_enc):
+        bound = mocker.MagicMock()
+        bound.request.id = task_id
+        return tasks_mod._TaskRuntime(
+            bound, "dep-1", log_prefix="t", phases=_PHASES_WITH_PACKER, state_token_enc=token_enc
+        )
+
+    def test_backend_is_this_task_with_its_decrypted_token(self, mocker, _state_backend):
+        mocker.stop(_state_backend)
+        mocker.patch.object(tasks_mod.settings, "APPSTORE_API_URL", "http://appstore-api:8000")
+        rt = self._runtime(mocker, "task-7", crypto.encrypt_b64("the-token"))
+
+        backend = rt.state_backend()
+
+        assert backend.address == "http://appstore-api:8000/internal/tfstate/dep-1"
+        assert (backend.username, backend.password) == ("task-7", "the-token")
+
+    @pytest.mark.parametrize(("task_id", "token"), [("task-7", None), (None, "x")])
+    def test_no_tofu_without_a_token(self, mocker, _state_backend, task_id, token):
+        mocker.stop(_state_backend)
+        rt = self._runtime(mocker, task_id, crypto.encrypt_b64(token) if token else None)
+
+        with pytest.raises(Exception, match="state token"):
+            rt.state_backend()
+        assert rt.collect_outputs() is None
+        assert rt.collect_state() is None
+
+    def test_a_job_without_a_token_fails_before_opentofu_runs(self, mocker, tmp_path, _state_backend):
+        mocker.stop(_state_backend)
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+        _silence_events(mocker, destroy_deployment)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        cls, _inst = _make_terraform_executor_mock(mocker)
+
+        with pytest.raises(Failure, match="state token"):
+            destroy_deployment.run(
+                deployment_id="dep-1",
+                app_id="myapp",
+                app_git_link="https://git/repo.git",
+                release="v1",
+                user_vars={"terraform": {}},
+                teams=None,
+                openstack_envelope=_ENVELOPE,
+            )
+        cls.assert_not_called()
+
+
+@pytest.mark.unit
+class TestKeystoneAllowlist:
+    def test_a_credential_for_another_keystone_never_reaches_a_tool(self, mocker, tmp_path):
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _silence_events(mocker, pause_deployment)
+        git = _make_git_mock(mocker, repo_path)
+        clouds_cls, _cc = _make_clouds_config_mock(mocker)
+        mocker.patch.object(tasks_mod.settings, "APP_ENV", "production")
+        mocker.patch.object(tasks_mod.settings, "OPENSTACK_ALLOWED_AUTH_URLS", "https://keystone.example/v3")
+
+        with pytest.raises(Failure, match="Keystone URL is not allowed"):
+            pause_deployment.run(
+                deployment_id="dep-1",
+                app_id="myapp",
+                app_git_link="https://git/repo.git",
+                release="v1",
+                user_vars={"terraform": {}},
+                teams=None,
+                openstack_envelope={**_ENVELOPE, "auth_url": "https://169.254.169.254/v3"},
+            )
+        clouds_cls.assert_not_called()
+        git.clone_commit.assert_not_called()
