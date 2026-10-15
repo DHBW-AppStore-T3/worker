@@ -360,6 +360,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The pod deployer (.github#4): same code, no OpenTofu/Packer, no root.
+      - name: Build pod-deployer image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: pod-deployer
+          push: false
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-pods:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # ================================================================
   # 🔒 IMAGE SCAN — Trivy CVE scan against the built image
   # ================================================================
@@ -420,6 +433,27 @@ jobs:
           sarif_file: trivy-image.sarif
           category: trivy-image
 
+      - name: Build local pod-deployer image (amd64, --load)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: pod-deployer
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: worker-pods:scan
+          cache-from: type=gha
+
+      - name: Trivy pod-deployer image scan (gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: worker-pods:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: 1
+
   # ================================================================
   # 📦 PUSH — on main and dev
   # ================================================================
@@ -471,6 +505,32 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract metadata (pod deployer)
+        id: meta-pods
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-pods
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=spike-dev,enable=${{ github.ref == 'refs/heads/spike/dev' }}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push pod-deployer image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          target: pod-deployer
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta-pods.outputs.tags }}
+          labels: ${{ steps.meta-pods.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

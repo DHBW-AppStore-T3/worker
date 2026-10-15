@@ -71,6 +71,39 @@ class Settings(BaseSettings):
     # list, .github#7 B).
     APP_GIT_ALLOWED_HOSTS: str = "github.com"
 
+    # Pod apps (.github#4; the pod deployer, queue "pods") ------------------
+    # Platform limits for an appstore.yaml: same settings as the API's.
+    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/"
+    APP_MAX_CPU: str = "2"
+    APP_MAX_MEMORY: str = "4Gi"
+    APP_MAX_STORAGE: str = "20Gi"
+    K8S_MAX_WORKLOADS_PER_DEPLOYMENT: int = 60
+    # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
+    K8S_ZONE: str = ""
+    K8S_APP_DOMAIN: str = ""
+    K8S_INGRESS_CLASS: str = "traefik"
+    K8S_INGRESS_NAMESPACE: str = "kube-system"
+    K8S_TLS_SECRET: str = ""
+    K8S_CLUSTER_ISSUER: str = ""
+    K8S_STORAGE_CLASS: str = ""
+    # Where student pods may run (JSON): node selector and tolerations.
+    K8S_STUDENT_NODE_SELECTOR: str = ""
+    K8S_STUDENT_TOLERATIONS: str = ""
+    # Pod/service/node CIDRs of the cluster, which pods with internet access
+    # may not reach either (comma-separated, IPv4 and IPv6).
+    K8S_EXTRA_EGRESS_EXCEPT: str = ""
+    K8S_POLL_INTERVAL_SECONDS: float = 3.0
+    K8S_READY_TIMEOUT_SECONDS: int = 600
+    K8S_DELETE_TIMEOUT_SECONDS: int = 300
+    # The deployer's rights in each namespace it creates (a RoleBinding to
+    # this ClusterRole), and read access there for the API's account.
+    K8S_DEPLOYER_CLUSTER_ROLE: str = "appstore-deployer"
+    K8S_WORKER_SERVICE_ACCOUNT: str = "appstore-pod-deployer"
+    K8S_WORKER_NAMESPACE: str = "appstore"
+    K8S_API_SERVICE_ACCOUNT: str = ""
+    K8S_API_NAMESPACE: str = ""
+    K8S_READER_CLUSTER_ROLE: str = "appstore-reader"
+
     # A claimed message stays hidden from other workers this long; the
     # worker's main process renews it every third of it while it holds the
     # message. After a hard crash the message reappears after at most this.

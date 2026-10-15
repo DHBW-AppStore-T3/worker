@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 # to the transport in app/pgq.py. Registered before the app connects.
 TRANSPORT_ALIASES.setdefault("pgq", "app.pgq:Transport")
 
-celery_app = Celery("worker", broker=settings.celery_broker_url, include=["app.tasks"])
+# VM jobs (tasks.*, queue "vm") and pod jobs (pods.*, queue "pods"); each
+# worker deployment consumes only its own queue (-Q), see the Dockerfile.
+celery_app = Celery("worker", broker=settings.celery_broker_url, include=["app.tasks", "app.pod_tasks"])
 
 celery_app.conf.update(
     broker_url=settings.celery_broker_url,
@@ -38,6 +40,8 @@ celery_app.conf.update(
     # one kills the process (its lease then runs out: worker_lost).
     task_soft_time_limit=settings.WORKER_JOB_TIMEOUT_SECONDS,
     task_time_limit=settings.WORKER_JOB_TIMEOUT_SECONDS + 300,
+    # Same routing as the API's sender (task_routes there).
+    task_routes={"tasks.*": {"queue": "vm"}, "pods.*": {"queue": "pods"}},
 )
 
 

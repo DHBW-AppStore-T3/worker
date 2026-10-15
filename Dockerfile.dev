@@ -55,4 +55,4 @@ RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
 
 # Starte Celery Worker mit poetry run (fixed pool; no events, gossip or
 # mingle: the Postgres transport has no fanout, .github#5)
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=2", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=2", "-Q", "vm,celery", "--without-gossip", "--without-mingle", "--without-heartbeat"]

@@ -26,7 +26,37 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --only=main --no-ansi
 
 # -----------------------------------------------------------------------------
-# Stage 2: Runtime - Schlankes Production Image
+# Pod deployer (.github#4): pod jobs only (queue "pods"), built with
+# --target pod-deployer. It renders the Kubernetes objects itself and runs
+# nothing from the app repositories, so it needs no OpenTofu, Packer or
+# OpenStack CLI, and no root.
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS pod-deployer
+
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
+    useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin appstore
+
+WORKDIR /app
+COPY --from=builder /app/.venv /app/.venv
+COPY app/ ./app/
+
+# GIT_PYTHON_REFRESH: the VM task module is imported with the pod tasks but
+# never runs here; GitPython must not refuse to import without a git binary.
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    GIT_PYTHON_REFRESH=quiet \
+    WORKER_HEARTBEAT_FILE=/tmp/worker-heartbeat
+
+USER 10001
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
+
+CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "pods", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+
+# -----------------------------------------------------------------------------
+# Stage 2: Runtime - Schlankes Production Image (VM executor, queue "vm")
 # -----------------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
@@ -117,5 +147,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 
 # Celery Worker starten: fixed pool (slot n = UID 20000+n), no Celery
 # events, gossip or mingle (they need a fanout exchange). Concurrency can
-# be overridden by the deployment (command).
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+# be overridden by the deployment (command). Queue "vm" (the VM jobs) and
+# "celery", where jobs queued before the queues were split still wait.
+CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "vm,celery", "--without-gossip", "--without-mingle", "--without-heartbeat"]

@@ -31,6 +31,8 @@ pyyaml = "^6.0.1"
 watchdog = "^4.0"
 cryptography = ">=50.0.1"
 msgpack = ">=1.2.1"
+# Pod apps (.github#4): the pod deployer applies and watches namespaces.
+kubernetes = ">=31.0.0"
 
 [tool.poetry.group.dev.dependencies]
 # Linting & Formatting
