@@ -115,3 +115,86 @@ def test_hand_over_gives_the_job_dir_to_the_slot_but_keeps_git(tmp_path):
     assert os.stat(tmp_path).st_mode & 0o777 == 0o700
     assert os.stat(tmp_path / ".git").st_uid == 0
     assert os.stat(tmp_path / ".git" / "config").st_uid == 0
+
+
+# ----------------------------------------------------------------
+# Nothing of a slot's previous job reaches its next one
+# ----------------------------------------------------------------
+@pytest.fixture
+def slot_users(monkeypatch, tmp_path):
+    """Slot users on, with chown and the reaper recorded instead of run (no root here)."""
+    monkeypatch.setattr(job_context.settings, "WORKER_JOB_UID_BASE", 20000)
+    monkeypatch.setattr(job_context.settings, "WORKER_JOB_HOME_BASE", str(tmp_path / "homes"))
+    monkeypatch.setattr(job_context.settings, "TEMP_REPO_BASE_PATH", str(tmp_path / "repos"))
+    calls = []
+    monkeypatch.setattr(job_context, "reap", lambda uid: calls.append(("reap", uid)))
+    monkeypatch.setattr(
+        job_context.os, "chown", lambda path, uid, gid, **kw: calls.append(("chown", path, uid)), raising=False
+    )
+    return calls
+
+
+@pytest.mark.unit
+class TestSlotSession:
+    def test_a_job_starts_with_no_process_and_an_empty_home(self, slot_users, tmp_path):
+        stale = tmp_path / "homes" / "slot-2" / ".config" / "packer" / "plugins"
+        stale.mkdir(parents=True)
+        (stale / "packer-plugin-openstack").write_text("planted by the previous job")
+
+        ctx = job_context.for_slot(2)
+
+        assert slot_users[0] == ("reap", 20002)  # before the home is touched
+        assert ctx.uid == 20002 and ctx.home == str(tmp_path / "homes" / "slot-2")
+        assert os.listdir(ctx.home) == ["tmp"] and os.listdir(os.path.join(ctx.home, "tmp")) == []
+        assert ("chown", ctx.home, 20002) in slot_users
+        assert ctx.env()["TMPDIR"] == os.path.join(ctx.home, "tmp")
+
+    def test_the_slot_user_is_reaped_after_the_job_even_when_it_fails(self, slot_users):
+        with pytest.raises(RuntimeError, match="tool failed"), job_context.slot_session(4) as ctx:
+            assert job_context.current() is ctx
+            raise RuntimeError("tool failed")
+        assert [c for c in slot_users if c[0] == "reap"] == [("reap", 20004), ("reap", 20004)]
+        assert job_context.current().uid is None
+
+    def test_no_slot_users_means_no_reaping(self, monkeypatch):
+        monkeypatch.setattr(job_context.settings, "WORKER_JOB_UID_BASE", None)
+        monkeypatch.setattr(job_context, "reap", lambda uid: pytest.fail("reaped without slot users"))
+        with job_context.slot_session(1) as ctx:
+            assert ctx.uid is None and "TMPDIR" not in ctx.env()
+
+    def test_reap_kills_every_process_of_the_user_as_that_user(self, mocker):
+        run = mocker.patch("app.job_context.subprocess.run", return_value=mocker.MagicMock(returncode=0, stderr=b""))
+        job_context.reap(20003)
+        kwargs = run.call_args.kwargs
+        assert (kwargs["user"], kwargs["group"], kwargs["extra_groups"]) == (20003, 20003, [])
+        assert "os.kill(-1, signal.SIGKILL)" in run.call_args.args[0][-1]
+        assert set(kwargs["env"]) == {"PATH"}
+
+    def test_reap_failure_stops_the_job(self, mocker):
+        mocker.patch(
+            "app.job_context.subprocess.run",
+            return_value=mocker.MagicMock(returncode=1, stderr=b"setuid failed"),
+        )
+        with pytest.raises(RuntimeError, match="setuid failed"):
+            job_context.reap(20003)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+def test_base_dirs_are_not_listable_and_their_world_writable_parent_gets_the_sticky_bit(slot_users, tmp_path):
+    import stat
+
+    tmp_path.chmod(0o777)  # like an emptyDir mounted at /tmp
+    (tmp_path / "repos").mkdir(mode=0o777)
+    job_context.prepare_base_dirs()
+    for base in ("repos", "homes"):
+        assert stat.S_IMODE(os.stat(tmp_path / base).st_mode) == 0o711
+    assert os.stat(tmp_path).st_mode & stat.S_ISVTX
+
+
+@pytest.mark.unit
+def test_base_dirs_are_left_alone_without_slot_users(monkeypatch, tmp_path):
+    monkeypatch.setattr(job_context.settings, "WORKER_JOB_UID_BASE", None)
+    monkeypatch.setattr(job_context.settings, "TEMP_REPO_BASE_PATH", str(tmp_path / "repos"))
+    job_context.prepare_base_dirs()
+    assert not (tmp_path / "repos").exists()

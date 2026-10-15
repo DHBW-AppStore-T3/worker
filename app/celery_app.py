@@ -2,7 +2,7 @@ import logging
 import pathlib
 
 from celery import Celery, bootsteps
-from celery.signals import task_unknown
+from celery.signals import task_unknown, worker_init
 from kombu.transport import TRANSPORT_ALIASES
 
 from .config import settings
@@ -76,6 +76,14 @@ class HeartbeatFile(bootsteps.StartStopStep):
 
 
 celery_app.steps["worker"].add(HeartbeatFile)
+
+
+@worker_init.connect
+def _prepare_job_dirs(**kwargs):
+    """Base directories safe for the slot users, before the pool forks (job_context)."""
+    from . import job_context
+
+    job_context.prepare_base_dirs()
 
 
 @task_unknown.connect

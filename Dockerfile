@@ -81,6 +81,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     curl \
     ca-certificates \
     python3-pip \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade base-image Python tooling (pip / setuptools / wheel) to pull
@@ -144,6 +145,12 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # remote control, which the Postgres transport does not have (.github#5).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
+
+# tini as PID 1 reaps the processes a job's tools leave behind once the
+# worker kills them between jobs (app/job_context.py, slot_session); the
+# celery main process would leave them as zombies. Kubernetes: set ``args``,
+# not ``command``, or tini is skipped.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Celery Worker starten: fixed pool (slot n = UID 20000+n), no Celery
 # events, gossip or mingle (they need a fanout exchange). Concurrency can

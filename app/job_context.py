@@ -16,6 +16,13 @@ tools (OpenTofu, Packer, the OpenStack CLI) get:
   are), nor the files of a job running in another slot. The worker
   process must run as root for that; it drops to the slot's UID only for
   the child processes.
+- **nothing of the previous job in the slot** (:func:`slot_session`): every
+  job of a slot runs as the same user, whoever's deployment it is. A
+  ``local-exec`` can leave a process behind (``setsid``) that would read the
+  next job's credentials and variable file, or plant a provider or Packer
+  plugin in the home for the next job to run. So before a job every process
+  of the slot's user is killed and its home starts empty (with a private
+  ``TMPDIR`` in it), and after the job its processes are killed again.
 - **a deadline**: every tool gets at most the time left until the job's
   limit (``WORKER_JOB_TIMEOUT_SECONDS``), so a hanging provider cannot
   hold a worker slot until Celery's hard limit kills the whole process.
@@ -32,6 +39,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
+import stat
+import subprocess
+import sys
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -81,6 +92,10 @@ class JobContext:
             "TF_IN_AUTOMATION": "1",
             "TF_INPUT": "0",
         }
+        if self.uid is not None:
+            # Temporary files in the job's own home, not in the /tmp every
+            # slot shares (``slot_session`` creates it empty).
+            env["TMPDIR"] = os.path.join(self.home, "tmp")
         if extra:
             env.update(extra)
         return env
@@ -136,16 +151,18 @@ def current_slot() -> int:
 
 
 def for_slot(slot: int) -> JobContext:
-    """A context for a job starting now in worker slot ``slot``; its deadline starts now."""
+    """A context for a job starting now in worker slot ``slot``; its deadline starts now.
+
+    With slot users: no process of the slot's user survives from an earlier
+    job, and the home is empty (see the module docstring).
+    """
     deadline = time.monotonic() + settings.WORKER_JOB_TIMEOUT_SECONDS
     if settings.WORKER_JOB_UID_BASE is None:
         return JobContext(deadline=deadline)
     uid = settings.WORKER_JOB_UID_BASE + slot
-    # A home per slot, owned by the slot's user: plugin caches survive from
-    # one job to the next, but no two users share one.
     home = os.path.join(settings.WORKER_JOB_HOME_BASE, f"slot-{slot}")
-    os.makedirs(home, mode=0o700, exist_ok=True)
-    os.chown(home, uid, uid)
+    reap(uid)
+    _fresh_home(home, uid)
     return JobContext(uid=uid, home=home, deadline=deadline)
 
 
@@ -157,3 +174,82 @@ def bind(ctx: JobContext) -> Iterator[JobContext]:
         yield ctx
     finally:
         _current.reset(token)
+
+
+@contextlib.contextmanager
+def slot_session(slot: int) -> Iterator[JobContext]:
+    """The context of one job in worker slot ``slot``, bound for the ``with`` block.
+
+    Prepared by :func:`for_slot`; afterwards every process the job's tools
+    left behind is killed, so none runs on into the slot's next job.
+    """
+    ctx = for_slot(slot)
+    try:
+        with bind(ctx):
+            yield ctx
+    finally:
+        if ctx.uid is not None:
+            reap(ctx.uid)
+
+
+# Run as the slot's user, ``kill(-1)`` reaches every process of that user and
+# nobody else's (not the worker, which runs as root). No process left to
+# signal is fine.
+_REAP_SCRIPT = "import os, signal\ntry:\n    os.kill(-1, signal.SIGKILL)\nexcept ProcessLookupError:\n    pass\n"
+
+
+def reap(uid: int) -> None:
+    """Kill every process of user ``uid``; raises when that cannot be done.
+
+    A job must not start in a slot where the previous job's processes might
+    still run, so a failure here fails the job instead of being ignored.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _REAP_SCRIPT],
+        user=uid,
+        group=uid,
+        extra_groups=[],
+        env={"PATH": os.environ.get("PATH") or _FALLBACK_PATH},
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"could not stop the processes of slot user {uid}: {detail}")
+
+
+def _fresh_home(home: str, uid: int) -> None:
+    """An empty home for the slot's user, with an empty ``tmp`` in it (mode 0700)."""
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(os.path.join(home, "tmp"), mode=0o700, exist_ok=True)
+    for path in (home, os.path.join(home, "tmp")):
+        if os.path.islink(path) or not os.path.isdir(path):
+            raise RuntimeError(f"{path} is not a plain directory")
+        os.chmod(path, 0o700)
+        os.chown(path, uid, uid)
+
+
+def prepare_base_dirs() -> None:
+    """Set the base directories of the job dirs and homes up for slot users; once, at worker start.
+
+    The image creates both root-owned with mode 0711: a slot's user may enter
+    its own directory but not list or change the others. A volume mounted
+    over them or over their parent (an emptyDir in Kubernetes) comes up 0777
+    without the sticky bit; a slot's user could then rename a base away and
+    put one of its own in its place, from which the next job of another
+    deployment would run. So the bases are set again, and a world-writable
+    parent (``/tmp``) gets the sticky bit. Nothing to do without slot users.
+    """
+    if settings.WORKER_JOB_UID_BASE is None:
+        return
+    for base in (settings.TEMP_REPO_BASE_PATH, settings.WORKER_JOB_HOME_BASE):
+        os.makedirs(base, exist_ok=True)
+        if os.path.islink(base) or not os.path.isdir(base):
+            raise RuntimeError(f"{base} is not a plain directory")
+        os.chown(base, os.getuid(), os.getgid())
+        os.chmod(base, 0o711)
+        parent = os.path.dirname(os.path.abspath(base))
+        mode = os.stat(parent).st_mode
+        if mode & stat.S_IWOTH and not mode & stat.S_ISVTX:
+            os.chmod(parent, stat.S_IMODE(mode) | stat.S_ISVTX)

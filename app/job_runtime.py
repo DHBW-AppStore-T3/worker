@@ -79,6 +79,10 @@ WORKER_LOST_MESSAGE = (
     "Zustand der Ressourcen und starten Sie die Aktion bei Bedarf erneut."
 )
 CANCELLED_MESSAGE = "Abgebrochen: Die laufende Aktion wurde beendet."
+SLOT_NOT_READY_MESSAGE = (
+    "Der Worker konnte den Arbeitsbereich für diesen Auftrag nicht vorbereiten; der Auftrag "
+    "wurde nicht ausgeführt. Bitte den Administrator informieren."
+)
 
 
 class JobCancelled(BaseException):  # noqa: N818 - not an error, a stop signal
@@ -299,7 +303,21 @@ class Job:
         with _lock:
             _current = self
         self._context = contextlib.ExitStack()
-        self._context.enter_context(job_context.bind(job_context.for_slot(job_context.current_slot())))
+        try:
+            # The slot's user, home and deadline; nothing of the slot's
+            # previous job may still be around (job_context.slot_session).
+            self._context.enter_context(job_context.slot_session(job_context.current_slot()))
+        except Exception as exc:
+            logger.exception("task %s: the worker slot could not be prepared", self.task_id)
+            self.finish(
+                "FAILED",
+                logs=f"[err] {SLOT_NOT_READY_MESSAGE}\n\n--- Technische Details ---\n{exc}",
+                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+            )
+            with _lock:
+                if _current is self:
+                    _current = None
+            raise
         for target, name in ((self._heartbeat_loop, "lease"), (self._flush_loop, "events")):
             thread = threading.Thread(target=target, name=f"job-{name}-{self.task_id[:8]}", daemon=True)
             thread.start()
