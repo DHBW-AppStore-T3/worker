@@ -277,6 +277,26 @@ def test_uploaded_files_reach_exactly_their_workloads(cluster):
     assert secrets == {"team-1-anna-b", "team-1-ben"}
 
 
+def test_team_files_in_the_shape_the_api_stores_them_reach_the_workloads(cluster):
+    """The API wraps every slot of a team-scoped file variable as ``{"uploaded": file}``
+    (``deployment_input.attach_files_to_user_input``); those files must not be dropped."""
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    stored = {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4, "content_type": "application/zip"}
+    user_vars = {"terraform": {"assignment": {"Team-1": {"uploaded": stored}}}}
+
+    deploy(spec=spec, user_vars=user_vars)
+
+    contents = {
+        o["metadata"]["labels"]["appstore.dhbw/workload"]: o["data"]["assignment"]
+        for (kind, name, ns, _v), o in cluster.objects.items()
+        if kind == "Secret" and ns == NS and name.endswith("-files")
+    }
+    assert contents == {"team-1-anna-b": "UEsDBA==", "team-1-ben": "UEsDBA=="}
+
+
 def test_pause_stops_all_pods_and_resume_brings_them_back(cluster):
     deploy()
     pod_tasks.pause_deployment.run(DEP)

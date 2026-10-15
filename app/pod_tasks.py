@@ -272,19 +272,27 @@ def _bootstrap_objects(dep: DeploymentCtx) -> list[dict[str, Any]]:
 
 
 def _file_contents(user_vars: dict[str, Any], spec: AppSpec) -> dict[str, dict[str, bytes]]:
-    """Uploaded files per file variable as ``{slot: bytes}``, from ``userInputVar.terraform``."""
+    """Uploaded files per file variable as ``{slot: bytes}``, from ``userInputVar.terraform``.
+
+    The API stores a team-scoped file variable with each slot wrapped as
+    ``{"uploaded": file}`` (the shape a VM app's HCL ``map(map(object))``
+    needs); both shapes are read, so no team's file is silently dropped.
+    """
     terraform = user_vars.get("terraform") or {}
     out: dict[str, dict[str, bytes]] = {}
     for v in spec.variables:
         if v.type != "file":
             continue
         slots = terraform.get(v.name)
-        if isinstance(slots, dict):
-            out[v.name] = {
-                k: base64.b64decode(s["content_b64"])
-                for k, s in slots.items()
-                if isinstance(s, dict) and "content_b64" in s
-            }
+        if not isinstance(slots, dict):
+            continue
+        files: dict[str, bytes] = {}
+        for slot, entry in slots.items():
+            if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
+                entry = entry["uploaded"]
+            if isinstance(entry, dict) and "content_b64" in entry:
+                files[slot] = base64.b64decode(entry["content_b64"])
+        out[v.name] = files
     return out
 
 
