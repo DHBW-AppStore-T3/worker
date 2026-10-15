@@ -23,7 +23,9 @@ class TestConfiguration:
         assert hasattr(settings, "DATABASE_URL")
         assert hasattr(settings, "CELERY_BROKER_URL")
         assert hasattr(settings, "TEMP_REPO_BASE_PATH")
-        assert hasattr(settings, "GIT_ACCESS_TOKEN")
+        assert hasattr(settings, "APP_GIT_ALLOWED_HOSTS")
+        # App repositories are read anonymously (.github#7 B).
+        assert not hasattr(settings, "GIT_ACCESS_TOKEN")
         assert hasattr(settings, "CREDENTIAL_ENCRYPTION_KEY")
 
     @patch.dict(
@@ -31,7 +33,7 @@ class TestConfiguration:
         {
             "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
             "DATABASE_URL": "postgresql+psycopg2://appstore_worker:pw@postgres:5432/appstore",
-            "GIT_ACCESS_TOKEN": "test-token",
+            "APP_GIT_ALLOWED_HOSTS": "github.com,gitlab.dhbw.cloud",
         },
         clear=True,
     )
@@ -45,7 +47,7 @@ class TestConfiguration:
 
         # The broker defaults to the database, through the pgq transport.
         assert config.settings.celery_broker_url == "pgq+postgresql://appstore_worker:pw@postgres:5432/appstore"
-        assert config.settings.GIT_ACCESS_TOKEN == "test-token"
+        assert config.settings.APP_GIT_ALLOWED_HOSTS == "github.com,gitlab.dhbw.cloud"
 
     @patch.dict(
         os.environ,

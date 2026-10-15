@@ -102,6 +102,20 @@ def _scrub_nested_nones(value: Any) -> Any:
     return value
 
 
+def output_names(outputs: dict[str, Any]) -> list[str]:
+    """The names of Terraform outputs, never their values (.github#7 E)."""
+    return sorted(str(name) for name in (outputs or {}))
+
+
+def terraform_users(teams: dict[str, list]) -> dict[str, list[dict[str, str]]]:
+    """The ``users`` variable of an app: per team the members' e-mail only.
+
+    The API sends user id and username along (exact access matching,
+    .github#7 H); the apps declare ``map(list(object({email = string})))``.
+    """
+    return {team: [{"email": m["email"]} for m in members if m.get("email")] for team, members in teams.items()}
+
+
 def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
     """Encode variables for ``terraform -var key=value`` CLI args.
 
@@ -738,6 +752,7 @@ def _prepare_workspace(
     app_id: str,
     app_git_link: str,
     release: str,
+    commit_sha: str | None,
     openstack_envelope: dict[str, Any] | None,
     action: str,
     resource_info: dict[str, Any] | None = None,
@@ -769,6 +784,7 @@ def _prepare_workspace(
         app_id=app_id,
         git_url=app_git_link,
         release=release,
+        commit=commit_sha,
         **(resource_info or {}),
     )
 
@@ -783,25 +799,20 @@ def _prepare_workspace(
 
     rt.mark(
         PHASE_GIT_CLONE,
-        "Cloning repository" if initial_deploy else "Cloning repository at original release tag",
+        "Cloning repository" if initial_deploy else "Cloning repository at the deployment's commit",
     )
     rt.logger.info(
-        (
-            f"Cloning repository: {app_git_link}"
-            if initial_deploy
-            else (
-                f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-                "so terraform code matches the pg-backend state)"
-            )
-        ),
+        f"Cloning {app_git_link} at {release} (commit {(commit_sha or 'none')[:8]}, pinned when the "
+        "deployment was created)",
         category=LogCategory.OPERATION,
     )
     commit_info: dict[str, Any] | None = None
     try:
-        rt.repo_path = git_service.clone_release(
+        rt.repo_path = git_service.clone_commit(
             git_url=app_git_link,
-            deployment_id=rt.deployment_id,
             tag=release,
+            commit_sha=commit_sha or "",
+            deployment_id=rt.deployment_id,
         )
         if capture_commit:
             try:
@@ -1048,6 +1059,7 @@ def deploy_application(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
 ):
     """
     Deploy an application using Terraform and Packer
@@ -1091,6 +1103,7 @@ def deploy_application(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="deployment",
             initial_deploy=True,
@@ -1175,7 +1188,7 @@ def deploy_application(
                 legacy=_is_legacy_layout(templates),
             )
             if teams:
-                terraform_vars["users"] = teams
+                terraform_vars["users"] = terraform_users(teams)
             terraform_vars = encode_terraform_vars(terraform_vars)
 
             # File-upload variables can balloon a single -var to hundreds
@@ -1259,7 +1272,7 @@ def deploy_application(
                         legacy=_is_legacy_layout(templates),
                     )
                     if teams:
-                        cleanup_tf_vars["users"] = teams
+                        cleanup_tf_vars["users"] = terraform_users(teams)
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
                     # Refresh state after destroy so the persisted record reflects cleanup.
                     tf_state = collect_terraform_state()
@@ -1280,7 +1293,15 @@ def deploy_application(
         task_logger.info("Deployment summary", category=LogCategory.SYSTEM, **summary)
 
         if outputs:
-            task_logger.info("Terraform deployment output", category=LogCategory.SYSTEM, **outputs)
+            # Names only (.github#7 E, security review H-8): the values carry
+            # every member's credentials and would land in the task log, the
+            # live stream and the container log. They travel sealed in the
+            # result; ``my-access`` hands each member their own entry.
+            task_logger.info(
+                "Terraform deployment outputs",
+                category=LogCategory.SYSTEM,
+                output_names=output_names(outputs),
+            )
 
         result = {
             "status": "success",
@@ -1329,6 +1350,7 @@ def destroy_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
     sweep_build_artifacts: bool = False,
 ):
     """Tear down a deployment via ``terraform destroy``.
@@ -1368,6 +1390,7 @@ def destroy_deployment(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="destroy",
             resource_info={
@@ -1414,7 +1437,7 @@ def destroy_deployment(
             legacy=_is_legacy_layout(templates),
         )
         if teams:
-            terraform_vars["users"] = teams
+            terraform_vars["users"] = terraform_users(teams)
         terraform_vars = encode_terraform_vars(terraform_vars)
 
         terraform = TerraformExecutor(
@@ -1577,6 +1600,7 @@ def _run_compute_lifecycle(
     user_vars: dict[str, Any],
     teams: dict[str, list] | None,
     openstack_envelope: dict[str, Any] | None,
+    commit_sha: str | None,
     *,
     action: str,  # "pause" | "resume" — only for log/error labels
     phases: tuple[str, ...],
@@ -1608,6 +1632,7 @@ def _run_compute_lifecycle(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action=action,
             resource_info={"action": action},
@@ -1754,6 +1779,7 @@ def pause_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
 ):
     """Halt a deployment by stopping all of its compute instances.
 
@@ -1771,6 +1797,7 @@ def pause_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        commit_sha,
         action="pause",
         phases=_PHASES_PAUSE,
         server_phase=PHASE_SERVER_STOP,
@@ -1788,6 +1815,7 @@ def resume_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
 ):
     """Resume a paused deployment by starting all of its compute instances.
 
@@ -1803,6 +1831,7 @@ def resume_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        commit_sha,
         action="resume",
         phases=_PHASES_RESUME,
         server_phase=PHASE_SERVER_START,
@@ -1969,6 +1998,7 @@ def redeploy_resource(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
     resource_address: str | None = None,
 ):
     """Replace ONE compute instance via ``-target`` + ``-replace``.
@@ -2014,6 +2044,7 @@ def redeploy_resource(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="redeploy",
             start_message=f"Starting redeploy of {resource_address}",
@@ -2065,7 +2096,7 @@ def redeploy_resource(
             legacy=_is_legacy_layout(templates),
         )
         if teams:
-            terraform_vars["users"] = teams
+            terraform_vars["users"] = terraform_users(teams)
         terraform_vars = encode_terraform_vars(terraform_vars)
 
         terraform = TerraformExecutor(

@@ -107,7 +107,7 @@ def _make_build_lock_mock(mocker, *, held=True):
 def _make_git_mock(mocker, repo_path):
     """Patch the ``git_service`` symbol used inside tasks.py."""
     gs = mocker.patch("app.tasks.git_service")
-    gs.clone_release.return_value = repo_path
+    gs.clone_commit.return_value = repo_path
     gs.cleanup_repository.return_value = None
     return gs
 
@@ -373,6 +373,46 @@ class TestDeployApplication:
         assert not tf_inst.destroy.called
         lock_inst.acquire_or_wait.assert_called_once()
         lock_inst.release.assert_called_once()
+
+    def test_clones_the_pinned_commit_and_hands_terraform_only_emails(self, mocker, tmp_path):
+        """The job fetches the commit the API pinned (.github#7 G); Terraform's
+        ``users`` keeps the apps' ``{email}`` shape although the API sends ids too;
+        the log names the outputs but never shows their values (.github#7 E)."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+        _silence_events(mocker, deploy_application)
+        gs = _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _make_openstack_service_mock(mocker, image_exists=True)
+        _make_build_lock_mock(mocker, held=True)
+        _make_packer_mock(mocker)
+        _, tf_inst = _make_terraform_executor_mock(
+            mocker, output={"user_accounts": {"value": {"T1-a": {"auth": "s3cret-pw"}}, "sensitive": True}}
+        )
+        sha = "0123456789abcdef0123456789abcdef01234567"
+
+        result = deploy_application.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://github.com/acme/app",
+            release="v1",
+            commit_sha=sha,
+            user_vars={"terraform": {}},
+            teams={"T1": [{"email": "a@x", "user_id": "u-1", "username": "a"}]},
+            openstack_envelope={"project_id": "p1"},
+        )
+
+        assert result["status"] == "success"
+        assert gs.clone_commit.call_args.kwargs["commit_sha"] == sha
+        assert gs.clone_commit.call_args.kwargs["tag"] == "v1"
+        tf_vars = tf_inst.apply.call_args.kwargs["variables"]
+        assert json.loads(tf_vars["users"]) == {"T1": [{"email": "a@x"}]}
+        logged = json.dumps(result["logs"])
+        assert "s3cret-pw" not in logged
+        assert "user_accounts" in logged
 
     def test_multi_template_iterates_each_discovered(self, mocker, tmp_path):
         """Multi-template repo runs Packer once per template (in order)."""

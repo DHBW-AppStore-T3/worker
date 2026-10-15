@@ -30,8 +30,10 @@ class Settings(BaseSettings):
     # this is always set; an empty value at task time will raise.
     TFSTATE_DATABASE_URL: str = ""
 
-    # Git
-    GIT_ACCESS_TOKEN: str = ""
+    # Git: app repositories are public and fetched anonymously, only from
+    # these hosts (comma-separated, exact names; the API checks the same
+    # list, .github#7 B).
+    APP_GIT_ALLOWED_HOSTS: str = "github.com"
 
     # A claimed message stays hidden from other workers this long; the
     # worker's main process renews it every third of it while it holds the
