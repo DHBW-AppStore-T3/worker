@@ -371,3 +371,32 @@ class TestServerStart:
         service.server_start("srv-1")
         assert mock_sp.call_args.args[0] == ["openstack", "server", "start", "srv-1"]
         assert mock_sp.call_args.kwargs["timeout"] == 120
+
+
+# ---------------------------------------------------------------------------
+# Ids from the state never become options
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestIdsAreNeverOptions:
+    """Server ids come from the OpenTofu state, which the app's code can write."""
+
+    INJECTED = "--os-auth-url=https://evil.example/v3"
+
+    @pytest.mark.parametrize(
+        "call,refused",
+        [
+            (lambda s, v: s.server_show(v), None),
+            (lambda s, v: s.server_stop(v), (False, "not a server id")),
+            (lambda s, v: s.server_start(v), (False, "not a server id")),
+            (lambda s, v: s.server_delete(v), (False, "not a server id")),
+            (lambda s, v: s.image_delete_by_id(v), (False, "not an image id")),
+            (lambda s, v: s.keypair_delete(v), False),
+        ],
+    )
+    def test_a_value_that_would_be_read_as_an_option_never_reaches_the_cli(self, service, mocker, call, refused):
+        run = mocker.patch.object(service, "_run")
+        for value in (self.INJECTED, "-h", ""):
+            assert call(service, value) == refused
+        run.assert_not_called()
