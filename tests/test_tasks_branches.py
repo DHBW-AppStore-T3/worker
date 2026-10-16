@@ -715,6 +715,38 @@ class TestDestroyDeployment:
             )
         assert "Terraform destroy failed" in str(exc.value)
 
+    @pytest.mark.parametrize("sweep", [True, False])
+    def test_build_artifacts_of_a_cancelled_deploy_go_under_the_build_lock(self, mocker, tmp_path, sweep):
+        """The build server goes with the image cleanup (locked, usage-checked), never on its own."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        _seed_terraform_dir(repo_path)
+
+        _silence_events(mocker, destroy_deployment)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
+        _make_terraform_executor_mock(mocker)
+        _, os_inst = _make_openstack_service_mock(mocker)
+        os_inst.unused_packer_keypairs.return_value = ["packer_1"]
+        cleanup = mocker.patch("app.tasks._delete_unused_images")
+
+        destroy_deployment.run(
+            deployment_id="dep-1",
+            app_id="myapp",
+            app_git_link="https://git/repo.git",
+            release="v1",
+            user_vars={"terraform": {}},
+            teams=None,
+            openstack_envelope=_ENVELOPE,
+            sweep_build_artifacts=sweep,
+        )
+
+        assert cleanup.call_args.kwargs["build_servers"] is sweep
+        os_inst.servers_by_name.assert_not_called()
+        assert os_inst.keypair_delete.call_count == (1 if sweep else 0)
+
 
 # --- image pruning wiring ---------------------------------------------------
 

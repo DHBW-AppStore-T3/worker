@@ -196,24 +196,6 @@ class OpenStackService:
             return (False, stderr)
         return (True, None)
 
-    def image_delete_by_name(self, image_name: str) -> tuple[bool, str | None]:
-        """Delete a Glance image by exact name, if it exists.
-
-        Only ever called for the image name this deployment's build was
-        producing, so it cannot touch an unrelated app's image.
-        """
-        exists, image_id = self.check_image_exists(image_name)
-        if not exists or not image_id:
-            return (True, None)
-        rc, _stdout, stderr = self._run(
-            ["openstack", "image", "delete", image_id],
-            timeout=120,
-        )
-        if rc != 0:
-            logger.error(f"Failed to delete image {image_id}: {stderr}")
-            return (False, stderr)
-        return (True, None)
-
     def unused_packer_keypairs(self) -> list[str]:
         """Packer-generated keypairs that no server is still using.
 

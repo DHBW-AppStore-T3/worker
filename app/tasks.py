@@ -587,6 +587,7 @@ def _delete_unused_images(
     project_id: str,
     openstack_service: OpenStackService,
     task_logger: Any,
+    build_servers: bool = False,
 ) -> None:
     """Delete a destroyed deployment's Packer images once nothing may boot from them. Never raises.
 
@@ -597,12 +598,29 @@ def _delete_unused_images(
     resources are already gone, so a failure is a warning in the log, not
     a failed destroy (``_prune_superseded_images`` catches leftovers on the
     app's next deploy).
+
+    ``build_servers`` (destroy after a cancelled deploy): first delete the
+    build server a killed Packer leaves behind; it is not in Terraform's
+    state, and Packer names it after the image. Under the lock as well: once
+    the cancelled job's lock is gone, another deployment of the app in the
+    project may build the same (content-addressed) image, and its build
+    server has the same name.
     """
     for image_name in image_names.values():
         lock = PackerBuildLock(project_id, image_name, total_wait_s=_CLEANUP_LOCK_WAIT_S)
         try:
             while not lock.acquire_or_wait():
                 pass
+            if build_servers:
+                for server_id in openstack_service.servers_by_name(image_name):
+                    ok, err = openstack_service.server_delete(server_id)
+                    if ok:
+                        task_logger.success(
+                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
+                            category=LogCategory.STATUS,
+                        )
+                    else:
+                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
             if image_usage.others_use_app_images(deployment_id, app_id, project_id):
                 task_logger.info(
                     f"Keeping image '{image_name}': another deployment of this app in the project may use it",
@@ -1557,40 +1575,19 @@ def destroy_deployment(
             raise Exception("Terraform destroy failed")
         task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
 
-        # Cancel path only. Packer cleans up its own build instance and
-        # throwaway keypair on a normal exit, but a cancelled deploy kills
-        # it before that happens. None of it is in Terraform state - the
-        # build instance belongs to Packer - so the destroy above cannot
-        # reach it. Reap it by the exact image name this deploy was
-        # building, so a parallel build of another app is never touched.
+        # The Packer images stay while anything may still boot from them;
+        # otherwise nothing in OpenStack would ever remove them. Cancel path
+        # (``sweep_build_artifacts``): Packer cleans up its own build
+        # instance and throwaway keypair on a normal exit, but a cancelled
+        # deploy kills it before that happens, and none of it is in
+        # Terraform state. The build instance goes with the image, by its
+        # exact name and under its build lock (``_delete_unused_images``),
+        # so a parallel build of another app, or of the same image for
+        # another deployment, is never touched. The lock itself needs no
+        # cleanup: it is a session-level advisory lock, released when the
+        # cancelled job's database session ended.
         if sweep_build_artifacts:
             rt.mark(PHASE_CLEANUP, "Reaping build artifacts")
-            sweeper = OpenStackService(env_vars=openstack_env)
-            for image_name in image_names.values():
-                for server_id in sweeper.servers_by_name(image_name):
-                    ok, err = sweeper.server_delete(server_id)
-                    if ok:
-                        task_logger.success(
-                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
-                            category=LogCategory.STATUS,
-                        )
-                    else:
-                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
-                ok, err = sweeper.image_delete_by_name(image_name)
-                if not ok:
-                    task_logger.warning(f"Could not delete partial image '{image_name}': {err}")
-            for keypair in sweeper.unused_packer_keypairs():
-                if sweeper.keypair_delete(keypair):
-                    task_logger.info(f"Deleted stale Packer keypair {keypair}")
-            # The build lock needs no cleanup: it is a session-level
-            # advisory lock, released when the cancelled job's database
-            # session ended.
-
-        rt.mark(PHASE_CLEANUP, "Pulling final state")
-        tf_state = collect_terraform_state()
-
-        # The Packer images stay while anything may still boot from them;
-        # otherwise nothing in OpenStack would ever remove them.
         if templates:
             _delete_unused_images(
                 deployment_id,
@@ -1599,7 +1596,16 @@ def destroy_deployment(
                 project_id=_lock_project(openstack_envelope),
                 openstack_service=OpenStackService(env_vars=openstack_env),
                 task_logger=task_logger,
+                build_servers=sweep_build_artifacts,
             )
+        if sweep_build_artifacts:
+            sweeper = OpenStackService(env_vars=openstack_env)
+            for keypair in sweeper.unused_packer_keypairs():
+                if sweeper.keypair_delete(keypair):
+                    task_logger.info(f"Deleted stale Packer keypair {keypair}")
+
+        rt.mark(PHASE_CLEANUP, "Pulling final state")
+        tf_state = collect_terraform_state()
 
         task_logger.success(f"Deployment {deployment_id} destroyed successfully", category=LogCategory.STATUS)
 

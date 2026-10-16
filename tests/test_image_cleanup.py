@@ -35,10 +35,12 @@ def cleanup(monkeypatch):
     openstack.image_delete_by_id.return_value = (True, None)
     logger = MagicMock()
 
-    def run(*, shared=False, in_use=frozenset({"img-other"}), delete_result=(True, None)):
+    def run(*, shared=False, in_use=frozenset({"img-other"}), delete_result=(True, None), build_servers=False):
         # ``in_use=None``: the server listing failed.
         openstack.image_ids_in_use.return_value = None if in_use is None else set(in_use)
         openstack.image_delete_by_id.return_value = delete_result
+        openstack.servers_by_name.side_effect = lambda name: [f"build-of-{name}"]
+        openstack.server_delete.return_value = (True, None)
         monkeypatch.setattr(image_usage, "others_use_app_images", lambda _d, _a, _p: shared)
         tasks._delete_unused_images(
             "dep-1",
@@ -47,6 +49,7 @@ def cleanup(monkeypatch):
             project_id="p1",
             openstack_service=openstack,
             task_logger=logger,
+            build_servers=build_servers,
         )
         return openstack, logger
 
@@ -78,6 +81,37 @@ def test_a_failing_delete_is_a_warning_not_a_failed_destroy(cleanup):
     openstack, logger = cleanup(delete_result=(False, "403 forbidden"))
 
     assert openstack.image_delete_by_id.call_count == 2
+    assert logger.warning.call_count == 2
+
+
+def test_a_normal_destroy_leaves_servers_alone(cleanup):
+    openstack, _ = cleanup()
+
+    openstack.servers_by_name.assert_not_called()
+    openstack.server_delete.assert_not_called()
+
+
+def test_after_a_cancel_the_build_server_goes_under_the_build_lock(cleanup, monkeypatch):
+    events = []
+    monkeypatch.setattr(_Lock, "acquire_or_wait", lambda self: events.append(f"lock {self.key}") or True)
+    openstack, _ = cleanup(build_servers=True, shared=True)
+    assert openstack.server_delete.call_count == 2
+    deleted = [c.args[0] for c in openstack.server_delete.call_args_list]
+    assert deleted == ["build-of-app-1-web-abcdef012345", "build-of-app-1-db-abcdef012345"]
+    assert events == ["lock p1:app-1-web-abcdef012345", "lock p1:app-1-db-abcdef012345"]
+    # Another deployment of the app may use the image: it stays.
+    openstack.image_delete_by_id.assert_not_called()
+
+
+def test_a_build_server_is_left_while_the_same_image_is_built_for_another_deployment(cleanup, monkeypatch):
+    def busy(self):
+        raise TimeoutError("another worker is still building this image")
+
+    monkeypatch.setattr(_Lock, "acquire_or_wait", busy)
+    openstack, logger = cleanup(build_servers=True)
+
+    openstack.servers_by_name.assert_not_called()
+    openstack.image_delete_by_id.assert_not_called()
     assert logger.warning.call_count == 2
 
 
