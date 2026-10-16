@@ -31,7 +31,7 @@ from app.task_contract import (
     NOTIFY_TASK_RELEASED,
     open_results,
 )
-from app.utils.crypto import cipher
+from app.utils.crypto import results_cipher
 
 pytestmark = pytest.mark.integration
 
@@ -114,7 +114,7 @@ def test_success_records_status_logs_sealed_results_and_events(pg):
     assert row["status"] == "SUCCESS" and row["lease_until"] is None and row["finished_at"] is not None
     assert json.loads(row["logs"]) == [{"timestamp": "2026-10-09T12:00:00Z", "level": "INFO", "message": "done"}]
     assert row["outputs"] is None and row["tf_state"] is None  # nothing in plaintext
-    results = open_results(cipher, row["outputs_enc"])
+    results = open_results(results_cipher, row["outputs_enc"])
     assert results == {"terraform_outputs": {"ip": {"value": "::1"}}, "tf_state": '{"version": 4}'}
     assert row["current_phase"] == "STARTING" and row["progress_pct"] == 50
 
@@ -134,7 +134,7 @@ def test_failure_keeps_the_transcript_format_and_seals_partial_results(pg):
     assert row["logs"].startswith('[{"level": "ERROR", "message": "boom"}]')
     assert "[err] Error: Terraform apply failed" in row["logs"]
     assert "Commit: abcdef12" in row["logs"]
-    assert open_results(cipher, row["outputs_enc"])["tf_state"] == '{"version": 4, "partial": true}'
+    assert open_results(results_cipher, row["outputs_enc"])["tf_state"] == '{"version": 4, "partial": true}'
     (terminal,) = (p for t, p in _events(pg, task_id) if t == EVENT_FAILED)
     assert terminal["failure_kind"] == FAILURE_KIND_WORKER
 

@@ -76,7 +76,7 @@ class TestDecryptErrorPaths:
 
         foreign_key = Fernet.generate_key()
         foreign_cipher = Fernet(foreign_key)
-        mocker.patch.object(crypto_module, "_cipher", foreign_cipher)
+        mocker.patch.object(crypto_module, "_credential_cipher", foreign_cipher)
 
         with pytest.raises(InvalidToken):
             crypto_module.decrypt(token)
@@ -110,119 +110,69 @@ class TestDecryptErrorPaths:
 
 @pytest.mark.unit
 class TestBuildCipherErrors:
-    """Verify _build_cipher rejects missing or malformed keys with RuntimeError."""
+    """Verify _build_cipher rejects malformed keys with RuntimeError."""
 
-    def test_build_cipher_with_empty_key_raises_runtime_error(self, mocker):
-        """_build_cipher raises RuntimeError with a helpful message when the key is empty."""
-        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", "")
-
-        with pytest.raises(RuntimeError) as exc_info:
-            crypto_module._build_cipher()
-
-        message = str(exc_info.value)
-        assert "CREDENTIAL_ENCRYPTION_KEY" in message
-        assert "not set" in message
-
-    def test_build_cipher_with_none_key_raises_runtime_error(self, mocker):
-        """_build_cipher treats a None key as missing and raises RuntimeError."""
-        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", None)
-
-        with pytest.raises(RuntimeError) as exc_info:
-            crypto_module._build_cipher()
-
-        assert "CREDENTIAL_ENCRYPTION_KEY" in str(exc_info.value)
-
-    def test_build_cipher_with_malformed_key_raises_runtime_error(self, mocker):
+    def test_build_cipher_with_malformed_key_raises_runtime_error(self):
         """_build_cipher wraps Fernet ValueError/TypeError as RuntimeError('malformed')."""
-        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", "not-a-fernet-key")
-
         with pytest.raises(RuntimeError) as exc_info:
-            crypto_module._build_cipher()
+            crypto_module._build_cipher("RESULTS_ENCRYPTION_KEY", "not-a-fernet-key")
 
         message = str(exc_info.value)
-        assert "CREDENTIAL_ENCRYPTION_KEY" in message
+        assert "RESULTS_ENCRYPTION_KEY" in message
         assert "malformed" in message
         # Original exception preserved via __cause__ (from e).
-        assert exc_info.value.__cause__ is not None
         assert isinstance(exc_info.value.__cause__, ValueError | TypeError)
 
-    def test_build_cipher_accepts_str_key(self, mocker):
-        """_build_cipher encodes a str key to bytes before passing to Fernet."""
-        new_key = Fernet.generate_key().decode("ascii")
-        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key)
-
-        cipher = crypto_module._build_cipher()
-        assert isinstance(cipher, Fernet)
-        # Sanity: the new cipher round-trips with itself.
+    @pytest.mark.parametrize("key", [Fernet.generate_key(), Fernet.generate_key().decode("ascii")])
+    def test_build_cipher_accepts_str_and_bytes_keys(self, key):
+        cipher = crypto_module._build_cipher("CREDENTIAL_ENCRYPTION_KEY", key)
         assert cipher.decrypt(cipher.encrypt(b"hi")) == b"hi"
 
-    def test_build_cipher_accepts_bytes_key(self, mocker):
-        """_build_cipher passes a bytes key through to Fernet without encoding."""
-        new_key = Fernet.generate_key()
-        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key)
 
-        cipher = crypto_module._build_cipher()
-        assert isinstance(cipher, Fernet)
+@pytest.fixture
+def reload_with_keys():
+    """Rebuild the module's ciphers from other key settings; restored afterwards.
+
+    The settings object of ``app.config`` as it is now: other tests reload
+    that module, and the crypto module picks it up again on its reload.
+    """
+    from app import config
+
+    settings = config.settings
+    original = (settings.CREDENTIAL_ENCRYPTION_KEY, settings.RESULTS_ENCRYPTION_KEY)
+
+    def reload(credential: str, results: str):
+        settings.CREDENTIAL_ENCRYPTION_KEY, settings.RESULTS_ENCRYPTION_KEY = credential, results
+        return importlib.reload(crypto_module)
+
+    yield reload
+    settings.CREDENTIAL_ENCRYPTION_KEY, settings.RESULTS_ENCRYPTION_KEY = original
+    importlib.reload(crypto_module)
 
 
 @pytest.mark.unit
-class TestModuleReloadWithBadKey:
-    """Verify the import-time _build_cipher() call fails when the env key is bad.
+class TestTwoKeys:
+    """Credential envelopes and task results have keys of their own."""
 
-    ``crypto_module.settings`` is a ``pydantic_settings.BaseSettings``
-    instance whose ``CREDENTIAL_ENCRYPTION_KEY`` is sourced from the
-    process env. Mutating the attribute alone does not stick across an
-    ``importlib.reload`` of the *crypto* module — because the reload
-    re-executes ``from app.config import settings``, which fetches the
-    already-constructed module-level Settings object whose attribute
-    we just wrote to. To truly simulate "key absent at import time" we
-    need to drop the value off the Settings object before the reload
-    runs (the simulated cold-start path).
-    """
+    def test_results_are_sealed_with_the_results_key(self, reload_with_keys):
+        credential, results = Fernet.generate_key().decode(), Fernet.generate_key().decode()
+        module = reload_with_keys(credential, results)
 
-    @pytest.mark.skip(
-        reason=(
-            "Cannot reliably simulate 'cold-start with empty key' in a long-running "
-            "test session: pydantic_settings.BaseSettings caches the resolved value on "
-            "the singleton, and importlib.reload of the crypto module re-imports "
-            "the existing settings object rather than rebuilding it from the env. "
-            "The cold-start error path is covered by "
-            "``test_build_cipher_with_empty_key_raises_runtime_error`` (calling "
-            "_build_cipher() directly with a patched attribute), which has the same "
-            "branch coverage without the import-time side effect."
-        )
-    )
-    def test_reload_with_empty_key_raises_runtime_error(self, monkeypatch):
-        """Reloading the module after clearing the key raises RuntimeError at import time."""
-        # Remove the env var too, so a future ``Settings()`` rebuild can't recover it.
-        monkeypatch.delenv("CREDENTIAL_ENCRYPTION_KEY", raising=False)
-        original = crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY
-        crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY = ""
-        try:
-            with pytest.raises(RuntimeError, match="not set"):
-                importlib.reload(crypto_module)
-        finally:
-            # Restore the real key BEFORE the recovery reload so the module-level
-            # _cipher is reconstructed with a valid Fernet key for the rest of
-            # the test session.
-            crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY = original
-            importlib.reload(crypto_module)
+        sealed = module.results_cipher.encrypt(b"outputs")
+        assert Fernet(results).decrypt(sealed) == b"outputs"
+        with pytest.raises(InvalidToken):
+            Fernet(credential).decrypt(sealed)
 
-    @pytest.mark.skip(
-        reason=(
-            "Same root cause as the empty-key reload test above: pydantic_settings "
-            "caches the resolved key on the singleton, so re-importing the crypto "
-            "module does not pick up our mutation. The malformed-key path is covered "
-            "by ``test_build_cipher_with_malformed_key_raises_runtime_error``."
-        )
-    )
-    def test_reload_with_malformed_key_raises_runtime_error(self):
-        """Reloading the module with a malformed key raises RuntimeError('malformed')."""
-        original = crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY
-        crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY = "not-a-fernet-key"
-        try:
-            with pytest.raises(RuntimeError, match="malformed"):
-                importlib.reload(crypto_module)
-        finally:
-            crypto_module.settings.CREDENTIAL_ENCRYPTION_KEY = original
-            importlib.reload(crypto_module)
+    def test_the_pod_deployer_seals_results_but_decrypts_no_credential(self, reload_with_keys):
+        results = Fernet.generate_key().decode()
+        module = reload_with_keys("", results)
+
+        assert Fernet(results).decrypt(module.results_cipher.encrypt(b"outputs")) == b"outputs"
+        with pytest.raises(RuntimeError, match="CREDENTIAL_ENCRYPTION_KEY is not set"):
+            module.decrypt_b64(base64.b64encode(Fernet(results).encrypt(b"envelope")).decode())
+
+    def test_without_a_results_key_the_credential_key_seals_as_before(self, reload_with_keys):
+        credential = Fernet.generate_key().decode()
+        module = reload_with_keys(credential, "")
+
+        assert Fernet(credential).decrypt(module.results_cipher.encrypt(b"outputs")) == b"outputs"

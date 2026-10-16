@@ -57,7 +57,7 @@ from .task_contract import (
     seal_results,
     terminal_payload,
 )
-from .utils.crypto import cipher
+from .utils.crypto import results_cipher
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -489,7 +489,7 @@ class Job:
             thread.join(timeout=30)
         sealed = None
         if terraform_outputs is not None or tf_state is not None:
-            sealed = seal_results(cipher, terraform_outputs=terraform_outputs, tf_state=tf_state)
+            sealed = seal_results(results_cipher, terraform_outputs=terraform_outputs, tf_state=tf_state)
         event_type = {"SUCCESS": EVENT_SUCCEEDED, "FAILED": EVENT_FAILED}.get(status)
         with db.connect("finish") as conn, conn.transaction():
             previous = conn.execute(

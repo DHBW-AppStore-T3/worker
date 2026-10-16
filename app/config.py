@@ -51,10 +51,14 @@ class Settings(BaseSettings):
     # TF_LOG for OpenTofu (e.g. DEBUG); off by default, it drowns the errors.
     WORKER_TF_LOG: str = ""
 
-    # Symmetric Fernet key shared with the backend. Decrypts the credential
-    # envelopes that arrive with a task, and seals the task's results
-    # (``tasks.outputs_enc``).
-    CREDENTIAL_ENCRYPTION_KEY: str
+    # Fernet keys shared with the backend (``utils.crypto``), at least one:
+    # CREDENTIAL_ENCRYPTION_KEY decrypts what the API sends a VM job (the
+    # OpenStack credential envelope, the state token), so only the VM
+    # executor gets it; RESULTS_ENCRYPTION_KEY seals a task's results
+    # (``tasks.outputs_enc``), the only key the pod deployer gets. Without it
+    # the credential key seals the results (as before).
+    CREDENTIAL_ENCRYPTION_KEY: str = ""
+    RESULTS_ENCRYPTION_KEY: str = ""
 
     # The API as the worker reaches it (internal service URL, no /api
     # prefix). OpenTofu keeps each VM deployment's state there, through the
@@ -142,12 +146,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _refuse_unsafe_production_settings(self) -> "Settings":
-        """A malformed Fernet key never starts; in production neither does a published one."""
-        problem = _fernet_key_problem(self.CREDENTIAL_ENCRYPTION_KEY)
-        if problem:
-            raise ValueError(f"CREDENTIAL_ENCRYPTION_KEY {problem}")
-        if not self.is_development and self.CREDENTIAL_ENCRYPTION_KEY in _PUBLIC_FERNET_KEYS:
-            raise ValueError("unsafe production configuration: CREDENTIAL_ENCRYPTION_KEY is a published test key")
+        """A malformed Fernet key never starts; in production neither does a published or a doubled one."""
+        keys = {
+            "CREDENTIAL_ENCRYPTION_KEY": self.CREDENTIAL_ENCRYPTION_KEY,
+            "RESULTS_ENCRYPTION_KEY": self.RESULTS_ENCRYPTION_KEY,
+        }
+        if not any(keys.values()):
+            raise ValueError(
+                "CREDENTIAL_ENCRYPTION_KEY or RESULTS_ENCRYPTION_KEY must be set (task results are sealed)"
+            )
+        for name, key in keys.items():
+            problem = _fernet_key_problem(key) if key else None
+            if problem:
+                raise ValueError(f"{name} {problem}")
+            if key and not self.is_development and key in _PUBLIC_FERNET_KEYS:
+                raise ValueError(f"unsafe production configuration: {name} is a published test key")
+        if not self.is_development and self.RESULTS_ENCRYPTION_KEY == self.CREDENTIAL_ENCRYPTION_KEY:
+            raise ValueError("unsafe production configuration: RESULTS_ENCRYPTION_KEY is the credential key")
         return self
 
     @property

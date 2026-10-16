@@ -73,6 +73,19 @@ class TestConfiguration:
         [
             ({"CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="}, "published test key"),
             ({"CREDENTIAL_ENCRYPTION_KEY": "not-a-key", "APP_ENV": "development"}, "url-safe base64"),
+            ({"APP_ENV": "development"}, "CREDENTIAL_ENCRYPTION_KEY or RESULTS_ENCRYPTION_KEY must be set"),
+            (
+                {"RESULTS_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="},
+                "RESULTS_ENCRYPTION_KEY is a published test key",
+            ),
+            ({"RESULTS_ENCRYPTION_KEY": "not-a-key", "APP_ENV": "development"}, "RESULTS_ENCRYPTION_KEY is not url"),
+            (
+                {
+                    "CREDENTIAL_ENCRYPTION_KEY": "yJdwFtdm0sMMuyiokYEj4Fbt6lDnkhfRV9PqcSvhvxQ=",
+                    "RESULTS_ENCRYPTION_KEY": "yJdwFtdm0sMMuyiokYEj4Fbt6lDnkhfRV9PqcSvhvxQ=",
+                },
+                "RESULTS_ENCRYPTION_KEY is the credential key",
+            ),
         ],
     )
     def test_unsafe_keys_never_start(self, env, message):
@@ -85,6 +98,19 @@ class TestConfiguration:
             pytest.raises(ValidationError, match=message),
         ):
             Settings(_env_file=None)
+
+    def test_the_pod_deployer_starts_with_the_results_key_alone(self):
+        from cryptography.fernet import Fernet
+
+        from app.config import Settings
+
+        key = Fernet.generate_key().decode()
+        with patch.dict(
+            os.environ, {"DATABASE_URL": "postgresql://u:p@db/x", "RESULTS_ENCRYPTION_KEY": key}, clear=True
+        ):
+            settings = Settings(_env_file=None)
+        assert key == settings.RESULTS_ENCRYPTION_KEY
+        assert not settings.CREDENTIAL_ENCRYPTION_KEY
 
     def test_production_with_a_real_key_starts_and_the_tfstate_database_is_gone(self):
         from cryptography.fernet import Fernet
