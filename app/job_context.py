@@ -27,8 +27,13 @@ tools (OpenTofu, Packer, the OpenStack CLI) get:
   limit (``WORKER_JOB_TIMEOUT_SECONDS``), so a hanging provider cannot
   hold a worker slot until Celery's hard limit kills the whole process.
 
-Variables reach OpenTofu in a private var file (:meth:`JobContext.write_private`),
-not on the command line, where every process of the host could read them.
+Variables reach OpenTofu and Packer in private var files
+(:meth:`JobContext.write_private`), not on the command line, where every
+process of the host could read them.
+Once the job directory is handed over to the slot's user it is the app's:
+the worker writes nothing there as root (a link would take the write
+elsewhere) and reads only the repository's own regular files from it (the
+Packer content hash in ``tasks``).
 
 The job runtime binds a context per job (:func:`bind`); code running
 outside a job (tests, one-off calls) gets the minimal environment without
@@ -101,12 +106,30 @@ class JobContext:
         return env
 
     def write_private(self, path: str, content: str) -> None:
-        """Write a file only the job's tools (and the worker) can read (mode 0600)."""
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        if self.uid is not None:
-            os.chown(path, self.uid, self.uid)
+        """Write a file only the job's tools (and the worker) can read (mode 0600).
+
+        ``path`` lies in the job directory, and that belongs to the app: its
+        repository is checked out there and its tools run in it. A symlink in
+        the file's place (in the repository, or left there by a tool) would
+        make the worker, root with slot users, write wherever it points and
+        hand that file to the slot's user (another slot's job directory, the
+        system). So the file is written by a child running as the slot's user
+        (:data:`_WRITE_SCRIPT`), which replaces whatever is at ``path`` and
+        never writes through a link.
+        """
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", _WRITE_SCRIPT, path],
+            input=content.encode("utf-8"),
+            cwd="/",
+            env={"PATH": os.environ.get("PATH") or _FALLBACK_PATH},
+            capture_output=True,
+            timeout=30,
+            check=False,
+            **self.popen_kwargs(),
+        )
+        if result.returncode != 0:
+            lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
+            raise RuntimeError(f"could not write {path}: {lines[-1] if lines else result.returncode}")
 
     def popen_kwargs(self) -> dict[str, Any]:
         """Extra ``subprocess`` arguments that run the child as the slot's user."""
@@ -192,6 +215,21 @@ def slot_session(slot: int) -> Iterator[JobContext]:
             reap(ctx.uid)
 
 
+# Run by ``write_private`` (as the slot's user): a new file with the bytes on
+# stdin at ``argv[1]``, mode 0600. Whatever was there goes first, a link
+# included, and O_EXCL|O_NOFOLLOW refuse anything put there in between.
+_WRITE_SCRIPT = (
+    "import os, sys\n"
+    "path, data = sys.argv[1], sys.stdin.buffer.read()\n"
+    "try:\n"
+    "    os.unlink(path)\n"
+    "except FileNotFoundError:\n"
+    "    pass\n"
+    "flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)\n"
+    "with os.fdopen(os.open(path, flags, 0o600), 'wb') as f:\n"
+    "    f.write(data)\n"
+)
+
 # Run as the slot's user, ``kill(-1)`` reaches every process of that user and
 # nobody else's (not the worker, which runs as root). No process left to
 # signal is fine.
@@ -205,10 +243,11 @@ def reap(uid: int) -> None:
     still run, so a failure here fails the job instead of being ignored.
     """
     result = subprocess.run(
-        [sys.executable, "-c", _REAP_SCRIPT],
+        [sys.executable, "-I", "-c", _REAP_SCRIPT],
         user=uid,
         group=uid,
         extra_groups=[],
+        cwd="/",
         env={"PATH": os.environ.get("PATH") or _FALLBACK_PATH},
         capture_output=True,
         timeout=30,

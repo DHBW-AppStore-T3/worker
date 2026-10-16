@@ -8,6 +8,8 @@ direction - a needless 45-minute Windows rebuild, or a silently stale
 image.
 """
 
+import os
+
 import pytest
 
 from app.services.packer_discovery import _PackerTemplate
@@ -129,3 +131,102 @@ def test_missing_packer_dir_still_hashes(repo):
 
     shutil.rmtree(repo / "packer")
     assert _packer_content_hash(str(repo), "default", {}, True)
+
+
+# ----------------------------------------------------------------
+# The worker hashes the app's repository itself (root in the VM
+# executor): it reads regular files inside the repository and nothing else
+# ----------------------------------------------------------------
+def _write_repo(root, layout):
+    base = root / "packer" if layout == "legacy" else root / "packer" / "win"
+    (base / "scripts").mkdir(parents=True)
+    (base / "template.pkr.hcl").write_bytes(b'source "openstack" "x" {}\r\n')
+    (base / "scripts" / "setup.ps1").write_bytes(b"Write-Host hi\n")
+    (root / "packer" / "_common").mkdir(exist_ok=True)
+    (root / "packer" / "_common" / "util.sh").write_bytes(b"#!/bin/sh\n")
+
+
+@pytest.mark.parametrize(
+    "layout,key,user_vars,legacy,expected",
+    [
+        ("legacy", "default", {"packer": {"source_image_name": "Windows Server 2022"}}, True, "75c2318fcc25"),
+        ("multi", "win", {"packer": {"win": {"source_image_name": "Windows Server 2022"}}}, False, "f8cb237b77d7"),
+    ],
+)
+def test_the_hash_of_a_plain_repository_does_not_change(tmp_path, layout, key, user_vars, legacy, expected):
+    """Image names of existing deployments: a different hash for the same
+    repository would rebuild (and orphan) every image."""
+    _write_repo(tmp_path, layout)
+    assert _packer_content_hash(str(tmp_path), key, user_vars, legacy) == expected
+
+
+def _symlink(target, link):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"cannot create symlinks here: {e}")
+
+
+def test_a_link_out_of_the_repository_is_not_read(tmp_path):
+    repo = tmp_path / "repo"
+    _write_repo(repo, "legacy")
+    secret = tmp_path / "secret"
+    secret.write_text("first")
+    _symlink(str(secret), repo / "packer" / "scripts" / "leak")
+    before = _packer_content_hash(str(repo), "default", USER_VARS, True)
+    secret.write_text("second")
+    assert _packer_content_hash(str(repo), "default", USER_VARS, True) == before
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="POSIX devices")
+def test_a_link_to_an_endless_file_does_not_hang(tmp_path):
+    _write_repo(tmp_path, "legacy")
+    _symlink("/dev/zero", tmp_path / "packer" / "zero")
+    assert _packer_content_hash(str(tmp_path), "default", USER_VARS, True)
+
+
+def test_a_link_inside_the_repository_counts_like_a_copy_of_its_target(tmp_path):
+    linked, copied = tmp_path / "linked", tmp_path / "copied"
+    for repo in (linked, copied):
+        _write_repo(repo, "legacy")
+    _symlink(os.path.join("..", "_common", "util.sh"), linked / "packer" / "scripts" / "util.sh")
+    (copied / "packer" / "scripts" / "util.sh").write_bytes((copied / "packer" / "_common" / "util.sh").read_bytes())
+    assert _packer_content_hash(str(linked), "default", USER_VARS, True) == _packer_content_hash(
+        str(copied), "default", USER_VARS, True
+    )
+
+
+def test_a_packer_dir_linked_out_of_the_repository_is_not_walked(tmp_path):
+    outside = tmp_path / "outside"
+    _write_repo(outside, "legacy")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _symlink(str(outside / "packer"), repo / "packer")
+    before = _packer_content_hash(str(repo), "default", USER_VARS, True)
+    (outside / "packer" / "template.pkr.hcl").write_bytes(b"changed")
+    assert _packer_content_hash(str(repo), "default", USER_VARS, True) == before
+
+
+def test_only_files_inside_the_repository_are_read(tmp_path):
+    """The containment check itself, without symlinks (runs everywhere)."""
+    import hashlib
+
+    from app.tasks import _hash_repo_file
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "inside").write_bytes(b"content")
+    (tmp_path / "outside").write_bytes(b"secret")
+
+    inside, outside = hashlib.sha256(), hashlib.sha256()
+    _hash_repo_file(inside, str(repo / "inside"), os.path.realpath(repo))
+    _hash_repo_file(outside, str(tmp_path / "outside"), os.path.realpath(repo))
+    assert inside.digest() == hashlib.sha256(b"content").digest()
+    assert outside.digest() == hashlib.sha256(b"<outside the repository>").digest()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+def test_a_fifo_is_not_read(tmp_path):
+    _write_repo(tmp_path, "legacy")
+    os.mkfifo(tmp_path / "packer" / "pipe")
+    assert _packer_content_hash(str(tmp_path), "default", USER_VARS, True)

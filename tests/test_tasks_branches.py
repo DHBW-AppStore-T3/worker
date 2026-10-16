@@ -30,11 +30,10 @@ from app.tasks import (
     _strip_file_vars,
     deploy_application,
     destroy_deployment,
-    encode_packer_vars,
     pause_deployment,
     redeploy_resource,
     resume_deployment,
-    terraform_var_values,
+    var_file_values,
 )
 from app.utils import crypto
 
@@ -156,38 +155,19 @@ def _seed_terraform_dir(repo_path: str) -> str:
 
 
 @pytest.mark.unit
-class TestTerraformVarValues:
-    """Values for the JSON var file keep their JSON types."""
+class TestVarFileValues:
+    """Values for the JSON var files keep their JSON types."""
 
     def test_structures_and_scalars_keep_their_types(self):
-        out = terraform_var_values({"users": {"Team-1": [{"email": "a@b"}]}, "ports": [22, 80], "flag": True, "n": 2})
+        out = var_file_values({"users": {"Team-1": [{"email": "a@b"}]}, "ports": [22, 80], "flag": True, "n": 2})
         assert out == {"users": {"Team-1": [{"email": "a@b"}]}, "ports": [22, 80], "flag": True, "n": 2}
 
     def test_none_top_level_dropped(self):
         """An unset variable is left out, so its declared default applies."""
-        assert terraform_var_values({"keep": "x", "drop": None}) == {"keep": "x"}
+        assert var_file_values({"keep": "x", "drop": None}) == {"keep": "x"}
 
     def test_nested_none_scrubbed(self):
-        assert terraform_var_values({"m": {"a": None, "b": [1, None, 2]}}) == {"m": {"b": [1, 2]}}
-
-
-@pytest.mark.unit
-class TestEncodePackerVars:
-    """Packer encodes typed lists as JSON arrays (not comma joins)."""
-
-    def test_list_becomes_json_array(self):
-        """A list value emits an HCL-compatible JSON array literal."""
-        out = encode_packer_vars({"net": ["NAT"]})
-        assert out["net"] == '["NAT"]'
-
-    def test_dict_becomes_json_object(self):
-        """A dict value emits a JSON object literal."""
-        out = encode_packer_vars({"m": {"a": 1}})
-        assert out["m"] == '{"a": 1}'
-
-    def test_bool_lowercased(self):
-        """Bool values match HCL's lowercase literals."""
-        assert encode_packer_vars({"x": False})["x"] == "false"
+        assert var_file_values({"m": {"a": None, "b": [1, None, 2]}}) == {"m": {"b": [1, 2]}}
 
 
 @pytest.mark.unit
@@ -564,6 +544,39 @@ class TestDeployApplication:
         assert "Terraform apply failed" in str(exc.value)
         assert tf_inst.destroy.called  # cleanup-after-failure
         assert tf_inst.apply.called
+
+    def test_a_state_file_in_the_job_directory_is_never_read(self, mocker, tmp_path):
+        """The state comes from the backend only. A ``terraform.tfstate`` in
+        the job directory is the app's (with the backend OpenTofu writes
+        none); as a link it could have the worker read its own secrets."""
+        repo_path = str(tmp_path / "repo")
+        os.makedirs(repo_path)
+        tf_dir = _seed_terraform_dir(repo_path)
+        with open(os.path.join(tf_dir, "terraform.tfstate"), "w") as f:
+            f.write('{"planted": true}')
+
+        _silence_events(mocker, deploy_application)
+        _make_git_mock(mocker, repo_path)
+        _patch_git_repo(mocker)
+        _make_clouds_config_mock(mocker)
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[])
+        _make_openstack_service_mock(mocker)
+        _make_build_lock_mock(mocker)
+        _make_packer_mock(mocker)
+        _make_terraform_executor_mock(mocker, plan=False, state="")
+
+        with pytest.raises(Failure) as exc:
+            deploy_application.run(
+                deployment_id="dep-2",
+                app_id="myapp",
+                app_git_link="https://git/repo.git",
+                release="v1",
+                user_vars={"terraform": {}},
+                teams=None,
+                openstack_envelope=_ENVELOPE,
+            )
+
+        assert "planted" not in str(exc.value.tf_state)
 
     def test_missing_envelope_raises_failure(self, mocker, tmp_path):
         """No ``openstack_envelope`` short-circuits with a Failure exception."""

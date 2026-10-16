@@ -104,6 +104,45 @@ class TestSlotUser:
 
 
 @pytest.mark.unit
+class TestWritePrivate:
+    """The job directory is the app's: the worker never writes there as root."""
+
+    def test_writes_a_file_only_its_owner_can_read(self, tmp_path):
+        path = tmp_path / "vars.json"
+        path.write_text("old")
+        JobContext().write_private(str(path), '{"name": "Müller"}')
+        assert path.read_text(encoding="utf-8") == '{"name": "Müller"}'
+        if os.name == "posix":
+            assert os.stat(path).st_mode & 0o777 == 0o600
+
+    def test_a_link_in_its_place_is_replaced_not_written_through(self, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        path = tmp_path / "vars.json"
+        try:
+            os.symlink(victim, path)
+        except (OSError, NotImplementedError) as e:
+            pytest.skip(f"cannot create symlinks here: {e}")
+        JobContext().write_private(str(path), "new")
+        assert victim.read_text() == "keep"
+        assert not path.is_symlink() and path.read_text() == "new"
+
+    def test_it_is_written_by_the_slot_user(self, mocker):
+        run = mocker.patch("app.job_context.subprocess.run", return_value=mocker.MagicMock(returncode=0, stderr=b""))
+        JobContext(uid=20004).write_private("/job/terraform/.appstore.tfvars.json", "{}")
+        args, kwargs = run.call_args.args[0], run.call_args.kwargs
+        assert (kwargs["user"], kwargs["group"], kwargs["extra_groups"], kwargs["umask"]) == (20004, 20004, [], 0o077)
+        assert args[1:3] == ["-I", "-c"] and args[-1] == "/job/terraform/.appstore.tfvars.json"
+        assert kwargs["input"] == b"{}" and set(kwargs["env"]) == {"PATH"}
+
+    def test_a_failed_write_stops_the_job(self, mocker):
+        stderr = b"Traceback (most recent call last):\nFileExistsError: [Errno 17] File exists: '/x'"
+        mocker.patch("app.job_context.subprocess.run", return_value=mocker.MagicMock(returncode=1, stderr=stderr))
+        with pytest.raises(RuntimeError, match="File exists"):
+            JobContext(uid=20004).write_private("/x", "{}")
+
+
+@pytest.mark.unit
 @pytest.mark.skipif(sys.platform == "win32" or os.geteuid() != 0, reason="needs root on Linux")
 def test_hand_over_gives_the_job_dir_to_the_slot_but_keeps_git(tmp_path):
     (tmp_path / "terraform").mkdir()

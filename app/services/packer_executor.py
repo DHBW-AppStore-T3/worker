@@ -6,9 +6,14 @@ Packer execution utilities with comprehensive structured logging.
 each line into the task's live events while the build is still running.
 ``validate`` is short and stays as a buffered call. All three run within
 the job's limits (``job_context``: minimal environment, the slot's user).
+
+Variables go into a private JSON var file, as OpenTofu's do
+(``job_context.write_private``): on the command line every process of the
+worker, the other slots' jobs included, could read them.
 """
 
 import json
+import os
 from typing import Any
 
 from .. import job_context
@@ -17,6 +22,10 @@ from ..utils.logger import LogCategory, get_logger
 from .terraform_executor import OutputCallback, _run_buffered, _stream_subprocess
 
 logger = get_logger(__name__)
+
+# Not ``*.pkr.json`` (Packer would read it as a template) and not
+# ``*.auto.pkrvars.json`` (it would load it on its own).
+_VAR_FILE_NAME = ".appstore.pkrvars.json"
 
 
 class PackerExecutor:
@@ -48,6 +57,14 @@ class PackerExecutor:
             extra.update(extra_env)
         extra["PACKER_LOG"] = "1"
         return job_context.current().env(extra)
+
+    def _var_args(self, variables: dict[str, Any] | None) -> list[str]:
+        """Write ``variables`` to the private JSON var file and return the ``-var-file`` arguments."""
+        if not variables:
+            return []
+        path = os.path.join(self.working_dir, _VAR_FILE_NAME)
+        job_context.current().write_private(path, json.dumps(variables, ensure_ascii=False))
+        return ["-var-file", path]
 
     def init(self) -> tuple[bool, str, str]:
         """Initialize Packer (install required plugins). Streams output."""
@@ -92,12 +109,7 @@ class PackerExecutor:
         logger.operation_start("packer_validate", template=template_file)
         logger.debug(f"Packer working directory: {self.working_dir}", category=LogCategory.SYSTEM)
         try:
-            cmd = [self.packer_path, "validate"]
-            if variables:
-                for key, value in variables.items():
-                    value_str = json.dumps(value) if isinstance(value, list | dict) else str(value)
-                    cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(".")
+            cmd = [self.packer_path, "validate", *self._var_args(variables), "."]
 
             logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
             result = _run_buffered(cmd, cwd=self.working_dir, env=self._get_env(), timeout=60)
@@ -137,12 +149,7 @@ class PackerExecutor:
             cmd = [self.packer_path, "build"]
             if force:
                 cmd.append("-force")
-
-            if variables:
-                for key, value in variables.items():
-                    value_str = json.dumps(value) if isinstance(value, list | dict) else str(value)
-                    cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(".")
+            cmd += [*self._var_args(variables), "."]
 
             logger.info(
                 "Starting Packer build process (this may take several minutes)...",

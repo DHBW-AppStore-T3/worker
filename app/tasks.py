@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from typing import Any
 
 import git
@@ -108,47 +109,16 @@ def terraform_users(teams: dict[str, list]) -> dict[str, list[dict[str, str]]]:
     return {team: [{"email": m["email"]} for m in members if m.get("email")] for team, members in teams.items()}
 
 
-def terraform_var_values(d: dict[str, Any]) -> dict[str, Any]:
-    """Variables as they go into the job's JSON var file.
+def var_file_values(d: dict[str, Any]) -> dict[str, Any]:
+    """Variables as they go into a job's JSON var file (OpenTofu's and Packer's).
 
-    Values keep their JSON types; OpenTofu converts them to the declared
+    Values keep their JSON types; the tool converts them to the declared
     variable types. Unset (``None``) variables are left out so their
     declared defaults apply, and ``None`` inside maps and lists is scrubbed
     (see :func:`_scrub_nested_nones`) so a stray ``null`` in a
     ``map(list(string))`` slot can't trip the type check.
     """
     return {k: _scrub_nested_nones(v) for k, v in d.items() if v is not None}
-
-
-def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
-    """Encode variables for ``packer -var key=value`` CLI args.
-
-    For HCL ``list(...)``-typed variables, we emit a JSON array literal
-    (e.g. ``["NAT"]``) — that's the only form Packer accepts via ``-var``
-    for typed-list variables, since Packer parses each ``-var`` value as
-    an HCL expression against the declared type. JSON arrays are valid
-    HCL list literals, so a single representation covers both syntaxes.
-    String values are passed through verbatim.
-    """
-    result: dict[str, str] = {}
-    for k, v in d.items():
-        if v is None:
-            continue
-        if isinstance(v, list):
-            # JSON array works for ``list(string)``, ``list(number)`` etc.
-            # ``ensure_ascii=False`` lets non-ASCII names pass through
-            # unchanged (Packer's HCL parser is UTF-8 native).
-            result[k] = json.dumps(v, ensure_ascii=False)
-        elif isinstance(v, dict):
-            # ``map(...)``-typed Packer vars take the same JSON literal
-            # path. No Packer template in the project uses this today,
-            # but the encoding is correct for when one shows up.
-            result[k] = json.dumps(v, ensure_ascii=False)
-        elif isinstance(v, bool):
-            result[k] = "true" if v else "false"
-        else:
-            result[k] = str(v)
-    return result
 
 
 # --- Phase tracking ----------------------------------------------------------
@@ -342,35 +312,24 @@ def _terraform_executor(terraform_dir, openstack_env, state_backend) -> Terrafor
     )
 
 
-def collect_terraform_state_helper(terraform_dir, openstack_env, state_backend, task_logger, *, local_fallback=False):
+def collect_terraform_state_helper(terraform_dir, openstack_env, state_backend, task_logger):
     """Snapshot the state for the task row (best-effort).
 
     The canonical state lives in the API's state backend; the task keeps a
-    sealed copy for the record. When ``local_fallback`` is set (deploy
-    path), a missing/empty pull falls back to reading a local
-    ``terraform.tfstate`` file (tests without a backend). Returns ``None``
-    when nothing could be read.
+    sealed copy for the record, pulled by OpenTofu (as the slot's user).
+    Never read from a ``terraform.tfstate`` in the job directory: with the
+    backend OpenTofu writes none, so one there is the app's, and a link
+    (``-> /dev/zero``, ``-> /proc/self/environ``) would have the worker read
+    without end or read its own secrets. Returns ``None`` when nothing
+    could be pulled.
     """
     if not (terraform_dir and os.path.exists(terraform_dir)):
         return None
     try:
-        pulled = _terraform_executor(terraform_dir, openstack_env, state_backend).state_pull()
-        if pulled or not local_fallback:
-            return pulled
+        return _terraform_executor(terraform_dir, openstack_env, state_backend).state_pull()
     except Exception as e:
         task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
-        if not local_fallback:
-            return None
-
-    # Fallback for runs without a state backend (tests).
-    tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
-    if os.path.exists(tfstate_path):
-        try:
-            with open(tfstate_path) as f:
-                return f.read()
-        except Exception as e:
-            task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
-    return None
+        return None
 
 
 def collect_terraform_outputs_helper(terraform_dir, openstack_env, state_backend, task_logger):
@@ -421,21 +380,22 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     ``source_image_name``, same image name, stale image silently reused.
     """
     digest = hashlib.sha256()
-    packer_dir = os.path.join(repo_path, "packer")
-    for root, dirs, files in os.walk(packer_dir):
+    repo_root = os.path.realpath(repo_path)
+    packer_dir = os.path.realpath(os.path.join(repo_path, "packer"))
+    if _inside(packer_dir, repo_root):
+        # Links to directories below are not followed (``os.walk``'s default).
+        tree = os.walk(packer_dir)
+    else:
+        tree = iter(())
+        digest.update(b"<outside the repository>" + SEP)
+    for root, dirs, files in tree:
         # Sorted so the hash never depends on filesystem ordering.
         dirs.sort()
         for name in sorted(files):
             full = os.path.join(root, name)
             rel = os.path.relpath(full, packer_dir).replace(os.sep, "/")
             digest.update(rel.encode("utf-8") + SEP)
-            try:
-                with open(full, "rb") as handle:
-                    digest.update(handle.read())
-            except OSError:
-                # Fold the failure in rather than hashing as if the file
-                # were simply absent.
-                digest.update(b"<unreadable>")
+            _hash_repo_file(digest, full, repo_root)
             digest.update(SEP)
 
     if is_legacy:
@@ -445,6 +405,45 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     template_vars.pop("image_name", None)
     digest.update(json.dumps(template_vars, sort_keys=True, default=str).encode("utf-8"))
     return digest.hexdigest()[:12]
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether the resolved ``path`` is ``root`` or below it."""
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # another drive (Windows)
+        return False
+
+
+def _hash_repo_file(digest: Any, path: str, repo_root: str) -> None:
+    """Fold the content of one file of the app's repository into ``digest``.
+
+    The worker reads it itself (root in the VM executor), so only a regular
+    file inside the repository is read: a link leading out of it
+    (``-> /dev/zero``, ``-> /proc/self/environ``) counts with its target's
+    name, a FIFO or device not at all. Read in chunks, so a large file costs
+    no memory. A link to a file inside the repository counts with that
+    file's content, as before.
+    """
+    real = os.path.realpath(path)
+    if not _inside(real, repo_root):
+        target = os.readlink(path) if os.path.islink(path) else ""
+        digest.update(b"<outside the repository>" + os.fsencode(target))
+        return
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(real, flags)
+    except OSError:
+        # Fold the failure in rather than hashing as if the file were
+        # simply absent.
+        digest.update(b"<unreadable>")
+        return
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            digest.update(b"<not a regular file>")
+            return
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
 
 
 def _is_legacy_layout(templates: list[_PackerTemplate]) -> bool:
@@ -783,16 +782,15 @@ class _TaskRuntime:
         except Exception:
             return None
 
-    def collect_state(self, *, local_fallback: bool = False) -> str | None:
+    def collect_state(self) -> str | None:
         backend = self._backend_if_any()
-        if backend is None and not local_fallback:
+        if backend is None:
             return None
         return collect_terraform_state_helper(
             self.terraform_dir,
             self.openstack_env,
             backend,
             self.logger,
-            local_fallback=local_fallback,
         )
 
     def collect_outputs(self) -> Any:
@@ -1018,7 +1016,7 @@ def _build_one_packer_image(
                 user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
             packer_vars = {**user_packer}
             packer_vars["image_name"] = image_name
-            packer_vars = encode_packer_vars(packer_vars)
+            packer_vars = var_file_values(packer_vars)
 
             task_logger.info(
                 f"{log_prefix}Packer variable keys",
@@ -1167,7 +1165,7 @@ def deploy_application(
         teams = {}
 
     def collect_terraform_state():
-        return rt.collect_state(local_fallback=True)
+        return rt.collect_state()
 
     def collect_terraform_outputs():
         return rt.collect_outputs()
@@ -1263,7 +1261,7 @@ def deploy_application(
             )
             if teams:
                 terraform_vars["users"] = terraform_users(teams)
-            terraform_vars = terraform_var_values(terraform_vars)
+            terraform_vars = var_file_values(terraform_vars)
 
             # File-upload variables can balloon a single variable to
             # hundreds of KB. The Nova metadata service caps cloud-init
@@ -1348,7 +1346,7 @@ def deploy_application(
                     )
                     if teams:
                         cleanup_tf_vars["users"] = terraform_users(teams)
-                    terraform.destroy(variables=terraform_var_values(cleanup_tf_vars))
+                    terraform.destroy(variables=var_file_values(cleanup_tf_vars))
                     # Refresh state after destroy so the persisted record reflects cleanup.
                     tf_state = collect_terraform_state()
                 except Exception as cleanup_error:
@@ -1516,7 +1514,7 @@ def destroy_deployment(
         )
         if teams:
             terraform_vars["users"] = terraform_users(teams)
-        terraform_vars = terraform_var_values(terraform_vars)
+        terraform_vars = var_file_values(terraform_vars)
 
         terraform = TerraformExecutor(
             terraform_dir,
@@ -2193,7 +2191,7 @@ def redeploy_resource(
         )
         if teams:
             terraform_vars["users"] = terraform_users(teams)
-        terraform_vars = terraform_var_values(terraform_vars)
+        terraform_vars = var_file_values(terraform_vars)
 
         terraform = TerraformExecutor(
             terraform_dir,
