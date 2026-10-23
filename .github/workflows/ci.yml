@@ -372,7 +372,9 @@ jobs:
           target: pod-deployer
           push: false
           platforms: linux/amd64,linux/arm64
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-pods:ci
+          # A local name: never pushed, and github.repository has capitals,
+          # which an image reference may not.
+          tags: worker-pods:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
