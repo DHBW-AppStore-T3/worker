@@ -36,6 +36,11 @@ FROM python:3.11-slim AS pod-deployer
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
     useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin appstore
 
+# The base image's pip / setuptools / wheel (unused here, the worker runs from
+# the venv) with their security fixes, as in the runtime stage: Trivy scans
+# the system site-packages too.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app/ ./app/
