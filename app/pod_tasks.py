@@ -30,6 +30,7 @@ from .config import settings
 from .failure import Failure
 from .job_task import JobTask
 from .k8s.kube import Kube, KubeApi, Snapshot, deployment_selector
+from .k8s.fake import FakeKube
 from .k8s.render import (
     DEPLOYMENT_LABEL,
     FIELD_MANAGER,
@@ -93,6 +94,10 @@ def set_kube_factory(factory: KubeFactory) -> None:
     """Replace how the cluster connection is made (tests, local runs with FakeKube)."""
     global _kube_factory
     _kube_factory = factory
+
+
+if settings.WORKER_SIMULATE:
+    set_kube_factory(FakeKube)
 
 
 def limits() -> PlatformLimits:
