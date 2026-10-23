@@ -20,8 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir python-openstackclient "urllib3>=2.8.0"
 
 # Install OpenTofu and Packer (checked against their SHA256SUMS; see Dockerfile)
-ARG TOFU_VERSION=1.12.6
-ARG PACKER_VERSION=1.15.3
+ARG TOFU_VERSION=1.13.2
+ARG PACKER_VERSION=1.16.2
 RUN cd /tmp && \
     BASE=https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION} && \
     curl -fsSLO ${BASE}/tofu_${TOFU_VERSION}_linux_amd64.zip && \

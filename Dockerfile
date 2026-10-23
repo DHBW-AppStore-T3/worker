@@ -62,8 +62,8 @@ FROM python:3.11-slim AS runtime
 
 # Build arguments für Multi-Platform Support
 ARG TARGETARCH
-ARG TOFU_VERSION=1.12.6
-ARG PACKER_VERSION=1.15.3
+ARG TOFU_VERSION=1.13.2
+ARG PACKER_VERSION=1.16.2
 
 WORKDIR /app
 

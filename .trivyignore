@@ -121,3 +121,11 @@ CVE-2026-97689
 # Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
 GHSA-6v7p-g79w-8964
 
+
+# CVE-2026-78669: golang.org/x/net/http2 denial of service, fixed in x/net
+# 0.60.0. OpenTofu 1.13.2 (the newest release, Go 1.27.3) still vendors
+# x/net 0.57.0; every other finding of tofu and Packer is gone with
+# TOFU_VERSION 1.13.2 / PACKER_VERSION 1.16.2. tofu is an HTTP client of
+# the providers' APIs here; drop this line with the next OpenTofu release
+# that has x/net >= 0.60.0.
+CVE-2026-78669
