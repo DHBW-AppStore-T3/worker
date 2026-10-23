@@ -29,8 +29,8 @@ from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
 from .job_task import JobTask
-from .k8s.kube import Kube, KubeApi, Snapshot, deployment_selector
 from .k8s.fake import FakeKube
+from .k8s.kube import Kube, KubeApi, Snapshot, deployment_selector
 from .k8s.render import (
     DEPLOYMENT_LABEL,
     FIELD_MANAGER,
