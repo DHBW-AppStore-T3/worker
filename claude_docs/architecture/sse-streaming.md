@@ -1,8 +1,9 @@
 # Worker — SSE & Live-Log-Streaming
 
-## Der Streaming-Pfad: Vom Subprozess in den Browser
+## Der Streaming-Pfad: Vom Subprozess in den Browser (.github#5)
 
-Während eines Deployments fallen kontinuierlich Log-Ausgaben von `git`, `packer` und `terraform` an. Diese müssen live im Frontend dargestellt werden, ohne dass die Datenbank durch Tausende Einzel-Inserts überlastet wird.
+Während eines Deployments fallen kontinuierlich Log-Ausgaben von `git`, `packer` und `terraform` an. Sie landen als
+Zeilen in `task_events`; jede API-Instanz kann sie streamen.
 
 ```
 Worker Subprozess (Terraform/Packer stdout/stderr)
@@ -10,19 +11,26 @@ Worker Subprozess (Terraform/Packer stdout/stderr)
                      ▼ Line-by-Line Reader Thread
 StructuredLogger (app/utils/logger.py)
                      │
-                     ├── 1. Memory Buffer (für finales Task-Result)
+                     ├── 1. Memory Buffer (für das Transkript in tasks.logs)
                      ├── 2. Console Sink (stdout für docker logs)
-                     └── 3. Event Sink: bound_task.send_event("deployment_log", ...)
+                     └── 3. Event Sink: JobTask.send_event(...) (app/job_task.py)
                                  │
-                                 ▼ Celery Event Bus (RabbitMQ)
-Backend Celery Event Listener (backend/app/services/celery_listener.py)
+                                 ▼ Job.emit: Puffer, Batch-INSERT alle 200 ms (app/job_runtime.py)
+task_events (Postgres) ── Trigger: NOTIFY task_events '<task>:<event>:<typ>'
                                  │
-                                 ▼ Redis Pub/Sub Kanal: deployment:{id}:logs
-Backend SSE Endpoint (backend/app/api/v1/endpoints/deployments.py: /events)
+                                 ▼ eine LISTEN-Verbindung je API-Prozess (backend app/services/task_events.py)
+Backend SSE Endpoint GET /deployments/{id}/stream (id: = Event-ID, Last-Event-ID)
                                  │
-                                 ▼ HTTP Server-Sent Events (SSE)
-Frontend DeploymentDetailView (EventSource)
+                                 ▼ HTTP Server-Sent Events
+Frontend DeploymentDetailView (useDeploymentStream)
 ```
+
+- Event-Typen und Payloads (`app/task_contract.py`, identisch im Backend) sind dieselben wie zu Celery-Zeiten
+  (`task-progress`, `task-log`, `task-succeeded`, `task-failed`, `task-revoked`); das Frontend blieb unverändert.
+- Höchstens 10 000 Logzeilen je Task gehen live raus, danach eine Marke; das vollständige Transkript steht nach dem
+  Ende in `tasks.logs`.
+- Das Terminal-Event schreibt der Worker im Epilog in derselben Transaktion wie Status und Ergebnis, nach allen
+  anderen Events.
 
 ## Thread-Sicherheit in `StructuredLogger`
 

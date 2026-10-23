@@ -1,4 +1,5 @@
 # Services module
+from . import image_usage
 from .build_lock import PackerBuildLock
 from .git_service import git_service
 from .openstack_auth import CredentialEnvelopeError, PerTaskCloudsConfig

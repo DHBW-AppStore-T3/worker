@@ -1,13 +1,19 @@
 """Tests for the Terraform executor service."""
 
+import json
 import os
 import subprocess
+import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from app import job_context
 from app.services import terraform_executor as te_mod
-from app.services.terraform_executor import TerraformExecutor, _pg_backend_override_hcl, _stream_subprocess
+from app.services.terraform_executor import StateBackend, TerraformExecutor, _stream_subprocess
+
+_BACKEND = StateBackend(address="http://api/internal/tfstate/dep-1", username="task-1", password="tok")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,28 +56,6 @@ class FakePopen:
         if self._raise_timeout:
             raise subprocess.TimeoutExpired(cmd="terraform", timeout=timeout)
         return self._returncode
-
-
-# ---------------------------------------------------------------------------
-# _pg_backend_override_hcl
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestPgBackendOverrideHcl:
-    """Verify the HCL renderer for the pg backend override file."""
-
-    def test_renders_schema_name_in_block(self):
-        """schema_name is embedded inside the backend "pg" block."""
-        out = _pg_backend_override_hcl("deployment_abc")
-        assert 'backend "pg"' in out
-        assert 'schema_name = "deployment_abc"' in out
-        assert out.endswith("\n")
-
-    def test_escapes_double_quotes_in_schema_name(self):
-        """Double-quotes inside schema_name are HCL-escaped."""
-        out = _pg_backend_override_hcl('weird"name')
-        assert 'schema_name = "weird\\"name"' in out
 
 
 # ---------------------------------------------------------------------------
@@ -201,73 +185,93 @@ class TestStreamSubprocess:
 
 
 # ---------------------------------------------------------------------------
-# TerraformExecutor: _get_env / _write_pg_backend_override
+# TerraformExecutor: environment and state backend
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 class TestGetEnv:
-    """Verify _get_env merging rules for env_vars, extra_env, TF_LOG, PG_CONN_STR."""
+    """The tool environment is built from scratch, never copied from the worker."""
 
-    def test_env_vars_layered_on_os_environ(self, mocker, tmp_path):
-        """env_vars merge on top of os.environ; os.environ keys still present."""
-        mocker.patch.dict(os.environ, {"FROM_OS": "yes"}, clear=False)
-        ex = TerraformExecutor(str(tmp_path), env_vars={"CUSTOM": "v"})
-        env = ex._get_env()
-        assert env["FROM_OS"] == "yes"
-        assert env["CUSTOM"] == "v"
+    def test_worker_settings_do_not_leak(self, mocker, tmp_path):
+        mocker.patch.dict(os.environ, {"DATABASE_URL": "postgresql://secret", "PATH": "/bin"}, clear=True)
+        env = TerraformExecutor(str(tmp_path), env_vars={"OS_CLOUD": "openstack"})._get_env()
+        assert "DATABASE_URL" not in env
+        assert env["PATH"] == "/bin"
+        assert env["OS_CLOUD"] == "openstack"
+        assert env["TF_IN_AUTOMATION"] == "1"
 
-    def test_extra_env_wins_over_env_vars(self, mocker, tmp_path):
-        """extra_env passed to _get_env overrides instance env_vars."""
-        ex = TerraformExecutor(str(tmp_path), env_vars={"K": "instance"})
-        env = ex._get_env(extra_env={"K": "extra"})
-        assert env["K"] == "extra"
+    def test_tf_log_only_when_configured(self, mocker, tmp_path):
+        mocker.patch.object(te_mod.settings, "WORKER_TF_LOG", "TRACE")
+        assert TerraformExecutor(str(tmp_path))._get_env()["TF_LOG"] == "TRACE"
+        mocker.patch.object(te_mod.settings, "WORKER_TF_LOG", "")
+        assert "TF_LOG" not in TerraformExecutor(str(tmp_path))._get_env()
 
-    def test_tf_log_set_when_worker_tf_log_present(self, mocker, tmp_path):
-        """TF_LOG is propagated from WORKER_TF_LOG when set."""
-        mocker.patch.dict(os.environ, {"WORKER_TF_LOG": "TRACE"}, clear=False)
-        ex = TerraformExecutor(str(tmp_path))
-        env = ex._get_env()
-        assert env["TF_LOG"] == "TRACE"
+    def test_state_backend_credentials_travel_in_the_environment(self, tmp_path):
+        env = TerraformExecutor(str(tmp_path), state_backend=_BACKEND)._get_env()
+        assert env["TF_HTTP_ADDRESS"] == _BACKEND.address
+        assert env["TF_HTTP_LOCK_ADDRESS"] == _BACKEND.address
+        assert env["TF_HTTP_UNLOCK_ADDRESS"] == _BACKEND.address
+        assert (env["TF_HTTP_LOCK_METHOD"], env["TF_HTTP_UNLOCK_METHOD"]) == ("LOCK", "UNLOCK")
+        assert env["TF_HTTP_USERNAME"] == "task-1"
+        assert env["TF_HTTP_PASSWORD"] == "tok"
 
-    def test_tf_log_popped_when_worker_tf_log_absent(self, mocker, tmp_path):
-        """TF_LOG is stripped from env if WORKER_TF_LOG is unset, even when inherited."""
-        # Ensure WORKER_TF_LOG is absent and TF_LOG inherited from os.environ.
-        env_copy = {k: v for k, v in os.environ.items() if k != "WORKER_TF_LOG"}
-        env_copy["TF_LOG"] = "DEBUG"
-        mocker.patch.dict(os.environ, env_copy, clear=True)
-        ex = TerraformExecutor(str(tmp_path))
-        env = ex._get_env()
-        assert "TF_LOG" not in env
+    def test_the_token_is_never_on_the_command_line(self, mocker, tmp_path):
+        stream = mocker.patch.object(te_mod, "_stream_subprocess", return_value=(0, "", ""))
+        ex = TerraformExecutor(str(tmp_path), state_backend=_BACKEND)
+        ex.init()
+        ex.apply(variables={"a": "b"})
+        for call in stream.call_args_list:
+            assert not any(arg == "tok" or "TF_HTTP" in arg for arg in call.args[0])
 
-    def test_pg_conn_str_added_only_when_backend_conn_set(self, tmp_path):
-        """PG_CONN_STR is injected only when backend_conn_str is configured."""
-        ex_with = TerraformExecutor(str(tmp_path), backend_conn_str="postgres://x")
-        assert ex_with._get_env()["PG_CONN_STR"] == "postgres://x"
-
-        ex_without = TerraformExecutor(str(tmp_path))
-        assert "PG_CONN_STR" not in ex_without._get_env()
+    def test_for_job_points_at_the_api(self, mocker):
+        mocker.patch.object(te_mod.settings, "APPSTORE_API_URL", "http://appstore-api:8000/")
+        backend = StateBackend.for_job("dep-9", "task-9", "secret")
+        assert backend.address == "http://appstore-api:8000/internal/tfstate/dep-9"
+        assert (backend.username, backend.password) == ("task-9", "secret")
 
 
 @pytest.mark.unit
-class TestWritePgBackendOverride:
-    """Verify pg_backend_override.tf is written only when schema_name is configured."""
-
-    def test_noop_without_schema(self, tmp_path):
-        """No file is written when backend_schema_name is None."""
+class TestVarFile:
+    def test_variables_go_into_a_private_json_file(self, mocker, tmp_path):
+        stream = mocker.patch.object(te_mod, "_stream_subprocess", return_value=(0, "", ""))
         ex = TerraformExecutor(str(tmp_path))
-        ex._write_pg_backend_override()
-        assert not (tmp_path / "pg_backend_override.tf").exists()
+        ex.plan(variables={"users": {"T1": [{"email": "a@b"}]}, "flag": True})
+        cmd = stream.call_args.args[0]
+        path = cmd[cmd.index("-var-file") + 1]
+        assert "-var" not in cmd
+        assert json.loads(Path(path).read_text()) == {"users": {"T1": [{"email": "a@b"}]}, "flag": True}
+        if os.name == "posix":
+            assert os.stat(path).st_mode & 0o077 == 0
 
-    def test_writes_override_with_schema(self, tmp_path):
-        """Override file is written and contains the rendered HCL for the schema."""
-        ex = TerraformExecutor(str(tmp_path), backend_schema_name="deploy_xyz")
-        ex._write_pg_backend_override()
-        override = tmp_path / "pg_backend_override.tf"
-        assert override.exists()
-        text = override.read_text()
-        assert 'schema_name = "deploy_xyz"' in text
-        assert 'backend "pg"' in text
+
+@pytest.mark.unit
+class TestJobLimits:
+    def test_timeout_is_capped_at_the_jobs_deadline(self, mocker, tmp_path):
+        fake = FakePopen(lines=[], returncode=0)
+        popen = mocker.patch.object(te_mod.subprocess, "Popen", return_value=fake)
+        ctx = job_context.JobContext(deadline=time.monotonic() + 5)
+        with job_context.bind(ctx):
+            _stream_subprocess(["tofu"], cwd=str(tmp_path), env={}, timeout=1800, tool_name="t", output_callback=None)
+        assert fake.wait_called_with <= 5
+        assert "user" not in popen.call_args.kwargs
+
+    def test_no_tool_starts_after_the_deadline(self, mocker, tmp_path):
+        popen = mocker.patch.object(te_mod.subprocess, "Popen")
+        with (
+            job_context.bind(job_context.JobContext(deadline=time.monotonic() - 1)),
+            pytest.raises(job_context.JobTimeout),
+        ):
+            _stream_subprocess(["tofu"], cwd=str(tmp_path), env={}, timeout=60, tool_name="t", output_callback=None)
+        popen.assert_not_called()
+
+    def test_tools_run_as_the_slots_user(self, mocker, tmp_path):
+        fake = FakePopen(lines=[], returncode=0)
+        popen = mocker.patch.object(te_mod.subprocess, "Popen", return_value=fake)
+        with job_context.bind(job_context.JobContext(uid=20001, home=str(tmp_path))):
+            _stream_subprocess(["tofu"], cwd=str(tmp_path), env={}, timeout=60, tool_name="t", output_callback=None)
+        kwargs = popen.call_args.kwargs
+        assert (kwargs["user"], kwargs["group"], kwargs["extra_groups"]) == (20001, 20001, [])
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +292,8 @@ def _patch_stream(mocker, returncode=0, stdout="ok", stderr=""):
 class TestInit:
     """Verify terraform init command shape and success/failure handling."""
 
-    def test_init_without_schema_omits_reconfigure(self, mocker, tmp_path):
-        """When no schema is configured, -reconfigure is not added and no override file is written."""
+    def test_init_without_backend_omits_reconfigure(self, mocker, tmp_path):
+        """Without a state backend, -reconfigure is not added and no override file is written."""
         stream = _patch_stream(mocker, returncode=0, stdout="initialized")
         ex = TerraformExecutor(str(tmp_path))
 
@@ -303,19 +307,16 @@ class TestInit:
         assert "-reconfigure" not in cmd
         assert stream.call_args.kwargs["timeout"] == 300
         assert stream.call_args.kwargs["tool_name"] == "terraform_init"
-        assert not (tmp_path / "pg_backend_override.tf").exists()
+        assert not (tmp_path / "appstore_backend_override.tf").exists()
 
-    def test_init_with_schema_appends_reconfigure_and_writes_override(self, mocker, tmp_path):
-        """With backend_schema_name, init adds -reconfigure and writes the override file."""
-        _patch_stream(mocker, returncode=0)
-        ex = TerraformExecutor(
-            str(tmp_path),
-            backend_conn_str="postgres://x",
-            backend_schema_name="deploy_s",
-        )
+    def test_init_with_backend_appends_reconfigure_and_writes_override(self, mocker, tmp_path):
+        """With a state backend, init adds -reconfigure and forces the http backend."""
+        stream = _patch_stream(mocker, returncode=0)
+        ex = TerraformExecutor(str(tmp_path), state_backend=_BACKEND)
         ok, _, _ = ex.init()
         assert ok is True
-        assert (tmp_path / "pg_backend_override.tf").exists()
+        assert "-reconfigure" in stream.call_args.args[0]
+        assert 'backend "http"' in (tmp_path / "appstore_backend_override.tf").read_text()
 
     def test_init_failure_returns_false(self, mocker, tmp_path):
         """Non-zero return from the stream surfaces as success=False."""
@@ -346,24 +347,9 @@ class TestPlan:
         ok, _, _ = ex.plan()
         assert ok is True
         cmd = stream.call_args.args[0]
-        # ``-lock=false``: per-Deployment-Schema isoliert den State, das
-        # geteilte pg-Lock würde sonst unzusammenhängende Deployments
-        # serialisieren (siehe TerraformExecutor.plan).
-        assert cmd == [ex.terraform_path, "plan", "-input=false", "-lock=false"]
+        # Locking stays on: the state backend in the API implements it.
+        assert cmd == [ex.terraform_path, "plan", "-input=false"]
         assert stream.call_args.kwargs["timeout"] == 300
-
-    def test_plan_with_var_file_and_variables(self, mocker, tmp_path):
-        """plan with var_file appends -var-file and one -var pair per variable."""
-        stream = _patch_stream(mocker, returncode=0)
-        ex = TerraformExecutor(str(tmp_path))
-        ex.plan(var_file="vars.tfvars", variables={"a": "1", "b": "2"})
-        cmd = stream.call_args.args[0]
-        assert "-var-file" in cmd
-        assert cmd[cmd.index("-var-file") + 1] == "vars.tfvars"
-        # Each var pair appears as ["-var", "key=value"]
-        for k, v in [("a", "1"), ("b", "2")]:
-            assert "-var" in cmd
-            assert f"{k}={v}" in cmd
 
     def test_plan_failure(self, mocker, tmp_path):
         """plan non-zero returncode surfaces as success=False."""
@@ -393,7 +379,7 @@ class TestApply:
         ok, _, _ = ex.apply()
         assert ok is True
         cmd = stream.call_args.args[0]
-        assert cmd == [ex.terraform_path, "apply", "-auto-approve", "-input=false", "-lock=false"]
+        assert cmd == [ex.terraform_path, "apply", "-auto-approve", "-input=false"]
         assert stream.call_args.kwargs["timeout"] == 1800
 
     def test_apply_with_targets_and_replaces(self, mocker, tmp_path):
@@ -401,14 +387,12 @@ class TestApply:
         stream = _patch_stream(mocker, returncode=0)
         ex = TerraformExecutor(str(tmp_path))
         ex.apply(
-            var_file="vars.tfvars",
             variables={"k": "v"},
             targets=['module.team_ide["Team-A"]', "openstack_compute_instance_v2.vm[0]"],
             replace=["openstack_compute_instance_v2.vm[0]"],
         )
         cmd = stream.call_args.args[0]
-        assert "-var-file" in cmd and "vars.tfvars" in cmd
-        assert "k=v" in cmd
+        assert "-var-file" in cmd
         # Targets and replaces come through verbatim
         target_positions = [i for i, x in enumerate(cmd) if x == "-target"]
         assert len(target_positions) == 2
@@ -446,17 +430,16 @@ class TestDestroy:
         ok, _, _ = ex.destroy()
         assert ok is True
         cmd = stream.call_args.args[0]
-        assert cmd == [ex.terraform_path, "destroy", "-auto-approve", "-input=false", "-lock=false"]
+        assert cmd == [ex.terraform_path, "destroy", "-auto-approve", "-input=false"]
         assert stream.call_args.kwargs["timeout"] == 1800
 
-    def test_destroy_with_var_file_and_variables(self, mocker, tmp_path):
-        """destroy adds -var-file and -var pairs."""
+    def test_destroy_with_variables_and_without_refresh(self, mocker, tmp_path):
+        """destroy passes the var file and, as a fallback, -refresh=false."""
         stream = _patch_stream(mocker, returncode=0)
         ex = TerraformExecutor(str(tmp_path))
-        ex.destroy(var_file="vars.tfvars", variables={"x": "9"})
+        ex.destroy(variables={"x": "9"}, refresh=False)
         cmd = stream.call_args.args[0]
-        assert "-var-file" in cmd and "vars.tfvars" in cmd
-        assert "-var" in cmd and "x=9" in cmd
+        assert "-var-file" in cmd and "-refresh=false" in cmd
 
     def test_destroy_failure(self, mocker, tmp_path):
         """destroy non-zero rc surfaces as success=False."""

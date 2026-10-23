@@ -1,5 +1,11 @@
 # Entscheidung: Worker-Datenbankisolation und Postgres-tfstate
 
+> **Abgelöst (Oktober 2026):** Der Worker hat seit .github#5 die eingeschränkte
+> Rolle `appstore_worker` auf der App-Datenbank, und den OpenTofu-State hält die
+> API (HTTP-State-Backend `/internal/tfstate`, je Task ein eigenes Token, siehe
+> `app/services/terraform_executor.py`). `postgres-tfstate` entfällt; bestehende
+> States übernimmt `python -m app.import_pg_tfstate` im Backend.
+
 ## Kontext
 Traditionell greifen Backend- und Worker-Services oft auf dieselbe relationale Datenbank zu. Bei einem Infrastruktur-Worker, der beliebigen Code aus fremden App-Repositories klont und ausführt, birgt ein direkter Datenbankzugriff jedoch erhebliche Sicherheitsrisiken (SQL-Injection-Gefahr, versehentliche Datenmanipulation, Leaking von Nutzerdaten).
 
