@@ -2,12 +2,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 from typing import Any
 
 import git
 
+from . import job_context, job_runtime, keystone_urls
 from .celery_app import celery_app
 from .config import settings
+from .failure import Failure
+from .job_task import JobTask
 from .services import (
     OpenStackService,
     PackerBuildLock,
@@ -15,8 +19,11 @@ from .services import (
     PerTaskCloudsConfig,
     TerraformExecutor,
     git_service,
+    image_usage,
 )
 from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
+from .services.terraform_executor import StateBackend
+from .utils import crypto
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
@@ -24,86 +31,6 @@ logger = get_logger(__name__)
 # Field separator for the Packer content hash, so a path ending and a
 # file's first bytes can never run together into the same digest input.
 SEP = b"\0"
-
-
-def _tfstate_schema_name(deployment_id: str) -> str:
-    """Postgres schema name for one deployment's Terraform state.
-
-    UUIDs contain hyphens, which would force every reference to be
-    double-quoted. Replacing hyphens with underscores keeps the schema
-    a plain unquoted identifier and avoids escaping hazards in any
-    backend-config plumbing.
-    """
-    return f"deployment_{deployment_id.replace('-', '_')}"
-
-
-class Failure(Exception):
-    """Custom exception that carries deployment details for Celery.
-
-    The full failure payload is serialised once into ``args[0]`` as a JSON
-    string. The backend's celery event listener parses that JSON back via
-    a ``Failure\\('<json>'\\)`` regex over the traceback.
-
-    ``__reduce__`` is overridden so pickle reconstructs the exception via
-    the ``_from_payload`` classmethod, which accepts the single JSON string
-    directly.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        deployment_id: str,
-        logs_dict: list[dict[str, Any]] | dict[str, Any],
-        tf_state: str | None = None,
-        commit_info: dict[str, Any] | None = None,
-        terraform_outputs: dict[str, Any] | None = None,
-    ):
-        self.deployment_id = deployment_id
-        self.logs_dict = logs_dict
-        self.tf_state = tf_state
-        self.commit_info = commit_info
-        self.terraform_outputs = terraform_outputs
-
-        # Encode all data as JSON in the exception message
-        data = {
-            "error": message,
-            "deployment_id": deployment_id,
-            "logs": logs_dict,
-            "tf_state": tf_state,
-            "commit_info": commit_info,
-            "terraform_outputs": terraform_outputs,
-        }
-        super().__init__(json.dumps(data))
-
-    @classmethod
-    def _from_payload(cls, payload: str) -> "Failure":
-        """Reconstruct a Failure from its serialised JSON payload.
-
-        Used by ``__reduce__`` so pickle can round-trip the exception.
-        """
-        data = json.loads(payload)
-        instance = cls.__new__(cls)
-        instance.deployment_id = data.get("deployment_id", "")
-        instance.logs_dict = data.get("logs")
-        instance.tf_state = data.get("tf_state")
-        instance.commit_info = data.get("commit_info")
-        instance.terraform_outputs = data.get("terraform_outputs")
-        Exception.__init__(instance, payload)
-        return instance
-
-    def __reduce__(self):
-        # The single-arg constructor here is ``_from_payload``; args[0] is
-        # the JSON string we built in __init__.
-        return (Failure._from_payload, (self.args[0] if self.args else "{}",))
-
-    def __repr__(self) -> str:
-        # Pin the repr format that the backend's celery event listener
-        # relies on (regex ``Failure\('(.+)'\)``).
-        return f"Failure({self.args[0]!r})" if self.args else "Failure()"
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert exception data to dict for serialization"""
-        return json.loads(str(self))
 
 
 # --- Variable encoding for Packer/Terraform CLI ----------------------------
@@ -168,61 +95,30 @@ def _scrub_nested_nones(value: Any) -> Any:
     return value
 
 
-def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
-    """Encode variables for ``terraform -var key=value`` CLI args.
+def output_names(outputs: dict[str, Any]) -> list[str]:
+    """The names of Terraform outputs, never their values (.github#7 E)."""
+    return sorted(str(name) for name in (outputs or {}))
 
-    Terraform reads complex types (objects, tuples) when the value is a
-    valid JSON literal. We JSON-encode dicts/lists once and pass them
-    through verbatim — no string normalisation that could damage escape
-    sequences.
 
-    Nested ``None`` values are scrubbed recursively (see
-    :func:`_scrub_nested_nones`) so a stray ``null`` deep inside a
-    ``map(list(string))`` slot can't trip Terraform's type check.
+def terraform_users(teams: dict[str, list]) -> dict[str, list[dict[str, str]]]:
+    """The ``users`` variable of an app: per team the members' e-mail only.
+
+    The API sends user id and username along (exact access matching,
+    .github#7 H); the apps declare ``map(list(object({email = string})))``.
     """
-    result: dict[str, str] = {}
-    for k, v in d.items():
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            # HCL accepts lowercase only; ``str(True)`` would emit "True".
-            result[k] = "true" if v else "false"
-        elif isinstance(v, dict | list):
-            result[k] = json.dumps(_scrub_nested_nones(v), ensure_ascii=False)
-        else:
-            result[k] = str(v)
-    return result
+    return {team: [{"email": m["email"]} for m in members if m.get("email")] for team, members in teams.items()}
 
 
-def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
-    """Encode variables for ``packer -var key=value`` CLI args.
+def var_file_values(d: dict[str, Any]) -> dict[str, Any]:
+    """Variables as they go into a job's JSON var file (OpenTofu's and Packer's).
 
-    For HCL ``list(...)``-typed variables, we emit a JSON array literal
-    (e.g. ``["NAT"]``) — that's the only form Packer accepts via ``-var``
-    for typed-list variables, since Packer parses each ``-var`` value as
-    an HCL expression against the declared type. JSON arrays are valid
-    HCL list literals, so a single representation covers both syntaxes.
-    String values are passed through verbatim.
+    Values keep their JSON types; the tool converts them to the declared
+    variable types. Unset (``None``) variables are left out so their
+    declared defaults apply, and ``None`` inside maps and lists is scrubbed
+    (see :func:`_scrub_nested_nones`) so a stray ``null`` in a
+    ``map(list(string))`` slot can't trip the type check.
     """
-    result: dict[str, str] = {}
-    for k, v in d.items():
-        if v is None:
-            continue
-        if isinstance(v, list):
-            # JSON array works for ``list(string)``, ``list(number)`` etc.
-            # ``ensure_ascii=False`` lets non-ASCII names pass through
-            # unchanged (Packer's HCL parser is UTF-8 native).
-            result[k] = json.dumps(v, ensure_ascii=False)
-        elif isinstance(v, dict):
-            # ``map(...)``-typed Packer vars take the same JSON literal
-            # path. No Packer template in the project uses this today,
-            # but the encoding is correct for when one shows up.
-            result[k] = json.dumps(v, ensure_ascii=False)
-        elif isinstance(v, bool):
-            result[k] = "true" if v else "false"
-        else:
-            result[k] = str(v)
-    return result
+    return {k: _scrub_nested_nones(v) for k, v in d.items() if v is not None}
 
 
 # --- Phase tracking ----------------------------------------------------------
@@ -407,54 +303,40 @@ class _PhaseTracker:
         )
 
 
-def _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema) -> TerraformExecutor:
-    """Build a TerraformExecutor bound to the deployment's pg-backend schema."""
+def _terraform_executor(terraform_dir, openstack_env, state_backend) -> TerraformExecutor:
+    """Build a TerraformExecutor bound to the deployment's state in the API."""
     return TerraformExecutor(
         terraform_dir,
         env_vars=openstack_env,
-        backend_conn_str=tfstate_conn_str,
-        backend_schema_name=tfstate_schema,
+        state_backend=state_backend,
     )
 
 
-def collect_terraform_state_helper(
-    terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger, *, local_fallback=False
-):
-    """Snapshot the terraform state for the task row (best-effort).
+def collect_terraform_state_helper(terraform_dir, openstack_env, state_backend, task_logger):
+    """Snapshot the state for the task row (best-effort).
 
-    With the pg backend the canonical state lives in Postgres; this
-    snapshot is used for debugging only. When ``local_fallback`` is set
-    (deploy path), a missing/empty pull falls back to reading the local
-    ``terraform.tfstate`` file for legacy/test modes that don't configure
-    a remote backend. Returns ``None`` when nothing could be read.
+    The canonical state lives in the API's state backend; the task keeps a
+    sealed copy for the record, pulled by OpenTofu (as the slot's user).
+    Never read from a ``terraform.tfstate`` in the job directory: with the
+    backend OpenTofu writes none, so one there is the app's, and a link
+    (``-> /dev/zero``, ``-> /proc/self/environ``) would have the worker read
+    without end or read its own secrets. Returns ``None`` when nothing
+    could be pulled.
     """
     if not (terraform_dir and os.path.exists(terraform_dir)):
         return None
     try:
-        pulled = _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).state_pull()
-        if pulled or not local_fallback:
-            return pulled
+        return _terraform_executor(terraform_dir, openstack_env, state_backend).state_pull()
     except Exception as e:
         task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
-        if not local_fallback:
-            return None
-
-    # Legacy fallback — only relevant when no pg backend is configured.
-    tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
-    if os.path.exists(tfstate_path):
-        try:
-            with open(tfstate_path) as f:
-                return f.read()
-        except Exception as e:
-            task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
-    return None
+        return None
 
 
-def collect_terraform_outputs_helper(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema, task_logger):
+def collect_terraform_outputs_helper(terraform_dir, openstack_env, state_backend, task_logger):
     """Collect terraform outputs even on partial success. ``None`` on failure."""
     if terraform_dir and os.path.exists(terraform_dir):
         try:
-            return _terraform_executor(terraform_dir, openstack_env, tfstate_conn_str, tfstate_schema).output()
+            return _terraform_executor(terraform_dir, openstack_env, state_backend).output()
         except Exception as e:
             task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
     return None
@@ -498,21 +380,22 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     ``source_image_name``, same image name, stale image silently reused.
     """
     digest = hashlib.sha256()
-    packer_dir = os.path.join(repo_path, "packer")
-    for root, dirs, files in os.walk(packer_dir):
+    repo_root = os.path.realpath(repo_path)
+    packer_dir = os.path.realpath(os.path.join(repo_path, "packer"))
+    if _inside(packer_dir, repo_root):
+        # Links to directories below are not followed (``os.walk``'s default).
+        tree = os.walk(packer_dir)
+    else:
+        tree = iter(())
+        digest.update(b"<outside the repository>" + SEP)
+    for root, dirs, files in tree:
         # Sorted so the hash never depends on filesystem ordering.
         dirs.sort()
         for name in sorted(files):
             full = os.path.join(root, name)
             rel = os.path.relpath(full, packer_dir).replace(os.sep, "/")
             digest.update(rel.encode("utf-8") + SEP)
-            try:
-                with open(full, "rb") as handle:
-                    digest.update(handle.read())
-            except OSError:
-                # Fold the failure in rather than hashing as if the file
-                # were simply absent.
-                digest.update(b"<unreadable>")
+            _hash_repo_file(digest, full, repo_root)
             digest.update(SEP)
 
     if is_legacy:
@@ -522,6 +405,45 @@ def _packer_content_hash(repo_path: str, template_key: str, user_vars: dict[str,
     template_vars.pop("image_name", None)
     digest.update(json.dumps(template_vars, sort_keys=True, default=str).encode("utf-8"))
     return digest.hexdigest()[:12]
+
+
+def _inside(path: str, root: str) -> bool:
+    """Whether the resolved ``path`` is ``root`` or below it."""
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:  # another drive (Windows)
+        return False
+
+
+def _hash_repo_file(digest: Any, path: str, repo_root: str) -> None:
+    """Fold the content of one file of the app's repository into ``digest``.
+
+    The worker reads it itself (root in the VM executor), so only a regular
+    file inside the repository is read: a link leading out of it
+    (``-> /dev/zero``, ``-> /proc/self/environ``) counts with its target's
+    name, a FIFO or device not at all. Read in chunks, so a large file costs
+    no memory. A link to a file inside the repository counts with that
+    file's content, as before.
+    """
+    real = os.path.realpath(path)
+    if not _inside(real, repo_root):
+        target = os.readlink(path) if os.path.islink(path) else ""
+        digest.update(b"<outside the repository>" + os.fsencode(target))
+        return
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(real, flags)
+    except OSError:
+        # Fold the failure in rather than hashing as if the file were
+        # simply absent.
+        digest.update(b"<unreadable>")
+        return
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            digest.update(b"<not a regular file>")
+            return
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
 
 
 def _is_legacy_layout(templates: list[_PackerTemplate]) -> bool:
@@ -646,6 +568,87 @@ def _prune_superseded_images(
         task_logger.warning(f"Image prune skipped after error: {e}")
 
 
+# Waiting for a running build of the same image before deleting it; after
+# that the image is simply kept.
+_CLEANUP_LOCK_WAIT_S = 300
+
+
+def _lock_project(openstack_envelope: dict[str, Any] | None) -> str:
+    """The project part of the Packer build lock key: the credential's project."""
+    envelope = openstack_envelope or {}
+    return envelope.get("project_id") or envelope.get("project_name") or "default"
+
+
+def _delete_unused_images(
+    deployment_id: str,
+    app_id: str,
+    image_names: dict[str, str],
+    *,
+    project_id: str,
+    openstack_service: OpenStackService,
+    task_logger: Any,
+    build_servers: bool = False,
+) -> None:
+    """Delete a destroyed deployment's Packer images once nothing may boot from them. Never raises.
+
+    Kept while another live deployment of the app exists in the project
+    (``image_usage``) or any server in the project was booted from the
+    image, whoever started it. Done under the image's build lock, so a
+    deploy reusing the image right now cannot lose it. Best effort: the
+    resources are already gone, so a failure is a warning in the log, not
+    a failed destroy (``_prune_superseded_images`` catches leftovers on the
+    app's next deploy).
+
+    ``build_servers`` (destroy after a cancelled deploy): first delete the
+    build server a killed Packer leaves behind; it is not in Terraform's
+    state, and Packer names it after the image. Under the lock as well: once
+    the cancelled job's lock is gone, another deployment of the app in the
+    project may build the same (content-addressed) image, and its build
+    server has the same name.
+    """
+    for image_name in image_names.values():
+        lock = PackerBuildLock(project_id, image_name, total_wait_s=_CLEANUP_LOCK_WAIT_S)
+        try:
+            while not lock.acquire_or_wait():
+                pass
+            if build_servers:
+                for server_id in openstack_service.servers_by_name(image_name):
+                    ok, err = openstack_service.server_delete(server_id)
+                    if ok:
+                        task_logger.success(
+                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
+                            category=LogCategory.STATUS,
+                        )
+                    else:
+                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
+            if image_usage.others_use_app_images(deployment_id, app_id, project_id):
+                task_logger.info(
+                    f"Keeping image '{image_name}': another deployment of this app in the project may use it",
+                    category=LogCategory.OPERATION,
+                )
+                continue
+            exists, image_id = openstack_service.check_image_exists(image_name)
+            if not exists or not image_id:
+                continue
+            in_use = openstack_service.image_ids_in_use()
+            if in_use is None or image_id in in_use:
+                task_logger.info(
+                    f"Keeping image '{image_name}': "
+                    + ("a server still runs from it" if in_use is not None else "could not list the servers"),
+                    category=LogCategory.OPERATION,
+                )
+                continue
+            ok, err = openstack_service.image_delete_by_id(image_id)
+            if ok:
+                task_logger.success(f"Deleted image '{image_name}' ({image_id})", category=LogCategory.STATUS)
+            else:
+                task_logger.warning(f"Could not delete image '{image_name}': {err}", category=LogCategory.WARNING)
+        except Exception as e:  # noqa: BLE001 - cleanup must never fail a destroy
+            task_logger.warning(f"Could not clean up image '{image_name}': {e}", category=LogCategory.WARNING)
+        finally:
+            lock.release()
+
+
 def _build_image_names(
     templates: list[_PackerTemplate],
     app_id: str,
@@ -715,9 +718,9 @@ class _TaskRuntime:
 
     All four task bodies (deploy, destroy, redeploy and the pause/resume
     pair) opened with the same seventy-odd lines: build a correlated
-    logger, bridge it onto Celery's event bus, start a phase tracker,
-    declare the same mutable locals, resolve the tfstate backend
-    coordinates, and define the same two or three closures over those
+    logger, bridge it onto the task's live events, start a phase tracker,
+    declare the same mutable locals, open the deployment's state in the
+    API with the task's token, and define the same two or three closures over those
     locals. ``_run_compute_lifecycle``'s docstring used to say it
     "mirrors destroy_deployment's preamble exactly" - that is the
     duplication this type removes.
@@ -738,27 +741,40 @@ class _TaskRuntime:
         *,
         log_prefix: str,
         phases: tuple[str, ...],
+        state_token_enc: str | None = None,
     ) -> None:
         self.deployment_id = deployment_id
+        # The job's id doubles as the user name for the state backend.
+        self.task_id = str(getattr(getattr(bound_task, "request", None), "id", None) or "")
+        self._state_token_enc = state_token_enc
+        self._state_backend: StateBackend | None = None
         self.logger = get_logger(f"{log_prefix}:{deployment_id}", correlation_id=deployment_id)
 
         def _emit(event_name: str, payload: dict[str, Any]) -> None:
-            # ``deployment_id`` rides along on every event so the backend
-            # listener doesn't need a DB lookup to route it.
+            # JobTask.send_event writes it to task_events (.github#5).
             bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
 
         self.logger.set_event_emitter(_emit)
         self.phase_tracker = _PhaseTracker(self.logger, phases)
 
-        # Terraform's pg backend lives in a worker-only Postgres, one
-        # schema per deployment so state and locks stay isolated.
-        self.tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
-        self.tfstate_schema = _tfstate_schema_name(deployment_id)
-
         self.repo_path: str | None = None
         self.terraform_dir: str | None = None
         self.openstack_env: dict[str, str] = {}
         self.clouds_config: PerTaskCloudsConfig | None = None
+
+    def state_backend(self) -> StateBackend:
+        """The deployment's state in the API, opened with this task's own token.
+
+        Refuses a job message without a token: OpenTofu without the backend
+        would start from an empty local state and create every resource a
+        second time.
+        """
+        if self._state_backend is None:
+            if not self._state_token_enc or not self.task_id:
+                raise Exception("Job without a state token; OpenTofu does not run without the deployment's state")
+            token = crypto.decrypt_b64(self._state_token_enc)
+            self._state_backend = StateBackend.for_job(self.deployment_id, self.task_id, token)
+        return self._state_backend
 
     def set_phases(self, phases: tuple[str, ...]) -> None:
         """Swap the phase set mid-task, keeping the same logger.
@@ -776,22 +792,33 @@ class _TaskRuntime:
         """Feed one line of subprocess output into the task log."""
         self.logger.tool_output_line(tool, line)
 
-    def collect_state(self, *, local_fallback: bool = False) -> str | None:
+    def _backend_if_any(self) -> StateBackend | None:
+        """The state backend, or None without a token (the collectors below
+        run from ``except`` blocks too, where that must not raise again)."""
+        try:
+            return self.state_backend()
+        except Exception:
+            return None
+
+    def collect_state(self) -> str | None:
+        backend = self._backend_if_any()
+        if backend is None:
+            return None
         return collect_terraform_state_helper(
             self.terraform_dir,
             self.openstack_env,
-            self.tfstate_conn_str,
-            self.tfstate_schema,
+            backend,
             self.logger,
-            local_fallback=local_fallback,
         )
 
     def collect_outputs(self) -> Any:
+        backend = self._backend_if_any()
+        if backend is None:
+            return None
         return collect_terraform_outputs_helper(
             self.terraform_dir,
             self.openstack_env,
-            self.tfstate_conn_str,
-            self.tfstate_schema,
+            backend,
             self.logger,
         )
 
@@ -805,6 +832,7 @@ def _prepare_workspace(
     app_id: str,
     app_git_link: str,
     release: str,
+    commit_sha: str | None,
     openstack_envelope: dict[str, Any] | None,
     action: str,
     resource_info: dict[str, Any] | None = None,
@@ -836,6 +864,7 @@ def _prepare_workspace(
         app_id=app_id,
         git_url=app_git_link,
         release=release,
+        commit=commit_sha,
         **(resource_info or {}),
     )
 
@@ -846,29 +875,32 @@ def _prepare_workspace(
             if initial_deploy
             else f"OpenStack credential envelope missing - cannot {action} without credentials"
         )
+    # The API checked it before dispatch; checked again here, so a message
+    # can never make the worker send a login anywhere else (.github#7 C).
+    if not keystone_urls.auth_url_allowed(
+        openstack_envelope.get("auth_url"),
+        settings.OPENSTACK_ALLOWED_AUTH_URLS,
+        development=settings.is_development,
+    ):
+        raise Exception("The credential's Keystone URL is not allowed (OPENSTACK_ALLOWED_AUTH_URLS)")
     rt.logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
 
     rt.mark(
         PHASE_GIT_CLONE,
-        "Cloning repository" if initial_deploy else "Cloning repository at original release tag",
+        "Cloning repository" if initial_deploy else "Cloning repository at the deployment's commit",
     )
     rt.logger.info(
-        (
-            f"Cloning repository: {app_git_link}"
-            if initial_deploy
-            else (
-                f"Cloning {app_git_link} at {release} (same ref as the original deploy "
-                "so terraform code matches the pg-backend state)"
-            )
-        ),
+        f"Cloning {app_git_link} at {release} (commit {(commit_sha or 'none')[:8]}, pinned when the "
+        "deployment was created)",
         category=LogCategory.OPERATION,
     )
     commit_info: dict[str, Any] | None = None
     try:
-        rt.repo_path = git_service.clone_release(
+        rt.repo_path = git_service.clone_commit(
             git_url=app_git_link,
-            deployment_id=rt.deployment_id,
             tag=release,
+            commit_sha=commit_sha or "",
+            deployment_id=rt.deployment_id,
         )
         if capture_commit:
             try:
@@ -899,6 +931,9 @@ def _prepare_workspace(
     rt.openstack_env = rt.clouds_config.__enter__()
     rt.logger.operation_end("openstack_credentials_materialise", success=True)
     rt.logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+    # The tools run as the worker slot's own user (.github#7 A): give them
+    # the job directory, clouds.yaml included (.git stays with the worker).
+    job_context.current().hand_over(rt.repo_path)
 
     return commit_info
 
@@ -936,6 +971,9 @@ def _build_one_packer_image(
     wait_announced = False
     try:
         while True:
+            # Waiting for another worker's build can take long; a cancel
+            # must not wait for it.
+            job_runtime.check_cancelled()
             # If the image already exists, skip the build and the lock.
             exists, image_id = openstack_service.check_image_exists(image_name)
             if exists:
@@ -996,7 +1034,7 @@ def _build_one_packer_image(
                 user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
             packer_vars = {**user_packer}
             packer_vars["image_name"] = image_name
-            packer_vars = encode_packer_vars(packer_vars)
+            packer_vars = var_file_values(packer_vars)
 
             task_logger.info(
                 f"{log_prefix}Packer variable keys",
@@ -1050,7 +1088,7 @@ def _build_all_packer_images(
 ) -> None:
     """Build every Packer image this deployment needs, or skip cleanly.
 
-    Each build is guarded by a Redis lock keyed on
+    Each build is guarded by a Postgres advisory lock keyed on
     ``(project_id, image_name)`` so two parallel workers cannot both kick
     off a build for the same image and end up with duplicate Glance
     entries plus wasted compute. For multi-image apps each template has
@@ -1068,7 +1106,7 @@ def _build_all_packer_images(
         rt.logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
         return
 
-    project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
+    project_id = _lock_project(openstack_envelope)
     openstack_service = OpenStackService(env_vars=rt.openstack_env)
     is_legacy = _is_legacy_layout(templates)
 
@@ -1099,7 +1137,7 @@ def _build_all_packer_images(
     )
 
 
-@celery_app.task(bind=True, name="tasks.deploy_application")
+@celery_app.task(bind=True, base=JobTask, name="tasks.deploy_application")
 def deploy_application(
     self,
     deployment_id: str,
@@ -1109,9 +1147,11 @@ def deploy_application(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
+    state_token_enc: str | None = None,
 ):
     """
-    Deploy an application using Terraform and Packer
+    Deploy an application using OpenTofu and Packer
 
     Args:
         deployment_id: UUID of the deployment
@@ -1129,7 +1169,9 @@ def deploy_application(
     """
     # Pessimistic phase set - assumes Packer. Re-planned after the git
     # clone if the cloned repo turns out to have no Packer template.
-    rt = _TaskRuntime(self, deployment_id, log_prefix="deploy", phases=_PHASES_WITH_PACKER)
+    rt = _TaskRuntime(
+        self, deployment_id, log_prefix="deploy", phases=_PHASES_WITH_PACKER, state_token_enc=state_token_enc
+    )
     task_logger = rt.logger
 
     tf_state = None
@@ -1141,7 +1183,7 @@ def deploy_application(
         teams = {}
 
     def collect_terraform_state():
-        return rt.collect_state(local_fallback=True)
+        return rt.collect_state()
 
     def collect_terraform_outputs():
         return rt.collect_outputs()
@@ -1152,6 +1194,7 @@ def deploy_application(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="deployment",
             initial_deploy=True,
@@ -1205,8 +1248,7 @@ def deploy_application(
             terraform = TerraformExecutor(
                 terraform_dir,
                 env_vars=openstack_env,
-                backend_conn_str=rt.tfstate_conn_str,
-                backend_schema_name=rt.tfstate_schema,
+                state_backend=rt.state_backend(),
                 output_callback=rt.stream_line,
             )
 
@@ -1236,19 +1278,20 @@ def deploy_application(
                 legacy=_is_legacy_layout(templates),
             )
             if teams:
-                terraform_vars["users"] = teams
-            terraform_vars = encode_terraform_vars(terraform_vars)
+                terraform_vars["users"] = terraform_users(teams)
+            terraform_vars = var_file_values(terraform_vars)
 
-            # File-upload variables can balloon a single -var to hundreds
-            # of KB. The Nova metadata service caps cloud-init user_data at
-            # ~64 KB compressed, so warn per-variable above 120 KB to land
-            # the heads-up in the worker log before a boot failure.
+            # File-upload variables can balloon a single variable to
+            # hundreds of KB. The Nova metadata service caps cloud-init
+            # user_data at ~64 KB compressed, so warn per-variable above
+            # 120 KB to land the heads-up in the log before a boot failure.
             _log_bytes_per_var_warn = 120 * 1024
-            for _vname, _vstr in terraform_vars.items():
-                if isinstance(_vstr, str) and len(_vstr) > _log_bytes_per_var_warn:
+            for _vname, _value in terraform_vars.items():
+                _size = len(json.dumps(_value, ensure_ascii=False))
+                if _size > _log_bytes_per_var_warn:
                     task_logger.warning(
                         f"Terraform variable '{_vname}' is "
-                        f"{len(_vstr) // 1024} KB encoded — close to the "
+                        f"{_size // 1024} KB encoded — close to the "
                         "cloud-init user_data limit; the VM may fail to "
                         "boot if the template inlines the full value.",
                         category=LogCategory.WARNING,
@@ -1320,8 +1363,8 @@ def deploy_application(
                         legacy=_is_legacy_layout(templates),
                     )
                     if teams:
-                        cleanup_tf_vars["users"] = teams
-                    terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
+                        cleanup_tf_vars["users"] = terraform_users(teams)
+                    terraform.destroy(variables=var_file_values(cleanup_tf_vars))
                     # Refresh state after destroy so the persisted record reflects cleanup.
                     tf_state = collect_terraform_state()
                 except Exception as cleanup_error:
@@ -1341,7 +1384,15 @@ def deploy_application(
         task_logger.info("Deployment summary", category=LogCategory.SYSTEM, **summary)
 
         if outputs:
-            task_logger.info("Terraform deployment output", category=LogCategory.SYSTEM, **outputs)
+            # Names only (.github#7 E, security review H-8): the values carry
+            # every member's credentials and would land in the task log, the
+            # live stream and the container log. They travel sealed in the
+            # result; ``my-access`` hands each member their own entry.
+            task_logger.info(
+                "Terraform deployment outputs",
+                category=LogCategory.SYSTEM,
+                output_names=output_names(outputs),
+            )
 
         result = {
             "status": "success",
@@ -1352,7 +1403,7 @@ def deploy_application(
             "terraform_outputs": outputs,
         }
 
-        # Return result (sent via task-succeeded event)
+        # JobTask records it in the task row.
         return result
 
     except Exception as e:
@@ -1380,7 +1431,7 @@ def deploy_application(
         rt.cleanup()
 
 
-@celery_app.task(bind=True, name="tasks.destroy_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.destroy_deployment")
 def destroy_deployment(
     self,
     deployment_id: str,
@@ -1390,7 +1441,9 @@ def destroy_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
     sweep_build_artifacts: bool = False,
+    state_token_enc: str | None = None,
 ):
     """Tear down a deployment via ``terraform destroy``.
 
@@ -1402,13 +1455,15 @@ def destroy_deployment(
     deploy of the same commit doesn't have to rebuild it.
 
     All progress and log events flow through the same ``StructuredLogger``
-    + Celery custom-event pipeline as deploy, so the frontend's live
-    SSE stream renders the destroy run identically to a deploy.
+    + task-event pipeline as deploy, so the frontend's live SSE stream
+    renders the destroy run identically to a deploy.
 
     Args mirror ``deploy_application`` so the backend can re-dispatch
     the same persisted values without translation.
     """
-    rt = _TaskRuntime(self, deployment_id, log_prefix="destroy", phases=_PHASES_DESTROY)
+    rt = _TaskRuntime(
+        self, deployment_id, log_prefix="destroy", phases=_PHASES_DESTROY, state_token_enc=state_token_enc
+    )
     task_logger = rt.logger
 
     tf_state: str | None = None
@@ -1429,6 +1484,7 @@ def destroy_deployment(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="destroy",
             resource_info={
@@ -1475,14 +1531,13 @@ def destroy_deployment(
             legacy=_is_legacy_layout(templates),
         )
         if teams:
-            terraform_vars["users"] = teams
-        terraform_vars = encode_terraform_vars(terraform_vars)
+            terraform_vars["users"] = terraform_users(teams)
+        terraform_vars = var_file_values(terraform_vars)
 
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=rt.tfstate_conn_str,
-            backend_schema_name=rt.tfstate_schema,
+            state_backend=rt.state_backend(),
             output_callback=rt.stream_line,
         )
 
@@ -1520,36 +1575,34 @@ def destroy_deployment(
             raise Exception("Terraform destroy failed")
         task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
 
-        # Cancel path only. Packer cleans up its own build instance and
-        # throwaway keypair on a normal exit, but a cancelled deploy kills
-        # it before that happens. None of it is in Terraform state - the
-        # build instance belongs to Packer - so the destroy above cannot
-        # reach it. Reap it by the exact image name this deploy was
-        # building, so a parallel build of another app is never touched.
+        # The Packer images stay while anything may still boot from them;
+        # otherwise nothing in OpenStack would ever remove them. Cancel path
+        # (``sweep_build_artifacts``): Packer cleans up its own build
+        # instance and throwaway keypair on a normal exit, but a cancelled
+        # deploy kills it before that happens, and none of it is in
+        # Terraform state. The build instance goes with the image, by its
+        # exact name and under its build lock (``_delete_unused_images``),
+        # so a parallel build of another app, or of the same image for
+        # another deployment, is never touched. The lock itself needs no
+        # cleanup: it is a session-level advisory lock, released when the
+        # cancelled job's database session ended.
         if sweep_build_artifacts:
             rt.mark(PHASE_CLEANUP, "Reaping build artifacts")
+        if templates:
+            _delete_unused_images(
+                deployment_id,
+                app_id,
+                image_names,
+                project_id=_lock_project(openstack_envelope),
+                openstack_service=OpenStackService(env_vars=openstack_env),
+                task_logger=task_logger,
+                build_servers=sweep_build_artifacts,
+            )
+        if sweep_build_artifacts:
             sweeper = OpenStackService(env_vars=openstack_env)
-            for image_name in image_names.values():
-                for server_id in sweeper.servers_by_name(image_name):
-                    ok, err = sweeper.server_delete(server_id)
-                    if ok:
-                        task_logger.success(
-                            f"Deleted orphaned Packer build instance {server_id} ({image_name})",
-                            category=LogCategory.STATUS,
-                        )
-                    else:
-                        task_logger.warning(f"Could not delete build instance {server_id}: {err}")
-                ok, err = sweeper.image_delete_by_name(image_name)
-                if not ok:
-                    task_logger.warning(f"Could not delete partial image '{image_name}': {err}")
             for keypair in sweeper.unused_packer_keypairs():
                 if sweeper.keypair_delete(keypair):
                     task_logger.info(f"Deleted stale Packer keypair {keypair}")
-            # The Redis build lock is token-owned, so this task cannot
-            # release a lock it never held. It self-heals instead: the
-            # heartbeat dies with the revoked task and the key expires
-            # after its 5-minute TTL.
-            task_logger.info("Build lock left to expire (5 min TTL; heartbeat died with the revoked task)")
 
         rt.mark(PHASE_CLEANUP, "Pulling final state")
         tf_state = collect_terraform_state()
@@ -1640,6 +1693,8 @@ def _run_compute_lifecycle(
     user_vars: dict[str, Any],
     teams: dict[str, list] | None,
     openstack_envelope: dict[str, Any] | None,
+    commit_sha: str | None,
+    state_token_enc: str | None,
     *,
     action: str,  # "pause" | "resume" — only for log/error labels
     phases: tuple[str, ...],
@@ -1659,7 +1714,7 @@ def _run_compute_lifecycle(
     "stopped 4/5; failed: web-1: locked task" instead of just "pause
     failed" without any pointer to which instance is stuck.
     """
-    rt = _TaskRuntime(self, deployment_id, log_prefix=action, phases=phases)
+    rt = _TaskRuntime(self, deployment_id, log_prefix=action, phases=phases, state_token_enc=state_token_enc)
     task_logger = rt.logger
 
     if teams is None:
@@ -1671,6 +1726,7 @@ def _run_compute_lifecycle(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action=action,
             resource_info={"action": action},
@@ -1687,8 +1743,7 @@ def _run_compute_lifecycle(
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=rt.tfstate_conn_str,
-            backend_schema_name=rt.tfstate_schema,
+            state_backend=rt.state_backend(),
             output_callback=rt.stream_line,
         )
 
@@ -1807,7 +1862,7 @@ def _run_compute_lifecycle(
         rt.cleanup()
 
 
-@celery_app.task(bind=True, name="tasks.pause_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.pause_deployment")
 def pause_deployment(
     self,
     deployment_id: str,
@@ -1817,6 +1872,8 @@ def pause_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
+    state_token_enc: str | None = None,
 ):
     """Halt a deployment by stopping all of its compute instances.
 
@@ -1834,6 +1891,8 @@ def pause_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        commit_sha,
+        state_token_enc,
         action="pause",
         phases=_PHASES_PAUSE,
         server_phase=PHASE_SERVER_STOP,
@@ -1841,7 +1900,7 @@ def pause_deployment(
     )
 
 
-@celery_app.task(bind=True, name="tasks.resume_deployment")
+@celery_app.task(bind=True, base=JobTask, name="tasks.resume_deployment")
 def resume_deployment(
     self,
     deployment_id: str,
@@ -1851,6 +1910,8 @@ def resume_deployment(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
+    state_token_enc: str | None = None,
 ):
     """Resume a paused deployment by starting all of its compute instances.
 
@@ -1866,6 +1927,8 @@ def resume_deployment(
         user_vars,
         teams,
         openstack_envelope,
+        commit_sha,
+        state_token_enc,
         action="resume",
         phases=_PHASES_RESUME,
         server_phase=PHASE_SERVER_START,
@@ -2022,7 +2085,7 @@ def _reconcile_scoped_vars_to_roster(
     return reconciled
 
 
-@celery_app.task(bind=True, name="tasks.redeploy_resource")
+@celery_app.task(bind=True, base=JobTask, name="tasks.redeploy_resource")
 def redeploy_resource(
     self,
     deployment_id: str,
@@ -2032,7 +2095,9 @@ def redeploy_resource(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     openstack_envelope: dict[str, Any] | None = None,
+    commit_sha: str | None = None,
     resource_address: str | None = None,
+    state_token_enc: str | None = None,
 ):
     """Replace ONE compute instance via ``-target`` + ``-replace``.
 
@@ -2042,10 +2107,12 @@ def redeploy_resource(
     (e.g. ``openstack_compute_instance_v2.team_ide["Team-A"]``) the
     user clicked.
 
-    Returns the same payload shape as deploy/destroy so the celery
-    event listener stays generic.
+    Returns the same payload shape as deploy/destroy so the job runtime
+    records every task the same way.
     """
-    rt = _TaskRuntime(self, deployment_id, log_prefix="redeploy", phases=_PHASES_REDEPLOY)
+    rt = _TaskRuntime(
+        self, deployment_id, log_prefix="redeploy", phases=_PHASES_REDEPLOY, state_token_enc=state_token_enc
+    )
     task_logger = rt.logger
 
     tf_state: str | None = None
@@ -2077,6 +2144,7 @@ def redeploy_resource(
             app_id=app_id,
             app_git_link=app_git_link,
             release=release,
+            commit_sha=commit_sha,
             openstack_envelope=openstack_envelope,
             action="redeploy",
             start_message=f"Starting redeploy of {resource_address}",
@@ -2128,14 +2196,13 @@ def redeploy_resource(
             legacy=_is_legacy_layout(templates),
         )
         if teams:
-            terraform_vars["users"] = teams
-        terraform_vars = encode_terraform_vars(terraform_vars)
+            terraform_vars["users"] = terraform_users(teams)
+        terraform_vars = var_file_values(terraform_vars)
 
         terraform = TerraformExecutor(
             terraform_dir,
             env_vars=openstack_env,
-            backend_conn_str=rt.tfstate_conn_str,
-            backend_schema_name=rt.tfstate_schema,
+            state_backend=rt.state_backend(),
             output_callback=rt.stream_line,
         )
 

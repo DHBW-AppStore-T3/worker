@@ -1,6 +1,7 @@
 """Tests for the PackerExecutor service."""
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -154,7 +155,7 @@ class TestPackerValidate:
 
     def test_validate_no_variables_command_shape(self, mocker, executor, working_dir):
         """validate with no variables runs [packer, validate, '.']."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         success, stdout, stderr = executor.validate("template.pkr.hcl")
 
@@ -168,43 +169,27 @@ class TestPackerValidate:
         assert run.call_args.kwargs["capture_output"] is True
         assert run.call_args.kwargs["text"] is True
 
-    def test_validate_encodes_dict_variable_as_json(self, mocker, executor):
-        """dict variable values are JSON-encoded via json.dumps."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
-        variables = {"mapping": {"a": 1, "b": 2}}
+    def test_validate_variables_go_into_a_private_json_file(self, mocker, executor, working_dir):
+        """Typed values in a var file, never on the command line (other slots' jobs could read it)."""
+        # Not subprocess.run: the var file is written by a child process too.
+        run = mocker.patch("app.services.packer_executor._run_buffered", return_value=self._make_completed())
+        variables = {"networks": ["NAT"], "mapping": {"a": 1}, "name": "Müller", "count": 5, "enabled": True}
 
         executor.validate("template.pkr.hcl", variables=variables)
 
         cmd = run.call_args.args[0]
-        assert "-var" in cmd
-        idx = cmd.index("-var")
-        assert cmd[idx + 1] == f"mapping={json.dumps({'a': 1, 'b': 2})}"
-
-    def test_validate_encodes_list_variable_as_json(self, mocker, executor):
-        """list variable values are JSON-encoded via json.dumps."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
-        variables = {"items": [1, 2, 3]}
-
-        executor.validate("template.pkr.hcl", variables=variables)
-
-        cmd = run.call_args.args[0]
-        assert f"items={json.dumps([1, 2, 3])}" in cmd
-
-    def test_validate_encodes_primitive_variable_via_str(self, mocker, executor):
-        """primitive variable values are stringified via str()."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
-        variables = {"name": "foo", "count": 5, "enabled": True}
-
-        executor.validate("template.pkr.hcl", variables=variables)
-
-        cmd = run.call_args.args[0]
-        assert "name=foo" in cmd
-        assert "count=5" in cmd
-        assert "enabled=True" in cmd
+        path = cmd[cmd.index("-var-file") + 1]
+        assert "-var" not in cmd and not any("Müller" in arg for arg in cmd)
+        assert os.path.dirname(path) == working_dir and path.endswith(".pkrvars.json")
+        assert not path.endswith(".pkr.json") and ".auto." not in path
+        with open(path, encoding="utf-8") as f:
+            assert json.load(f) == variables
+        if os.name == "posix":
+            assert os.stat(path).st_mode & 0o077 == 0
 
     def test_validate_dot_appended_after_vars(self, mocker, executor):
         """validate appends '.' as the final command element after vars."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         executor.validate("template.pkr.hcl", variables={"x": "y"})
 
@@ -214,7 +199,7 @@ class TestPackerValidate:
     def test_validate_success_returncode_zero(self, mocker, executor):
         """validate returns (True, stdout, stderr) on rc=0."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             return_value=self._make_completed(returncode=0, stdout="good", stderr=""),
         )
 
@@ -226,7 +211,7 @@ class TestPackerValidate:
     def test_validate_failure_nonzero_returncode(self, mocker, executor):
         """validate returns (False, stdout, stderr) when rc != 0."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             return_value=self._make_completed(returncode=2, stdout="", stderr="Error: bad template"),
         )
 
@@ -238,7 +223,7 @@ class TestPackerValidate:
     def test_validate_exception_returns_false_empty_stdout_message(self, mocker, executor):
         """validate catches exceptions and returns (False, '', str(e))."""
         mocker.patch(
-            "app.services.packer_executor.subprocess.run",
+            "app.services.terraform_executor.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="packer", timeout=60),
         )
 
@@ -250,7 +235,7 @@ class TestPackerValidate:
 
     def test_validate_env_has_packer_log_enabled(self, mocker, executor):
         """validate's subprocess env contains PACKER_LOG=1."""
-        run = mocker.patch("app.services.packer_executor.subprocess.run", return_value=self._make_completed())
+        run = mocker.patch("app.services.terraform_executor.subprocess.run", return_value=self._make_completed())
 
         executor.validate("template.pkr.hcl")
 
@@ -287,24 +272,19 @@ class TestPackerBuild:
 
         assert "-force" not in recorder.calls[0]["cmd"]
 
-    def test_build_encodes_variables_identically_to_validate(self, mocker, executor):
-        """build encodes dict/list via JSON and primitives via str()."""
+    def test_build_reads_the_variables_from_the_same_var_file(self, mocker, executor):
+        """build passes the var file like validate does."""
         recorder = StreamRecorder(returncode=0)
         mocker.patch("app.services.packer_executor._stream_subprocess", recorder)
-        variables = {
-            "mapping": {"a": 1},
-            "items": [1, 2],
-            "name": "foo",
-            "count": 7,
-        }
+        variables = {"mapping": {"a": 1}, "items": [1, 2], "name": "foo", "count": 7}
 
         executor.build("template.pkr.hcl", variables=variables, force=False)
 
         cmd = recorder.calls[0]["cmd"]
-        assert f"mapping={json.dumps({'a': 1})}" in cmd
-        assert f"items={json.dumps([1, 2])}" in cmd
-        assert "name=foo" in cmd
-        assert "count=7" in cmd
+        path = cmd[cmd.index("-var-file") + 1]
+        assert "-var" not in cmd
+        with open(path, encoding="utf-8") as f:
+            assert json.load(f) == variables
         # final element is the working dir marker
         assert cmd[-1] == "."
 

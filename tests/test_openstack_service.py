@@ -61,11 +61,11 @@ class TestRun:
         assert kwargs["text"] is True
         assert kwargs["timeout"] == 30
 
-    def test_run_merges_env_vars_on_top_of_os_environ(self, service, mocker):
-        """_run merges self.env_vars on top of os.environ in the env kwarg."""
+    def test_run_puts_env_vars_on_top_of_the_minimal_env(self, service, mocker):
+        """_run passes self.env_vars on top of the job's minimal env, nothing else of the worker's (.github#7 A)."""
         mocker.patch.dict(
-            "app.services.openstack_service.os.environ",
-            {"PATH": "/usr/bin", "OS_AUTH_URL": "should-be-overridden"},
+            "os.environ",
+            {"PATH": "/usr/bin", "OS_AUTH_URL": "should-be-overridden", "DATABASE_URL": "secret"},
             clear=True,
         )
         mock_sp = mocker.patch(
@@ -74,8 +74,9 @@ class TestRun:
         )
         service._run(["openstack", "image", "list"])
         env_passed = mock_sp.call_args.kwargs["env"]
-        # os.environ values present
+        # PATH comes from the worker, nothing else of its environment
         assert env_passed["PATH"] == "/usr/bin"
+        assert "DATABASE_URL" not in env_passed
         # env_vars override and add OS_* values
         assert env_passed["OS_AUTH_URL"] == "https://keystone.example.com:5000/v3"
         assert env_passed["OS_USERNAME"] == "test-user"
@@ -370,3 +371,32 @@ class TestServerStart:
         service.server_start("srv-1")
         assert mock_sp.call_args.args[0] == ["openstack", "server", "start", "srv-1"]
         assert mock_sp.call_args.kwargs["timeout"] == 120
+
+
+# ---------------------------------------------------------------------------
+# Ids from the state never become options
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestIdsAreNeverOptions:
+    """Server ids come from the OpenTofu state, which the app's code can write."""
+
+    INJECTED = "--os-auth-url=https://evil.example/v3"
+
+    @pytest.mark.parametrize(
+        "call,refused",
+        [
+            (lambda s, v: s.server_show(v), None),
+            (lambda s, v: s.server_stop(v), (False, "not a server id")),
+            (lambda s, v: s.server_start(v), (False, "not a server id")),
+            (lambda s, v: s.server_delete(v), (False, "not a server id")),
+            (lambda s, v: s.image_delete_by_id(v), (False, "not an image id")),
+            (lambda s, v: s.keypair_delete(v), False),
+        ],
+    )
+    def test_a_value_that_would_be_read_as_an_option_never_reaches_the_cli(self, service, mocker, call, refused):
+        run = mocker.patch.object(service, "_run")
+        for value in (self.INJECTED, "-h", ""):
+            assert call(service, value) == refused
+        run.assert_not_called()

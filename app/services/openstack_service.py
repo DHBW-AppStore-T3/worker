@@ -4,10 +4,24 @@ OpenStack service for image management
 
 import json
 import logging
-import os
 import subprocess
 
+from .. import job_context
+from .terraform_executor import _run_buffered
+
 logger = logging.getLogger(__name__)
+
+
+def _positional(value: str) -> bool:
+    """Whether ``value`` can go onto the command line as a positional argument.
+
+    Server ids come from the deployment's OpenTofu state, which the app's
+    own code can write (it holds the task's state token). One starting
+    with ``-`` would be read as an option, e.g. ``--os-auth-url=<elsewhere>``,
+    and the CLI would log in there with the credential of whoever runs the
+    job (pause and resume run with the caller's, an admin's too).
+    """
+    return isinstance(value, str) and bool(value) and not value.startswith("-")
 
 
 class OpenStackService:
@@ -42,16 +56,10 @@ class OpenStackService:
         ``(returncode, stdout, stderr)`` so callers can decide how to
         report; structured-output methods JSON-decode stdout themselves.
         """
-        env = os.environ.copy()
-        env.update(self.env_vars)
+        # The job's minimum environment, not the worker's (.github#7 A).
+        env = job_context.current().env(self.env_vars)
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-            )
+            result = _run_buffered(args, cwd=None, env=env, timeout=timeout)
             return (result.returncode, result.stdout or "", result.stderr or "")
         except subprocess.TimeoutExpired:
             return (-1, "", f"Timeout after {timeout}s running: {' '.join(args)}")
@@ -116,6 +124,8 @@ class OpenStackService:
         Returns ``None`` if the server can't be fetched (deleted,
         permission, transient failure).
         """
+        if not _positional(server_id):
+            return None
         rc, stdout, stderr = self._run(
             ["openstack", "server", "show", server_id, "-f", "json"],
             timeout=30,
@@ -135,6 +145,8 @@ class OpenStackService:
         failure. The CLI is idempotent on already-SHUTOFF instances —
         no extra status check needed.
         """
+        if not _positional(server_id):
+            return (False, "not a server id")
         rc, _stdout, stderr = self._run(
             ["openstack", "server", "stop", server_id],
             timeout=120,
@@ -149,6 +161,8 @@ class OpenStackService:
         Returns ``(True, None)`` on success, ``(False, stderr)`` on
         failure. Idempotent on already-ACTIVE instances.
         """
+        if not _positional(server_id):
+            return (False, "not a server id")
         rc, _stdout, stderr = self._run(
             ["openstack", "server", "start", server_id],
             timeout=120,
@@ -188,6 +202,8 @@ class OpenStackService:
 
     def server_delete(self, server_id: str) -> tuple[bool, str | None]:
         """Delete a server and wait for it to disappear."""
+        if not _positional(server_id):
+            return (False, "not a server id")
         rc, _stdout, stderr = self._run(
             ["openstack", "server", "delete", "--wait", server_id],
             timeout=300,
@@ -197,24 +213,6 @@ class OpenStackService:
             if "could not be found" in (stderr or "").lower() or "no server with" in (stderr or "").lower():
                 return (True, None)
             logger.error(f"Failed to delete server {server_id}: {stderr}")
-            return (False, stderr)
-        return (True, None)
-
-    def image_delete_by_name(self, image_name: str) -> tuple[bool, str | None]:
-        """Delete a Glance image by exact name, if it exists.
-
-        Only ever called for the image name this deployment's build was
-        producing, so it cannot touch an unrelated app's image.
-        """
-        exists, image_id = self.check_image_exists(image_name)
-        if not exists or not image_id:
-            return (True, None)
-        rc, _stdout, stderr = self._run(
-            ["openstack", "image", "delete", image_id],
-            timeout=120,
-        )
-        if rc != 0:
-            logger.error(f"Failed to delete image {image_id}: {stderr}")
             return (False, stderr)
         return (True, None)
 
@@ -253,6 +251,8 @@ class OpenStackService:
 
     def keypair_delete(self, name: str) -> bool:
         """Delete a keypair by name. Missing is treated as success."""
+        if not _positional(name):
+            return False
         rc, _stdout, stderr = self._run(["openstack", "keypair", "delete", name], timeout=60)
         if rc != 0 and "could not be found" not in (stderr or "").lower():
             logger.error(f"Failed to delete keypair {name}: {stderr}")
@@ -327,6 +327,8 @@ class OpenStackService:
 
     def image_delete_by_id(self, image_id: str) -> tuple[bool, str | None]:
         """Delete a Glance image by ID."""
+        if not _positional(image_id):
+            return (False, "not an image id")
         rc, _stdout, stderr = self._run(["openstack", "image", "delete", image_id], timeout=120)
         if rc != 0:
             logger.error(f"Failed to delete image {image_id}: {stderr}")
