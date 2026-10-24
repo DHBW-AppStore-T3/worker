@@ -96,8 +96,9 @@ def set_kube_factory(factory: KubeFactory) -> None:
     _kube_factory = factory
 
 
+_sim_kube = FakeKube()
 if settings.WORKER_SIMULATE:
-    set_kube_factory(FakeKube)
+    set_kube_factory(lambda: _sim_kube)
 
 
 def limits() -> PlatformLimits:
