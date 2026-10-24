@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     K8S_POLL_INTERVAL_SECONDS: float = 3.0
     K8S_READY_TIMEOUT_SECONDS: int = 600
     K8S_DELETE_TIMEOUT_SECONDS: int = 300
+    # A pod may be unschedulable this long before a wait fails (.github#8): a
+    # StatefulSet's new pod is, until its volume claim exists and is bound.
+    K8S_UNSCHEDULABLE_GRACE_SECONDS: int = 60
     # The deployer's rights in each namespace it creates (a RoleBinding to
     # this ClusterRole), and read access there for the API's account.
     K8S_DEPLOYER_CLUSTER_ROLE: str = "appstore-deployer"
