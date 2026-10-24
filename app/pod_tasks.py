@@ -29,7 +29,7 @@ from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
 from .job_task import JobTask
-from .k8s.kube import Kube, KubeApi, Snapshot, deployment_selector
+from .k8s.kube import Kube, KubeApi, PodInfo, Snapshot, deployment_selector
 from .k8s.render import (
     DEPLOYMENT_LABEL,
     FIELD_MANAGER,
@@ -87,6 +87,8 @@ _WORKLOAD_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 KubeFactory = Callable[[], Kube]
 _kube_factory: KubeFactory = KubeApi
+# The clock of the waits (deadlines, how long a pod is unschedulable); tests replace it.
+_clock: Callable[[], float] = time.monotonic
 
 
 def set_kube_factory(factory: KubeFactory) -> None:
@@ -165,15 +167,58 @@ class _Job:
         }
 
 
-def explain(snap: Snapshot) -> str | None:
-    """A readable reason when the namespace cannot become ready, else None."""
+def unschedulable_reason(pod: PodInfo) -> str:
+    """Why ``pod`` cannot be scheduled, in words: its volume, the capacity, or its placement."""
+    message = pod.message or ""
+    text = message.lower()
+    if "persistentvolumeclaim" in text or "unbound" in text:
+        what = "is still waiting for its volume"
+    elif "insufficient" in text or "too many pods" in text:
+        what = "cannot be scheduled, the cluster has no capacity"
+    elif "taint" in text or "affinity" in text or "selector" in text:
+        what = "cannot be scheduled, no node matches its placement (node selector, tolerations)"
+    else:
+        what = "cannot be scheduled"
+    return f"Pod {pod.name} {what}: {message}".strip().removesuffix(":")
+
+
+class UnschedulableSince:
+    """When each pod was first seen unschedulable, during one wait.
+
+    A StatefulSet's new pod is unschedulable for a moment: until its volume
+    claim exists and is bound (.github#8; a reset deletes the claim, so it
+    creates exactly this state). That alone is no failure, only a pod that
+    stays unschedulable for longer than ``grace`` seconds is.
+    """
+
+    def __init__(self, grace: float) -> None:
+        self.grace = grace
+        self._since: dict[str, float] = {}
+
+    def overdue(self, snap: Snapshot) -> PodInfo | None:
+        """The first pod of ``snap`` unschedulable for longer than the grace period, if any."""
+        now = _clock()
+        stuck = {pod.uid or pod.name: pod for pod in snap.pods if pod.unschedulable}
+        self._since = {key: self._since.get(key, now) for key in stuck}
+        return next((pod for key, pod in stuck.items() if now - self._since[key] >= self.grace), None)
+
+
+def explain(snap: Snapshot, unschedulable: UnschedulableSince | None = None) -> str | None:
+    """A readable reason when the namespace cannot become ready, else None.
+
+    Without ``unschedulable`` an unschedulable pod is a failure at once.
+    """
     for pod in snap.pods:
         if pod.waiting_reason in _FATAL_WAITING:
             return f"Pod {pod.name}: {_FATAL_WAITING[pod.waiting_reason]} ({pod.waiting_reason})"
         if pod.waiting_reason == "CrashLoopBackOff" and pod.restarts >= 2:
             return f"Pod {pod.name}: the container keeps crashing (CrashLoopBackOff, {pod.restarts} restarts)"
-        if pod.unschedulable:
-            return f"Pod {pod.name} cannot be scheduled, the cluster has no capacity: {pod.message or ''}".strip()
+    if unschedulable is not None:
+        stuck = unschedulable.overdue(snap)
+    else:
+        stuck = next((pod for pod in snap.pods if pod.unschedulable), None)
+    if stuck is not None:
+        return unschedulable_reason(stuck)
     for event in snap.events:
         if event.reason == "FailedCreate" and "exceeded quota" in event.message:
             return f"{event.object}: resource quota exceeded: {event.message}"
@@ -191,9 +236,12 @@ def wait_until(
 ) -> Snapshot:
     """Poll the namespace until ``done``; raise with a readable reason on a fatal state or timeout.
 
-    A cancel of the job ends the wait (``JobCancelled``) at every poll.
+    A pod may be unschedulable for ``K8S_UNSCHEDULABLE_GRACE_SECONDS`` before
+    that counts as fatal. A cancel of the job ends the wait (``JobCancelled``)
+    at every poll.
     """
-    deadline = time.monotonic() + timeout
+    deadline = _clock() + timeout
+    unschedulable = UnschedulableSince(settings.K8S_UNSCHEDULABLE_GRACE_SECONDS)
     while True:
         job_runtime.check_cancelled()
         snap = kube.snapshot(namespace)
@@ -201,11 +249,13 @@ def wait_until(
             raise RuntimeError("the namespace disappeared while waiting (the deployment was cancelled or destroyed)")
         if done(snap):
             return snap
-        reason = explain(snap) if check_failure else None
+        reason = explain(snap, unschedulable) if check_failure else None
         if reason:
             raise RuntimeError(reason)
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"timed out after {int(timeout)} s waiting for {what}")
+        if _clock() > deadline:
+            stuck = next((pod for pod in snap.pods if pod.unschedulable), None) if check_failure else None
+            detail = f" ({unschedulable_reason(stuck)})" if stuck is not None else ""
+            raise RuntimeError(f"timed out after {int(timeout)} s waiting for {what}{detail}")
         sleep(settings.K8S_POLL_INTERVAL_SECONDS)
 
 
