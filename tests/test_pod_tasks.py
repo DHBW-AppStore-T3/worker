@@ -509,4 +509,3 @@ def test_worker_simulate_singleton_persists_across_tasks(events, monkeypatch):
     assert pod_tasks.resume_deployment.run(DEP)["status"] == "success"
     assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
     assert NS not in sim_kube.namespace_labels
-
