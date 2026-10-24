@@ -74,6 +74,8 @@ def cluster(monkeypatch):
     monkeypatch.setattr(settings, "K8S_POLL_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 5)
+    # An unschedulable pod fails at once here; the grace period has tests of its own.
+    monkeypatch.setattr(settings, "K8S_UNSCHEDULABLE_GRACE_SECONDS", 0)
     kube = FakeKube()
     monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
     return kube
@@ -361,6 +363,104 @@ def test_reset_waits_until_the_volume_is_really_gone(cluster):
     cluster.scale = scale
     pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
     assert seen_scale_up_with_pvc == []
+
+
+# --- unschedulable pods (.github#8) -------------------------------------------
+MISSING_CLAIM = '0/1 nodes are available: persistentvolumeclaim "data-team-1-ben-0" not found.'
+
+
+class VolumeLateKube(FakeKube):
+    """Every new pod is unschedulable for its first ``polls`` snapshots, as a
+    StatefulSet's pod is until its volume claim exists and is bound."""
+
+    def __init__(self, polls: int, message: str = MISSING_CLAIM):
+        super().__init__()
+        self.polls = polls
+        self.message = message
+        self._seen: dict[str, int] = {}
+
+    def snapshot(self, namespace):
+        snap = super().snapshot(namespace)
+        for pod in snap.pods:
+            seen = self._seen[pod.uid] = self._seen.get(pod.uid, 0) + 1
+            if seen <= self.polls:
+                pod.unschedulable, pod.ready, pod.phase, pod.message = True, False, "Pending", self.message
+        return snap
+
+
+class Clock:
+    """A clock that moves ``step`` seconds every time it is read."""
+
+    def __init__(self, step: float):
+        self.now, self.step = 0.0, step
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
+
+
+@pytest.fixture
+def volume_late(monkeypatch):
+    def make(polls, message=MISSING_CLAIM, grace=60, step=5):
+        kube = VolumeLateKube(polls, message)
+        monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+        monkeypatch.setattr(pod_tasks, "_clock", Clock(step))
+        monkeypatch.setattr(settings, "K8S_UNSCHEDULABLE_GRACE_SECONDS", grace)
+        monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 600)
+        return kube
+
+    return make
+
+
+def test_pods_waiting_for_their_volume_are_no_failure(volume_late):
+    kube = volume_late(polls=3)
+
+    assert deploy()["status"] == "success"
+    assert kube.deployment_label(NS) == DEP
+
+
+def test_a_pod_unschedulable_past_the_grace_period_fails_the_deploy(volume_late):
+    kube = volume_late(polls=10**6)
+
+    with pytest.raises(Failure, match="is still waiting for its volume"):
+        deploy()
+    kube.snapshot(NS)
+    kube.snapshot(NS)
+    assert NS not in kube.namespace_labels
+
+
+def test_reset_survives_the_new_pod_waiting_for_its_volume(volume_late):
+    kube = volume_late(polls=3)
+    deploy()
+
+    result = pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
+
+    assert result["status"] == "success"
+    assert kube.deleted_pvcs == [(NS, "team-1-ben")]
+
+
+def test_a_timeout_names_the_pod_that_cannot_be_scheduled(volume_late):
+    volume_late(polls=10**6, message="0/1 nodes are available: 1 Insufficient memory.", grace=10**6)
+
+    with pytest.raises(Failure, match=r"timed out after 600 s waiting for the pods \(Pod .* no capacity"):
+        deploy()
+
+
+@pytest.mark.parametrize(
+    ("message", "text"),
+    [
+        (MISSING_CLAIM, "is still waiting for its volume"),
+        ("0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims.", "waiting for its volume"),
+        ("0/1 nodes are available: 1 Insufficient cpu.", "the cluster has no capacity"),
+        ("0/1 nodes are available: 1 Too many pods.", "the cluster has no capacity"),
+        ("0/2 nodes are available: 2 node(s) had untolerated taint {a: b}.", "no node matches its placement"),
+        ("0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.", "no node matches"),
+        ("something new", "cannot be scheduled: something new"),
+    ],
+)
+def test_unschedulable_reasons_are_told_apart(message, text):
+    pod = pod_tasks.PodInfo(name="team-1-ben-0", workload="team-1-ben", unschedulable=True, message=message)
+    assert text in pod_tasks.unschedulable_reason(pod)
 
 
 class _CancelledJob:

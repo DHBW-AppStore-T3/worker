@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 
 API_VERSION = "appstore/v2"
 
@@ -124,7 +124,8 @@ class SpecValidationError(ValueError):
 class PlatformLimits:
     """Upper bounds and allowlist the spec is validated against."""
 
-    image_registry_allowlist: tuple[str, ...] = ("ghcr.io/dhbw-appstore-t3/",)
+    # The apps' packages only, not every package of the organisation (backend, worker, ...).
+    image_registry_allowlist: tuple[str, ...] = ("ghcr.io/dhbw-appstore-t3/apps/",)
     max_cpu_millicores: int = 2000  # APP_MAX_CPU
     max_memory_mib: int = 4096  # APP_MAX_MEMORY
     max_storage_mib: int = 20 * 1024  # APP_MAX_STORAGE
@@ -190,6 +191,32 @@ class Resources(_Strict):
         return self.requests.memory if self.requests else self.memory
 
 
+class Range(_Strict):
+    """Inclusive ``min``..``max`` of one resource, in the notation of its quantity."""
+
+    min: str
+    max: str
+
+
+class ResourceBounds(_Strict):
+    """What a person may choose for a container's ``cpu``/``memory`` limits.
+
+    Opt-in per container: without ``resourceBounds`` the container always runs
+    with ``resources``, which are then the defaults of this range.
+    """
+
+    cpu: Range
+    memory: Range
+
+    @model_validator(mode="after")
+    def _quantities(self) -> ResourceBounds:
+        if parse_cpu_millicores(self.cpu.min) > parse_cpu_millicores(self.cpu.max):
+            raise ValueError("cpu.min must not exceed cpu.max")
+        if parse_memory_mib(self.memory.min) > parse_memory_mib(self.memory.max):
+            raise ValueError("memory.min must not exceed memory.max")
+        return self
+
+
 class EnvVar(_Strict):
     name: str
     source: Literal["generated-password", "team-name", "user-name"] | None = Field(default=None, alias="from")
@@ -209,6 +236,7 @@ class Container(_Strict):
     image: str
     expose: Expose | None = None
     resources: Resources
+    resource_bounds: ResourceBounds | None = Field(default=None, alias="resourceBounds")
     env: list[EnvVar] = Field(default_factory=list)
     writable_paths: list[str] = Field(default_factory=list, alias="writablePaths")
 
@@ -218,6 +246,16 @@ class Container(_Strict):
             raise ValueError(f"invalid container name {self.name!r} (lowercase letters, digits, '-')")
         if not _IMAGE_DIGEST_RE.match(self.image):
             raise ValueError("image must be pinned by digest: <registry>/<repo>@sha256:<64 hex> (tags are not allowed)")
+        b = self.resource_bounds
+        if b is not None:
+            cpu, mem = (
+                parse_cpu_millicores(self.resources.cpu),
+                parse_memory_mib(self.resources.memory),
+            )
+            if not parse_cpu_millicores(b.cpu.min) <= cpu <= parse_cpu_millicores(b.cpu.max):
+                raise ValueError("resources.cpu (the default) must lie within resourceBounds.cpu")
+            if not parse_memory_mib(b.memory.min) <= mem <= parse_memory_mib(b.memory.max):
+                raise ValueError("resources.memory (the default) must lie within resourceBounds.memory")
         for p in self.writable_paths:
             check_path(p, "writablePaths entry")
         if len(set(self.writable_paths)) != len(self.writable_paths):
@@ -316,6 +354,13 @@ def _check_placeholders(template: str, allowed: set[str]) -> None:
             raise ValueError(f"unknown placeholder {{{field_name}}} (allowed: {', '.join(sorted(allowed))})")
 
 
+class UserChoices(_Strict):
+    """Settings the author lets the person deploying change (opt-in, off by default)."""
+
+    internet: StrictBool = False
+    pod_network: StrictBool = Field(default=False, alias="podNetwork")
+
+
 class AppSpec(_Strict):
     api_version: Literal["appstore/v2"] = Field(alias="apiVersion")
     name: str
@@ -323,6 +368,8 @@ class AppSpec(_Strict):
     scope: Literal["team", "user"] = "team"
     workload: Workload | None = None
     egress: Literal["none", "internet"] = "none"
+    pod_network: Literal["none", "namespace"] = Field(default="none", alias="podNetwork")
+    user_choices: UserChoices | None = Field(default=None, alias="userChoices")
     variables: list[Variable] = Field(default_factory=list)
     access: list[Access] = Field(default_factory=list)
 
@@ -369,18 +416,49 @@ def _limit_errors(spec: AppSpec, limits: PlatformLimits) -> list[dict[str, str]]
         base = f"workload.containers[{i}]"
         if not c.image.startswith(limits.image_registry_allowlist):
             allowed = ", ".join(limits.image_registry_allowlist)
-            errors.append({"loc": f"{base}.image", "msg": f"registry not allowed (allowed prefixes: {allowed})"})
+            errors.append(
+                {
+                    "loc": f"{base}.image",
+                    "msg": f"registry not allowed (allowed prefixes: {allowed})",
+                }
+            )
         if parse_cpu_millicores(c.resources.cpu) > limits.max_cpu_millicores:
             errors.append(
-                {"loc": f"{base}.resources.cpu", "msg": f"exceeds platform limit of {limits.max_cpu_millicores}m"}
+                {
+                    "loc": f"{base}.resources.cpu",
+                    "msg": f"exceeds platform limit of {limits.max_cpu_millicores}m",
+                }
             )
         if parse_memory_mib(c.resources.memory) > limits.max_memory_mib:
             errors.append(
-                {"loc": f"{base}.resources.memory", "msg": f"exceeds platform limit of {limits.max_memory_mib}Mi"}
+                {
+                    "loc": f"{base}.resources.memory",
+                    "msg": f"exceeds platform limit of {limits.max_memory_mib}Mi",
+                }
             )
+        if c.resource_bounds is not None:
+            if parse_cpu_millicores(c.resource_bounds.cpu.max) > limits.max_cpu_millicores:
+                errors.append(
+                    {
+                        "loc": f"{base}.resourceBounds.cpu.max",
+                        "msg": f"exceeds platform limit of {limits.max_cpu_millicores}m",
+                    }
+                )
+            if parse_memory_mib(c.resource_bounds.memory.max) > limits.max_memory_mib:
+                errors.append(
+                    {
+                        "loc": f"{base}.resourceBounds.memory.max",
+                        "msg": f"exceeds platform limit of {limits.max_memory_mib}Mi",
+                    }
+                )
     storage = spec.workload.storage
     if storage is not None and _storage_mib(storage.size) > limits.max_storage_mib:
-        errors.append({"loc": "workload.storage.size", "msg": f"exceeds platform limit of {limits.max_storage_mib}Mi"})
+        errors.append(
+            {
+                "loc": "workload.storage.size",
+                "msg": f"exceeds platform limit of {limits.max_storage_mib}Mi",
+            }
+        )
     return errors
 
 
@@ -410,3 +488,161 @@ def parse_spec(text: str | bytes | dict[str, Any], limits: PlatformLimits | None
             [{"loc": _loc(e["loc"]), "msg": e["msg"].removeprefix("Value error, ")} for e in exc.errors()]
         ) from exc
     return validate_spec(spec, limits)
+
+
+def _format_cpu(millicores: int) -> str:
+    return str(millicores // 1000) if millicores % 1000 == 0 else f"{millicores}m"
+
+
+def _format_memory(mib: int) -> str:
+    return f"{mib // 1024}Gi" if mib % 1024 == 0 else f"{mib}Mi"
+
+
+def apply_resource_overrides(spec: AppSpec, overrides: Any, limits: PlatformLimits | None = None) -> AppSpec:
+    """A copy of ``spec`` with the ``cpu``/``memory`` a person chose per container.
+
+    ``overrides`` maps a container name to ``{"cpu": ..., "memory": ...}`` (either
+    key may be left out). Only containers with ``resourceBounds`` can be
+    changed, and only within them and the platform limits. The scheduler
+    request keeps its ratio to the limit, so a mostly idle app stays one.
+    Raises :class:`SpecValidationError` with one field path per problem.
+    """
+    if not overrides:
+        return spec
+    limits = limits or PlatformLimits()
+    errors: list[dict[str, str]] = []
+    if not isinstance(overrides, dict) or spec.workload is None:
+        raise SpecValidationError([{"loc": "resources", "msg": "must map container names to cpu/memory"}])
+    by_name = {c.name: c for c in spec.workload.containers}
+    result = spec.model_copy(deep=True)
+    new_by_name = {c.name: c for c in result.workload.containers}  # type: ignore[union-attr]
+    for name, choice in overrides.items():
+        loc = f"resources.{name}"
+        container = by_name.get(name)
+        if container is None:
+            errors.append({"loc": loc, "msg": "unknown container"})
+            continue
+        if container.resource_bounds is None:
+            errors.append({"loc": loc, "msg": "this container's resources cannot be changed"})
+            continue
+        if not isinstance(choice, dict) or set(choice) - {"cpu", "memory"}:
+            errors.append({"loc": loc, "msg": "only cpu and memory can be set"})
+            continue
+        bounds, current = container.resource_bounds, container.resources
+        try:
+            cpu = parse_cpu_millicores(choice["cpu"]) if "cpu" in choice else None
+            mem = parse_memory_mib(choice["memory"]) if "memory" in choice else None
+        except (ValueError, TypeError) as exc:
+            errors.append({"loc": loc, "msg": str(exc)})
+            continue
+        if cpu is not None:
+            lo, hi = (
+                parse_cpu_millicores(bounds.cpu.min),
+                min(parse_cpu_millicores(bounds.cpu.max), limits.max_cpu_millicores),
+            )
+            if not lo <= cpu <= hi:
+                errors.append(
+                    {
+                        "loc": f"{loc}.cpu",
+                        "msg": f"must be between {_format_cpu(lo)} and {_format_cpu(hi)}",
+                    }
+                )
+        if mem is not None:
+            lo, hi = (
+                parse_memory_mib(bounds.memory.min),
+                min(parse_memory_mib(bounds.memory.max), limits.max_memory_mib),
+            )
+            if not lo <= mem <= hi:
+                errors.append(
+                    {
+                        "loc": f"{loc}.memory",
+                        "msg": f"must be between {_format_memory(lo)} and {_format_memory(hi)}",
+                    }
+                )
+        if errors:
+            continue
+        target = new_by_name[name].resources
+        old_cpu, old_mem = parse_cpu_millicores(current.cpu), parse_memory_mib(current.memory)
+        if cpu is not None:
+            target.cpu = _format_cpu(cpu)
+        if mem is not None:
+            target.memory = _format_memory(mem)
+        if current.requests is not None:
+            new_cpu, new_mem = cpu or old_cpu, mem or old_mem
+            req_cpu = parse_cpu_millicores(current.requests.cpu) * new_cpu // old_cpu
+            req_mem = parse_memory_mib(current.requests.memory) * new_mem // old_mem
+            target.requests = ResourceRequests(
+                cpu=_format_cpu(max(1, min(req_cpu, new_cpu))),
+                memory=_format_memory(max(1, min(req_mem, new_mem))),
+            )
+    if errors:
+        raise SpecValidationError(errors)
+    return result
+
+
+def resource_choices(spec: AppSpec, limits: PlatformLimits | None = None) -> list[dict[str, Any]]:
+    """What the wizard offers: per container with ``resourceBounds`` the default and range."""
+    limits = limits or PlatformLimits()
+    out: list[dict[str, Any]] = []
+    for c in spec.workload.containers if spec.workload else []:
+        b = c.resource_bounds
+        if b is None:
+            continue
+        cpu_max = min(parse_cpu_millicores(b.cpu.max), limits.max_cpu_millicores)
+        mem_max = min(parse_memory_mib(b.memory.max), limits.max_memory_mib)
+        out.append(
+            {
+                "container": c.name,
+                "cpu": {"default": c.resources.cpu, "min": b.cpu.min, "max": _format_cpu(cpu_max)},
+                "memory": {
+                    "default": c.resources.memory,
+                    "min": b.memory.min,
+                    "max": _format_memory(mem_max),
+                },
+            }
+        )
+    return out
+
+
+def apply_network_overrides(spec: AppSpec, choice: Any) -> AppSpec:
+    """A copy of ``spec`` with the network settings a person chose.
+
+    ``choice`` is ``{"internet": bool, "podNetwork": bool}`` (either key may be
+    left out). Only keys the author released in ``userChoices`` can be set;
+    the rest keeps the author's value. Raises :class:`SpecValidationError`
+    with one field path per problem.
+    """
+    if choice is None or choice == {}:
+        return spec
+    if not isinstance(choice, dict):
+        raise SpecValidationError([{"loc": "network", "msg": "must map internet/podNetwork to true or false"}])
+    allowed = spec.user_choices
+    errors: list[dict[str, str]] = []
+    for key, value in choice.items():
+        loc = f"network.{key}"
+        if key not in ("internet", "podNetwork"):
+            errors.append({"loc": loc, "msg": "unknown setting (allowed: internet, podNetwork)"})
+        elif not isinstance(value, bool):
+            errors.append({"loc": loc, "msg": "must be true or false"})
+        elif allowed is None or not (allowed.internet if key == "internet" else allowed.pod_network):
+            errors.append({"loc": loc, "msg": "this setting cannot be changed"})
+    if errors:
+        raise SpecValidationError(errors)
+    result = spec.model_copy(deep=True)
+    if "internet" in choice:
+        result.egress = "internet" if choice["internet"] else "none"
+    if "podNetwork" in choice:
+        result.pod_network = "namespace" if choice["podNetwork"] else "none"
+    return result
+
+
+def network_choices(spec: AppSpec) -> dict[str, Any]:
+    """What the wizard offers: per released setting the author's default."""
+    out: dict[str, Any] = {}
+    if spec.user_choices is None:
+        return out
+    if spec.user_choices.internet:
+        out["internet"] = {"default": spec.egress == "internet"}
+    if spec.user_choices.pod_network:
+        out["podNetwork"] = {"default": spec.pod_network == "namespace"}
+    return out
