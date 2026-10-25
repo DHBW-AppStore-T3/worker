@@ -4,6 +4,11 @@
 # comment. Document *why* a finding is suppressed so reviewers can
 # revisit when the upstream advisory changes.
 
+# AVD-DS-0002: Dockerfile.dev runs as root.
+# The production Dockerfile runs as UID 10001. The dev image is only used by
+# docker compose for local development (WORKER_SIMULATE, no cluster).
+AVD-DS-0002
+
 # CVE-2025-47273: Path Traversal in setuptools PackageIndex (pre-78.1.1).
 # False positive from Trivy scanning internal pip vendored SBOM metadata.
 CVE-2025-47273
