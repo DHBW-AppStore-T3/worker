@@ -7,36 +7,11 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    wget \
-    unzip \
     curl \
     gcc \
     libpq-dev \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
-
-# Install OpenStack CLI (urllib3 floor: see Dockerfile)
-RUN pip install --no-cache-dir python-openstackclient "urllib3>=2.8.0"
-
-# Install OpenTofu and Packer (checked against their SHA256SUMS; see Dockerfile)
-ARG TARGETARCH
-ARG TOFU_VERSION=1.13.2
-ARG PACKER_VERSION=1.16.2
-RUN ARCH="${TARGETARCH:-amd64}" && cd /tmp && \
-    BASE=https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION} && \
-    curl -fsSLO ${BASE}/tofu_${TOFU_VERSION}_linux_${ARCH}.zip && \
-    curl -fsSLO ${BASE}/tofu_${TOFU_VERSION}_SHA256SUMS && \
-    grep " tofu_${TOFU_VERSION}_linux_${ARCH}.zip\$" tofu_${TOFU_VERSION}_SHA256SUMS | sha256sum -c - && \
-    unzip -qo tofu_${TOFU_VERSION}_linux_${ARCH}.zip tofu -d /usr/local/bin && \
-    rm tofu_${TOFU_VERSION}_*
-RUN ARCH="${TARGETARCH:-amd64}" && cd /tmp && \
-    BASE=https://releases.hashicorp.com/packer/${PACKER_VERSION} && \
-    curl -fsSLO ${BASE}/packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    curl -fsSLO ${BASE}/packer_${PACKER_VERSION}_SHA256SUMS && \
-    grep " packer_${PACKER_VERSION}_linux_${ARCH}.zip\$" packer_${PACKER_VERSION}_SHA256SUMS | sha256sum -c - && \
-    unzip -qo packer_${PACKER_VERSION}_linux_${ARCH}.zip packer -d /usr/local/bin && \
-    rm packer_${PACKER_VERSION}_*
 
 # Install Poetry
 RUN curl -sSL https://install.python-poetry.org | python3 - && \
@@ -49,13 +24,8 @@ RUN poetry install --no-root --no-interaction --no-ansi
 # Copy application code
 COPY . .
 
-# Create temp directory for repositories (and the slot users' homes, if
-# WORKER_JOB_UID_BASE is set)
-RUN mkdir -p /tmp/worker_repos /var/lib/appstore-worker && \
-    chmod 0711 /tmp/worker_repos /var/lib/appstore-worker
-
 # Starte Celery Worker mit poetry run (single process so in-memory FakeKube
 # state is shared across deploy/pause/resume/destroy in WORKER_SIMULATE mode;
-# consumes pods, vm and default celery queues; no events, gossip or mingle:
+# consumes the pods queue; no events, gossip or mingle:
 # the Postgres transport has no fanout, .github#5 / .github#6)
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--pool=solo", "-Q", "pods,vm,celery", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--pool=solo", "-Q", "pods", "--without-gossip", "--without-mingle", "--without-heartbeat"]

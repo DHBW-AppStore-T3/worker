@@ -5,6 +5,8 @@ Jede Session liest dieses Dokument zu Beginn und aktualisiert es vor dem Abschlu
 
 ---
 
+> **Stand Oktober 2026 (.github#12):** Der OpenStack-VM-Pfad (Packer, OpenTofu, OpenStack-Auth, Git-Clone) ist aus diesem Repo entfernt; der Worker ist nur noch der Pod-Deployer (`app/pod_tasks.py`). Die Abschnitte unten beschreiben teilweise noch den alten Stand und sind beim nächsten Anfassen zu bereinigen.
+
 ## 1. Status & Fokus
 - **Stack:** Python 3.11, Poetry, Celery 5 über den Postgres-Transport `pgq` (Branch `spike/dev`, .github#5; auf `dev` noch RabbitMQ + Redis), Terraform 1.x, Packer 1.x, GitPython.
 - **Rolle:** Asynchrone Ausführung von Infrastruktur-Deployments auf OpenStack (Klonen von App-Repos, Packer-Image-Builds, Terraform-Provisionierung, State-Verwaltung, Streaming von Logs).
