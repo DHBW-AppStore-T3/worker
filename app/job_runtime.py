@@ -66,8 +66,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Grace for a tool to stop after SIGTERM (Packer removes its build VM)
-# before its process group gets SIGKILL.
+# Grace for a tool to stop after SIGTERM before its process group gets SIGKILL.
 KILL_GRACE_SECONDS = 10
 # The event writer flushes at least this often while a job runs.
 FLUSH_INTERVAL_SECONDS = 0.2
