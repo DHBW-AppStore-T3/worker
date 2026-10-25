@@ -73,6 +73,7 @@ def long_tool_task(self, seconds=30):
     process = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
     with job_runtime.track(process):
         rc = process.wait(timeout=seconds)
+    job_runtime.check_cancelled()
     raise AssertionError(f"tool ended on its own (rc={rc}), cancel did not stop it")
 
 
