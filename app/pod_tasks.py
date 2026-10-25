@@ -41,6 +41,7 @@ from .k8s.render import (
     Team,
     render,
     render_access,
+    render_vm,
     workload_refs,
 )
 from .k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
@@ -471,6 +472,77 @@ def deploy_application(
         )
         job.mark(PHASE_OUTPUTS, "Collecting access data")
         job.logger.success(f"Deployment {deployment_id} is running in {dep.namespace}", category=LogCategory.STATUS)
+    except Exception as e:
+        if kube is not None:
+            _cleanup_after_failure(kube, dep, job.logger)
+        raise job.failure(e) from None
+    return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
+
+
+def _vm_all_ready(expected: set[str]) -> Callable[[Snapshot], bool]:
+    """VMs are ready when the noVNC proxy pods are Running+Ready (VirtualMachine itself has no pod readiness gate)."""
+    novnc_names = {f"{name}-novnc" for name in expected}
+    return _all_ready(novnc_names)
+
+
+@celery_app.task(bind=True, base=JobTask, name="pods.deploy_vm_application")
+def deploy_vm_application(
+    self,
+    deployment_id: str,
+    user_vars: dict[str, Any] | None = None,
+    teams: dict[str, list] | None = None,
+    commit_sha: str | None = None,
+    spec: dict[str, Any] | None = None,
+    owner: str = "",
+    **_: Any,
+) -> dict[str, Any]:
+    """Deploy a kubevirt-vm app: namespace, PVC clone, VirtualMachine, noVNC proxy, wait."""
+    job = _Job(self, "deploy_vm", deployment_id, PHASES_DEPLOY)
+    dep = DeploymentCtx(id=deployment_id, owner=owner)
+    kube: Kube | None = None
+    user_vars = user_vars or {}
+    try:
+        job.mark(PHASE_STARTING, "Starting")
+        job.mark(PHASE_SPEC_LOAD, "Validating appstore.yaml")
+        try:
+            app = parse_spec(spec or {}, limits())
+        except SpecValidationError as e:
+            raise RuntimeError(f"appstore.yaml is invalid: {e}") from None
+        if app.runtime != "kubevirt-vm":
+            raise RuntimeError("the spec is not a kubevirt-vm app")
+        team_list = _teams(teams or {})
+        refs = workload_refs(app, team_list)
+        if not refs:
+            raise RuntimeError("the deployment has no teams or members to run workloads for")
+        if len(refs) > settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT:
+            raise RuntimeError(f"{len(refs)} workloads exceed the limit of {settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT}")
+        passwords = {r.name: secrets.token_urlsafe(16) for r in refs}
+        objects = render_vm(app, dep, team_list, render_settings(), passwords)
+        outputs = build_outputs(app, dep, team_list, passwords)
+        kube = _kube_factory()
+
+        job.mark(PHASE_NAMESPACE, f"Creating namespace {dep.namespace}")
+        _owned_snapshot(kube, dep, must_exist=False)
+        kube.apply(objects[0])  # namespace first
+        for obj in _bootstrap_objects(dep):
+            kube.apply(obj)
+        job.mark(PHASE_POLICIES, "Applying network policies")
+        policy_kinds = {"ResourceQuota", "NetworkPolicy"}
+        for obj in (o for o in objects if o["kind"] in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_APPLY, f"Applying {len(refs)} VM workload(s)")
+        for obj in (o for o in objects[1:] if o["kind"] not in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_WAIT_READY, "Waiting for the noVNC proxy to become ready")
+        wait_until(
+            kube,
+            dep.namespace,
+            _vm_all_ready({r.name for r in refs}),
+            settings.K8S_READY_TIMEOUT_SECONDS,
+            "the noVNC proxy",
+        )
+        job.mark(PHASE_OUTPUTS, "Collecting access data")
+        job.logger.success(f"VM deployment {deployment_id} is running in {dep.namespace}", category=LogCategory.STATUS)
     except Exception as e:
         if kube is not None:
             _cleanup_after_failure(kube, dep, job.logger)
