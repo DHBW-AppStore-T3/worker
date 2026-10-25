@@ -1,24 +1,16 @@
-# Entscheidung: Worker-Datenbankisolation und Postgres-tfstate
-
-> **Abgelöst (Oktober 2026):** Der Worker hat seit .github#5 die eingeschränkte
-> Rolle `appstore_worker` auf der App-Datenbank, und den OpenTofu-State hält die
-> API (HTTP-State-Backend `/internal/tfstate`, je Task ein eigenes Token, siehe
-> `app/services/terraform_executor.py`). `postgres-tfstate` entfällt; bestehende
-> States übernimmt `python -m app.import_pg_tfstate` im Backend.
-
-## Kontext
-Traditionell greifen Backend- und Worker-Services oft auf dieselbe relationale Datenbank zu. Bei einem Infrastruktur-Worker, der beliebigen Code aus fremden App-Repositories klont und ausführt, birgt ein direkter Datenbankzugriff jedoch erhebliche Sicherheitsrisiken (SQL-Injection-Gefahr, versehentliche Datenmanipulation, Leaking von Nutzerdaten).
+# Worker-Isolation: eigene Datenbankrolle, kein Code aus App-Repositories
 
 ## Entscheidung
-1. **Kein direkter Zugriff auf die App-Datenbank:**
-   Der Worker besitzt keine Datenbank-Credentials für die Haupt-Postgres-Datenbank des Backends.
-2. **Postgres-tfstate als dedizierter State-Store:**
-   Für den Remote-State von Terraform wird ein isolierter PostgreSQL-Container (`postgres-tfstate`) betrieben. Jedes Deployment erhält ein eigenes Schema `deployment_{deployment_id}`.
-3. **In-Process Fernet-Entschlüsselung:**
-   OpenStack-Zugangsdaten werden vom Backend verschlüsselt in die Celery-Task-Payload gelegt und vom Worker im Arbeitsspeicher mit dem geteilten `CREDENTIAL_ENCRYPTION_KEY` entschlüsselt.
-4. **Status-Rückmeldung ausschließlich über Celery:**
-   Ergebnisse, Logs und Fehlerdaten fließen ausschließlich über das Celery Result-Backend (Redis) und Celery-Events an das Backend zurück.
 
-## Konsequenzen
-- Deutlich verringerte Angriffsfläche bei kompromittierten App-Repositories.
-- Klare Trennung der Verantwortlichkeiten: Backend besitzt fachliche Datenhoheit, Worker ist reiner Infrastruktur-Executor.
+1. **Eingeschränkte Datenbankrolle:** Der Worker verbindet sich als `appstore_worker` mit der Anwendungs-Datenbank. Rechte: `celery_queue`, INSERT in `task_events`, Ergebnis-Spalten von `tasks`. Nichts sonst.
+2. **Kein fremder Code:** Der Worker klont kein App-Repository und führt nichts daraus aus; er rendert die Kubernetes-Objekte aus der geprüften `appstore.yaml` selbst. Er läuft ohne Root.
+3. **Ein Schlüssel für Ergebnisse:** `RESULTS_ENCRYPTION_KEY` (gleich wie in der API).
+4. **Status ausschließlich über die Datenbank:** Status, Logs, Fehler und Ergebnisse stehen in der Task-Zeile und in `task_events`.
+
+## Grund
+
+Jeder zusätzliche Zugriff auf Daten der API vergrößert den Schaden einer Kompromittierung des Workers, der Zugriff auf die Kubernetes-API hat.
+
+## Historie
+
+Bis .github#12 führte ein zweiter Worker (`vm-executor`) OpenTofu und Packer aus App-Repositories aus. Dafür gab es den State in der API, Slot-UIDs und einen zweiten Schlüssel. Der Pfad ist entfernt; die Datei behält ihren Namen, weil andere Dokumente auf sie verweisen.
