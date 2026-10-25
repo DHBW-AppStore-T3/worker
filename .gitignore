@@ -116,6 +116,3 @@ worker_repos/
 # -----------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
-
-# Generated code graph (graphify), not tracked
-graphify-out/
