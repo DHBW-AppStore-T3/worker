@@ -140,6 +140,7 @@ def render_settings() -> RenderSettings:
         tolerations=tuple(json.loads(settings.K8S_STUDENT_TOLERATIONS or "[]")),
         extra_egress_except=tuple(c.strip() for c in settings.K8S_EXTRA_EGRESS_EXCEPT.split(",") if c.strip()),
         environment=settings.K8S_ENVIRONMENT,
+        vnc_proxy_image=settings.K8S_VNC_PROXY_IMAGE,
     )
 
 
@@ -217,6 +218,7 @@ class UnschedulableSince:
     def __init__(self, grace: float) -> None:
         self.grace = grace
         self._since: dict[str, float] = {}
+        self._pvc_since: dict[str, float] = {}
 
     def overdue(self, snap: Snapshot) -> PodInfo | None:
         """The first pod of ``snap`` unschedulable for longer than the grace period, if any."""
@@ -224,6 +226,28 @@ class UnschedulableSince:
         stuck = {pod.uid or pod.name: pod for pod in snap.pods if pod.unschedulable}
         self._since = {key: self._since.get(key, now) for key in stuck}
         return next((pod for key, pod in stuck.items() if now - self._since[key] >= self.grace), None)
+
+    def pvc_overdue(self, snap: Snapshot) -> str | None:
+        """The reason a volume claim has been stuck for longer than the grace period, if one has.
+
+        A clone logs ProvisioningFailed warnings while it retries, so a single one is no failure.
+        """
+        now = _clock()
+        stuck = _stuck_pvcs(snap)
+        self._pvc_since = {name: self._pvc_since.get(name, now) for name in stuck}
+        return next((why for name, why in stuck.items() if now - self._pvc_since[name] >= self.grace), None)
+
+
+def _stuck_pvcs(snap: Snapshot) -> dict[str, str]:
+    """Volume claims still Pending with a ProvisioningFailed / quota warning: ``{name: reason in words}``."""
+    out: dict[str, str] = {}
+    for name, reason, message in snap.pvc_issues:
+        if snap.pvc_phases.get(name, "Pending") != "Pending" or name in out:
+            continue
+        if reason == "ProvisioningFailed" or "exceeded quota" in message:
+            what = "storage quota exceeded" if "exceeded quota" in message else "the volume cannot be provisioned"
+            out[name] = f"Volume claim {name} is stuck Pending, {what} ({reason}): {message}".strip().removesuffix(":")
+    return out
 
 
 def explain(snap: Snapshot, unschedulable: UnschedulableSince | None = None) -> str | None:
@@ -242,6 +266,12 @@ def explain(snap: Snapshot, unschedulable: UnschedulableSince | None = None) -> 
         stuck = next((pod for pod in snap.pods if pod.unschedulable), None)
     if stuck is not None:
         return unschedulable_reason(stuck)
+    if unschedulable is not None:
+        pvc_reason = unschedulable.pvc_overdue(snap)
+    else:
+        pvc_reason = next(iter(_stuck_pvcs(snap).values()), None)
+    if pvc_reason is not None:
+        return pvc_reason
     for event in snap.events:
         if event.reason == "FailedCreate" and "exceeded quota" in event.message:
             return f"{event.object}: resource quota exceeded: {event.message}"
@@ -415,21 +445,32 @@ def build_outputs(spec: AppSpec, dep: DeploymentCtx, teams: list[Team], password
     }
 
 
-def _delete_clone_grants(kube: Kube, dep: DeploymentCtx, snap: Snapshot) -> None:
-    """A kubevirt-vm deployment's ReferenceGrants live in the image namespaces, outside its own namespace."""
-    if snap.labels.get(VM_NAMESPACE_LABEL) != "true":
-        return
+def _delete_clone_grants(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
+    """Remove the deployment's ReferenceGrants from the image namespaces; best effort, never raises.
+
+    They live outside the deployment's namespace. The name derives from the deployment id, so
+    this also works after the namespace is gone; deleting a grant that does not exist is a
+    no-op. A failure (403, API hiccup) only leaves a grant behind that names a namespace that
+    no longer exists, which the orphan sweep can clean up; it must never block a destroy.
+    """
     for image_namespace in limits().vm_image_namespaces:
-        kube.delete_object(REFERENCE_GRANT_API, "ReferenceGrant", image_namespace, vm_clone_grant_name(dep))
+        try:
+            kube.delete_object(REFERENCE_GRANT_API, "ReferenceGrant", image_namespace, vm_clone_grant_name(dep))
+        except Exception as e:
+            logger.warning(
+                f"Could not remove the clone grant {vm_clone_grant_name(dep)} in {image_namespace}: {e}",
+                category=LogCategory.WARNING,
+            )
 
 
 def _cleanup_after_failure(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
     try:
         snap = kube.snapshot(dep.namespace)
         if snap.exists and snap.belongs_to(dep.id):
-            _delete_clone_grants(kube, dep, snap)
             kube.delete_namespace(dep.namespace)
             logger.info(f"Removed {dep.namespace} after the failure", category=LogCategory.OPERATION)
+            if snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+                _delete_clone_grants(kube, dep, logger)
     except Exception as e:  # best effort; the failure being reported is the original one
         logger.warning(f"Could not remove {dep.namespace}: {e}", category=LogCategory.WARNING)
 
@@ -578,7 +619,7 @@ def deploy_vm_application(
             kube,
             dep.namespace,
             _vm_all_ready({r.name for r in refs}),
-            settings.K8S_READY_TIMEOUT_SECONDS,
+            settings.K8S_VM_READY_TIMEOUT_SECONDS,
             "the VM and its noVNC proxy",
         )
         job.mark(PHASE_OUTPUTS, "Collecting access data")
@@ -601,8 +642,12 @@ def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         job.mark(PHASE_DELETE, f"Deleting namespace {dep.namespace}")
         snap = _owned_snapshot(kube, dep, must_exist=False)
         if snap.exists:
-            _delete_clone_grants(kube, dep, snap)
             kube.delete_namespace(dep.namespace)
+        # After the namespace (a failing grant must not keep it alive) and also when it is
+        # already gone (an earlier destroy may have died between the two). A pod deployment's
+        # namespace is known not to have grants.
+        if not snap.exists or snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+            _delete_clone_grants(kube, dep, job.logger)
         job.mark(PHASE_WAIT_GONE, "Waiting for the namespace to disappear")
         wait_until(
             kube,
@@ -622,9 +667,37 @@ def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     return job.result(terraform_outputs={})
 
 
+def _is_vm_namespace(snap: Snapshot) -> bool:
+    return snap.labels.get(VM_NAMESPACE_LABEL) == "true"
+
+
+def _stop_vms(kube: Kube, dep: DeploymentCtx, snap: Snapshot) -> None:
+    """Halt the VMs and scale the noVNC proxies to 0.
+
+    Both are patches the pod deployer is allowed to make (``virtualmachines`` and ``deployments``
+    patch; the admission policy admits ``runStrategy`` and at most one replica). A VMI is never
+    deleted: KubeVirt removes it itself once the VM is Halted.
+    """
+    for vm in snap.virtual_machines:
+        kube.set_run_strategy(dep.namespace, vm.name, "Halted")
+    for d in snap.deployments:
+        kube.scale_deployment(dep.namespace, d.name, 0)
+
+
+def _start_vms(kube: Kube, dep: DeploymentCtx, snap: Snapshot, vms: set[str]) -> None:
+    for name in sorted(vms):
+        kube.set_run_strategy(dep.namespace, name, "Always")
+    for d in snap.deployments:
+        kube.scale_deployment(dep.namespace, d.name, 1)
+
+
 @celery_app.task(bind=True, base=JobTask, name="pods.pause_deployment")
 def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
-    """Scale every workload to zero; volumes and secrets stay, so resume brings the data back."""
+    """Scale every workload to zero; volumes and secrets stay, so resume brings the data back.
+
+    kubevirt-vm: every VirtualMachine gets ``runStrategy: Halted`` (KubeVirt then removes the VMI
+    and the virt-launcher pod; the disk claim stays) and every noVNC proxy is scaled to 0.
+    """
     job = _Job(self, "pause", deployment_id, PHASES_PAUSE)
     dep = DeploymentCtx(id=deployment_id)
     try:
@@ -634,6 +707,8 @@ def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         snap = _owned_snapshot(kube, dep)
         for s in snap.statefulsets:
             kube.scale(dep.namespace, s.name, 0)
+        if _is_vm_namespace(snap):
+            _stop_vms(kube, dep, snap)
         job.mark(PHASE_WAIT_STOPPED, "Waiting for the pods to stop")
         wait_until(kube, dep.namespace, lambda s: not s.pods, settings.K8S_DELETE_TIMEOUT_SECONDS, "the pods to stop")
         job.logger.success("Paused", category=LogCategory.STATUS)
@@ -652,6 +727,21 @@ def resume_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         kube = _kube_factory()
         job.mark(PHASE_SCALE_UP, "Starting the workloads")
         snap = _owned_snapshot(kube, dep)
+        if _is_vm_namespace(snap):
+            vms = {vm.name for vm in snap.virtual_machines}
+            if not vms:
+                raise RuntimeError(f"namespace {dep.namespace} has no VirtualMachines to start")
+            _start_vms(kube, dep, snap, vms)
+            job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot and the noVNC proxy to become ready")
+            wait_until(
+                kube,
+                dep.namespace,
+                _vm_all_ready(vms),
+                settings.K8S_VM_READY_TIMEOUT_SECONDS,
+                "the VM and its noVNC proxy",
+            )
+            job.logger.success("Resumed", category=LogCategory.STATUS)
+            return job.result(terraform_outputs={})
         names = {s.name for s in snap.statefulsets}
         for name in names:
             kube.scale(dep.namespace, name, 1)
@@ -661,6 +751,38 @@ def resume_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     except Exception as e:
         raise job.failure(e) from None
     return job.result(terraform_outputs={})
+
+
+def _restart_vm(job: _Job, kube: Kube, dep: DeploymentCtx, snap: Snapshot, workload: str, reset: bool) -> None:
+    """Restart one VM: Halted, wait until its VMI and pod are gone, Always, wait until it is ready.
+
+    The deployer may not delete a VirtualMachineInstance (admission policy, RBAC: read only), so
+    this is the only restart it has; the disk and so the guest's data stay. Resetting the disk
+    (re-clone of the golden image) is not supported for VMs.
+    """
+    if reset:
+        raise RuntimeError("reset is not supported for VM deployments")
+    if workload not in {vm.name for vm in snap.virtual_machines}:
+        raise RuntimeError(f"unknown workload {workload!r}")
+    job.mark(PHASE_RESTART, f"Restarting {workload}")
+    kube.set_run_strategy(dep.namespace, workload, "Halted")
+    wait_until(
+        kube,
+        dep.namespace,
+        lambda s: not any(v.name == workload for v in s.vmis) and not any(p.workload == workload for p in s.pods),
+        settings.K8S_DELETE_TIMEOUT_SECONDS,
+        "the VM to stop",
+    )
+    kube.set_run_strategy(dep.namespace, workload, "Always")
+    job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot")
+    wait_until(
+        kube,
+        dep.namespace,
+        _vm_all_ready({workload}),
+        settings.K8S_VM_READY_TIMEOUT_SECONDS,
+        "the VM",
+    )
+    job.logger.success(f"{workload} is running again", category=LogCategory.STATUS)
 
 
 @celery_app.task(bind=True, base=JobTask, name="pods.redeploy_resource")
@@ -681,6 +803,9 @@ def redeploy_resource(self, deployment_id: str, resource_address: str | None = N
             raise RuntimeError(f"invalid workload name {workload!r}")
         kube = _kube_factory()
         snap = _owned_snapshot(kube, dep)
+        if _is_vm_namespace(snap):
+            _restart_vm(job, kube, dep, snap, workload, reset)
+            return job.result(terraform_outputs={})
         if workload not in {s.name for s in snap.statefulsets}:
             raise RuntimeError(f"unknown workload {workload!r}")
         old_pods = {p.name: p.uid for p in snap.pods if p.workload == workload}

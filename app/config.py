@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     K8S_POLL_INTERVAL_SECONDS: float = 3.0
     K8S_READY_TIMEOUT_SECONDS: int = 600
     K8S_DELETE_TIMEOUT_SECONDS: int = 300
+    # kubevirt-vm deployments (deploy, resume, restart): the PVC clone and Windows' first boot take minutes.
+    K8S_VM_READY_TIMEOUT_SECONDS: int = 1200
     # A pod may be unschedulable this long before a wait fails (.github#8): a
     # StatefulSet's new pod is, until its volume claim exists and is bound.
     K8S_UNSCHEDULABLE_GRACE_SECONDS: int = 60
@@ -91,6 +93,8 @@ class Settings(BaseSettings):
     K8S_READER_CLUSTER_ROLE: str = "appstore-reader"
     # Bound to the noVNC proxy's service account in each kubevirt-vm namespace (VNC subresource only).
     K8S_VNC_PROXY_CLUSTER_ROLE: str = "appstore-vnc-proxy"
+    # Image of the noVNC proxy deployment of each kubevirt-vm workload.
+    K8S_VNC_PROXY_IMAGE: str = "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
     # The installation this worker belongs to (e.g. its namespace), where
     # several share one cluster: set as a label on every namespace it
     # creates; the admission policy lets it touch only those.
