@@ -337,30 +337,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # The pod deployer (.github#4): same code, no OpenTofu/Packer, no root.
+      # The pod deployer (.github#4): no git, OpenTofu or Packer, no root.
       - name: Build pod-deployer image
         uses: docker/build-push-action@v5
         with:
@@ -397,44 +374,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build local image (amd64, --load)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          load: true
-          platforms: linux/amd64
-          tags: worker:scan
-          cache-from: type=gha
-
-      - name: Trivy image scan (gate)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: worker:scan
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          exit-code: 1
-
-      - name: Trivy image scan (SARIF for Security tab)
-        if: always()
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: worker:scan
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          trivyignores: .trivyignore
-          format: sarif
-          output: trivy-image.sarif
-
-      - name: Upload Trivy image results to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-          category: trivy-image
-
       - name: Build local pod-deployer image (amd64, --load)
         uses: docker/build-push-action@v5
         with:
@@ -470,7 +409,6 @@ jobs:
       contents: read
       packages: write
     outputs:
-      digest: ${{ steps.push-image.outputs.digest }}
       digest-pods: ${{ steps.push-image-pods.outputs.digest }}
 
     steps:
@@ -489,31 +427,6 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
-            type=sha,prefix=sha-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Build and push Docker image
-        id: push-image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Extract metadata (pod deployer)
         id: meta-pods
@@ -559,10 +472,7 @@ jobs:
       - name: Pin the new image in the deployment repo
         run: |
           gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref "$GITHUB_REF_NAME" \
-            -f component=worker -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST"
-          gh workflow run k8s-bump.yml --repo DHBW-AppStore-T3/deployment --ref "$GITHUB_REF_NAME" \
             -f component=worker-pods -f tag="sha-${GITHUB_SHA::7}" -f digest="$DIGEST_PODS"
         env:
           GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
-          DIGEST: ${{ needs.push.outputs.digest }}
           DIGEST_PODS: ${{ needs.push.outputs.digest-pods }}

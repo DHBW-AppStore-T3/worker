@@ -7,6 +7,7 @@ redelivered job after a dead worker is failed instead of run again.
 """
 
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -18,7 +19,6 @@ from app import job_runtime
 from app.celery_app import celery_app
 from app.failure import Failure
 from app.job_task import JobTask
-from app.services.terraform_executor import _stream_subprocess
 from app.task_contract import (
     EVENT_FAILED,
     EVENT_LOG,
@@ -70,14 +70,9 @@ def failing_task(self):
 def long_tool_task(self, seconds=30):
     self.send_event(EVENT_LOG, deployment_id="x", level="INFO", message="starting tool")
     code = "import time\nfor i in range(1000):\n    print(i, flush=True)\n    time.sleep(0.05)"
-    rc, _, _ = _stream_subprocess(
-        [sys.executable, "-c", code],
-        cwd=".",
-        env=None,
-        timeout=seconds,
-        tool_name="sleeper",
-        output_callback=None,
-    )
+    process = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    with job_runtime.track(process):
+        rc = process.wait(timeout=seconds)
     raise AssertionError(f"tool ended on its own (rc={rc}), cancel did not stop it")
 
 
@@ -318,24 +313,3 @@ def test_jobs_need_no_more_than_the_worker_role(pg, pg_url, as_worker_role):
     unknown_id, _ = _task(pg)
     job_runtime.fail_unknown(unknown_id, "tasks.nope")
     assert _row(pg, unknown_id)["status"] == "FAILED"
-
-
-def test_a_slot_that_cannot_be_prepared_fails_the_task_without_running_it(pg, monkeypatch):
-    task_id, _ = _task(pg)
-
-    def broken(slot):
-        raise RuntimeError("could not stop the processes of slot user 20000")
-
-    monkeypatch.setattr(job_runtime.job_context, "slot_session", broken)
-    ran = []
-    monkeypatch.setattr(ok_task, "run", lambda *a, **k: ran.append(1))
-
-    with pytest.raises(RuntimeError):
-        ok_task.apply(task_id=task_id, throw=True)
-
-    row = _row(pg, task_id)
-    assert row["status"] == "FAILED" and row["lease_until"] is None
-    assert job_runtime.SLOT_NOT_READY_MESSAGE in row["logs"]
-    assert not ran and job_runtime.current() is None
-    terminal = _events(pg, task_id)[-1]
-    assert terminal[0] == EVENT_FAILED and terminal[1]["failure_kind"] == FAILURE_KIND_INFRASTRUCTURE

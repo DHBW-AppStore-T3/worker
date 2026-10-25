@@ -44,7 +44,7 @@ from .k8s.render import (
     workload_refs,
 )
 from .k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
-from .tasks import _PhaseTracker
+from .phase_tracker import PhaseTracker
 from .utils.logger import LogCategory, get_logger
 
 PHASE_STARTING = "STARTING"
@@ -151,7 +151,7 @@ class _Job:
         self.logger.set_event_emitter(
             lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
         )
-        self.tracker = _PhaseTracker(self.logger, phases)
+        self.tracker = PhaseTracker(self.logger, phases)
         self.action = action
 
     def mark(self, phase: str, message: str) -> None:
