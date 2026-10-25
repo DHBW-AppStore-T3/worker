@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # control, which the pgq transport does not have).
     WORKER_HEARTBEAT_FILE: str = "/tmp/worker-heartbeat"
 
+    # Local development without a Kubernetes cluster: pod jobs run against
+    # FakeKube instead of the real API server. Only allowed in development.
+    WORKER_SIMULATE: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,
@@ -166,6 +170,8 @@ class Settings(BaseSettings):
                 raise ValueError(f"unsafe production configuration: {name} is a published test key")
         if not self.is_development and self.RESULTS_ENCRYPTION_KEY == self.CREDENTIAL_ENCRYPTION_KEY:
             raise ValueError("unsafe production configuration: RESULTS_ENCRYPTION_KEY is the credential key")
+        if self.WORKER_SIMULATE and not self.is_development:
+            raise ValueError("WORKER_SIMULATE requires APP_ENV=development")
         return self
 
     @property

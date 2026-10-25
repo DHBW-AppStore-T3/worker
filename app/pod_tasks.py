@@ -29,6 +29,7 @@ from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
 from .job_task import JobTask
+from .k8s.fake import FakeKube
 from .k8s.kube import Kube, KubeApi, PodInfo, Snapshot, deployment_selector
 from .k8s.render import (
     DEPLOYMENT_LABEL,
@@ -86,7 +87,14 @@ _FATAL_WAITING = {
 _WORKLOAD_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 KubeFactory = Callable[[], Kube]
-_kube_factory: KubeFactory = KubeApi
+_sim_kube = FakeKube()
+
+
+def _default_kube() -> Kube:
+    return _sim_kube if settings.WORKER_SIMULATE else KubeApi()
+
+
+_kube_factory: KubeFactory = _default_kube
 # The clock of the waits (deadlines, how long a pod is unschedulable); tests replace it.
 _clock: Callable[[], float] = time.monotonic
 
@@ -105,8 +113,9 @@ def limits() -> PlatformLimits:
 
 
 def render_settings() -> RenderSettings:
+    zone = settings.K8S_ZONE or ("localhost" if settings.WORKER_SIMULATE else "")
     return RenderSettings(
-        zone=settings.K8S_ZONE,
+        zone=zone,
         app_domain_override=settings.K8S_APP_DOMAIN,
         ingress_class=settings.K8S_INGRESS_CLASS,
         ingress_namespace=settings.K8S_INGRESS_NAMESPACE,

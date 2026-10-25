@@ -495,3 +495,30 @@ def test_a_cancel_before_anything_is_created_creates_nothing(cluster, monkeypatc
     with pytest.raises(job_runtime.JobCancelled):
         deploy()
     assert cluster.objects == {}
+
+
+def test_worker_simulate_singleton_persists_across_tasks(events, monkeypatch):
+    """Regression test: WORKER_SIMULATE must reuse the same FakeKube across tasks."""
+    sim_kube = FakeKube()
+    monkeypatch.setattr(settings, "WORKER_SIMULATE", True)
+    monkeypatch.setattr(settings, "K8S_ZONE", "")
+    monkeypatch.setattr(pod_tasks, "_sim_kube", sim_kube)
+    monkeypatch.setattr(pod_tasks, "_kube_factory", pod_tasks._default_kube)
+
+    result = deploy()
+    assert result["status"] == "success"
+    assert NS in sim_kube.namespace_labels
+    for account in accounts_of(result).values():
+        assert account["url"].endswith(".apps.localhost")
+    assert pod_tasks.pause_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.resume_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
+    assert NS not in sim_kube.namespace_labels
+
+
+def test_default_kube_uses_real_client_when_not_simulating(monkeypatch):
+    monkeypatch.setattr(settings, "WORKER_SIMULATE", False)
+    sentinel = object()
+    monkeypatch.setattr(pod_tasks, "KubeApi", lambda: sentinel)
+
+    assert pod_tasks._default_kube() is sentinel

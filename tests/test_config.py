@@ -86,6 +86,13 @@ class TestConfiguration:
                 },
                 "RESULTS_ENCRYPTION_KEY is the credential key",
             ),
+            (
+                {
+                    "CREDENTIAL_ENCRYPTION_KEY": "yJdwFtdm0sMMuyiokYEj4Fbt6lDnkhfRV9PqcSvhvxQ=",
+                    "WORKER_SIMULATE": "true",
+                },
+                "WORKER_SIMULATE requires APP_ENV=development",
+            ),
         ],
     )
     def test_unsafe_keys_never_start(self, env, message):
