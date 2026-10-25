@@ -43,9 +43,7 @@ results_cipher = (
 
 def _credentials() -> Fernet:
     if _credential_cipher is None:
-        raise RuntimeError(
-            "CREDENTIAL_ENCRYPTION_KEY is not set"
-        )
+        raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY is not set")
     return _credential_cipher
 
 
