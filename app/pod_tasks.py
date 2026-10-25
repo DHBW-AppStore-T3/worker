@@ -1,4 +1,9 @@
-"""Jobs for apps that run as pods (``runtime: kubernetes``, an appstore.yaml; .github#4).
+"""Jobs for apps that run in the cluster: pods (``runtime: kubernetes``, an appstore.yaml;
+.github#4) and KubeVirt VMs (``runtime: kubevirt-vm``, ``deploy_vm_application``).
+
+Historic naming: the pod jobs came first, so the module, the Celery names
+``pods.*`` and the queue ``pods`` also cover the VM jobs. Deployed workers and
+queued tasks use these names, so they stay.
 
 The API read and validated the app's spec at the pinned commit and put it into
 the job, so this worker never clones or runs anything from the app repository:
@@ -24,7 +29,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import job_runtime
+from . import job_runtime, upload_mac
 from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
@@ -365,7 +370,10 @@ def _file_contents(user_vars: dict[str, Any], spec: AppSpec) -> dict[str, dict[s
             if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
                 entry = entry["uploaded"]
             if isinstance(entry, dict) and "content_b64" in entry:
-                files[slot] = base64.b64decode(entry["content_b64"])
+                data = base64.b64decode(entry["content_b64"])
+                # Mounted only if the API sealed it after its checks (.github#13, 3.7).
+                upload_mac.verify(v.name, slot, entry, data)
+                files[slot] = data
         out[v.name] = files
     return out
 

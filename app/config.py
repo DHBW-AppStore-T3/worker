@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # until the API has dropped its credential key as well).
     CREDENTIAL_ENCRYPTION_KEY: str = ""
     RESULTS_ENCRYPTION_KEY: str = ""
+    # Every uploaded file must carry the API's seal (``upload_mac``). Switch off
+    # only while deployments from before the seal existed still have to be
+    # redeployed; a file with a seal that does not match is refused either way.
+    UPLOAD_MAC_REQUIRED: bool = True
 
     # Pod apps (.github#4; the pod deployer, queue "pods") ------------------
     # Platform limits for an appstore.yaml: same settings as the API's.
