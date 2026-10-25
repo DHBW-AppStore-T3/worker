@@ -35,12 +35,17 @@ from .k8s.render import (
     DEPLOYMENT_LABEL,
     FIELD_MANAGER,
     MANAGED_BY_LABEL,
+    REFERENCE_GRANT_API,
+    VM_NAMESPACE_LABEL,
+    VNC_PROXY_ACCOUNT,
     DeploymentCtx,
     Member,
     RenderSettings,
     Team,
     render,
     render_access,
+    render_vm,
+    vm_clone_grant_name,
     workload_refs,
 )
 from .k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
@@ -108,7 +113,11 @@ def set_kube_factory(factory: KubeFactory) -> None:
 def limits() -> PlatformLimits:
     """The platform limits, from the same settings as the API's."""
     return limits_from(
-        settings.APP_IMAGE_REGISTRY_ALLOWLIST, settings.APP_MAX_CPU, settings.APP_MAX_MEMORY, settings.APP_MAX_STORAGE
+        settings.APP_IMAGE_REGISTRY_ALLOWLIST,
+        settings.APP_MAX_CPU,
+        settings.APP_MAX_MEMORY,
+        settings.APP_MAX_STORAGE,
+        settings.APP_VM_IMAGE_NAMESPACES,
     )
 
 
@@ -307,8 +316,9 @@ def _binding(dep: DeploymentCtx, name: str, cluster_role: str, account: str, nam
     }
 
 
-def _bootstrap_objects(dep: DeploymentCtx) -> list[dict[str, Any]]:
-    """RoleBindings in the new namespace: the deployer's own rights there, and read access for the API."""
+def _bootstrap_objects(dep: DeploymentCtx, *, vnc_proxy: bool = False) -> list[dict[str, Any]]:
+    """RoleBindings in the new namespace: the deployer's own rights there, read access for the API,
+    and for a kubevirt-vm namespace the noVNC proxy's right to open its VM's VNC stream."""
     objects = [
         _binding(
             dep,
@@ -327,6 +337,10 @@ def _bootstrap_objects(dep: DeploymentCtx) -> list[dict[str, Any]]:
                 settings.K8S_API_SERVICE_ACCOUNT,
                 settings.K8S_API_NAMESPACE or settings.K8S_WORKER_NAMESPACE,
             )
+        )
+    if vnc_proxy:
+        objects.append(
+            _binding(dep, "appstore-vnc-proxy", settings.K8S_VNC_PROXY_CLUSTER_ROLE, VNC_PROXY_ACCOUNT, dep.namespace)
         )
     return objects
 
@@ -393,10 +407,19 @@ def build_outputs(spec: AppSpec, dep: DeploymentCtx, teams: list[Team], password
     }
 
 
+def _delete_clone_grants(kube: Kube, dep: DeploymentCtx, snap: Snapshot) -> None:
+    """A kubevirt-vm deployment's ReferenceGrants live in the image namespaces, outside its own namespace."""
+    if snap.labels.get(VM_NAMESPACE_LABEL) != "true":
+        return
+    for image_namespace in limits().vm_image_namespaces:
+        kube.delete_object(REFERENCE_GRANT_API, "ReferenceGrant", image_namespace, vm_clone_grant_name(dep))
+
+
 def _cleanup_after_failure(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
     try:
         snap = kube.snapshot(dep.namespace)
         if snap.exists and snap.belongs_to(dep.id):
+            _delete_clone_grants(kube, dep, snap)
             kube.delete_namespace(dep.namespace)
             logger.info(f"Removed {dep.namespace} after the failure", category=LogCategory.OPERATION)
     except Exception as e:  # best effort; the failure being reported is the original one
@@ -478,6 +501,87 @@ def deploy_application(
     return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
 
 
+def _vm_all_ready(expected: set[str]) -> Callable[[Snapshot], bool]:
+    """Every VM is Running and its noVNC proxy is ready, so the link that is shown works."""
+    novnc_names = {f"{name}-novnc" for name in expected}
+
+    def check(snap: Snapshot) -> bool:
+        for vmi in snap.vmis:
+            if vmi.phase in ("Failed", "Unknown"):
+                raise RuntimeError(f"the VM {vmi.name} is {vmi.phase}")
+        proxies = {d.name for d in snap.deployments if d.replicas >= 1 and d.ready_replicas >= 1}
+        running = {v.name for v in snap.vmis if v.phase == "Running" and v.ready}
+        proxy_pods = all(p.ready for p in snap.pods if p.workload in novnc_names)
+        return novnc_names <= proxies and expected <= running and proxy_pods
+
+    return check
+
+
+@celery_app.task(bind=True, base=JobTask, name="pods.deploy_vm_application")
+def deploy_vm_application(
+    self,
+    deployment_id: str,
+    user_vars: dict[str, Any] | None = None,
+    teams: dict[str, list] | None = None,
+    commit_sha: str | None = None,
+    spec: dict[str, Any] | None = None,
+    owner: str = "",
+    **_: Any,
+) -> dict[str, Any]:
+    """Deploy a kubevirt-vm app: namespace, PVC clone, VirtualMachine, noVNC proxy, wait."""
+    job = _Job(self, "deploy_vm", deployment_id, PHASES_DEPLOY)
+    dep = DeploymentCtx(id=deployment_id, owner=owner)
+    kube: Kube | None = None
+    user_vars = user_vars or {}
+    try:
+        job.mark(PHASE_STARTING, "Starting")
+        job.mark(PHASE_SPEC_LOAD, "Validating appstore.yaml")
+        try:
+            app = parse_spec(spec or {}, limits())
+        except SpecValidationError as e:
+            raise RuntimeError(f"appstore.yaml is invalid: {e}") from None
+        if app.runtime != "kubevirt-vm":
+            raise RuntimeError("the spec is not a kubevirt-vm app")
+        team_list = _teams(teams or {})
+        refs = workload_refs(app, team_list)
+        if not refs:
+            raise RuntimeError("the deployment has no teams or members to run workloads for")
+        if len(refs) > settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT:
+            raise RuntimeError(f"{len(refs)} workloads exceed the limit of {settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT}")
+        passwords = {r.name: secrets.token_urlsafe(16) for r in refs}
+        objects = render_vm(app, dep, team_list, render_settings(), passwords)
+        outputs = build_outputs(app, dep, team_list, passwords)
+        kube = _kube_factory()
+
+        job.mark(PHASE_NAMESPACE, f"Creating namespace {dep.namespace}")
+        _owned_snapshot(kube, dep, must_exist=False)
+        kube.apply(objects[0])  # namespace first
+        for obj in _bootstrap_objects(dep, vnc_proxy=True):
+            kube.apply(obj)
+        job.mark(PHASE_POLICIES, "Applying network policies")
+        policy_kinds = {"ResourceQuota", "NetworkPolicy"}
+        for obj in (o for o in objects if o["kind"] in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_APPLY, f"Applying {len(refs)} VM workload(s)")
+        for obj in (o for o in objects[1:] if o["kind"] not in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot and the noVNC proxy to become ready")
+        wait_until(
+            kube,
+            dep.namespace,
+            _vm_all_ready({r.name for r in refs}),
+            settings.K8S_READY_TIMEOUT_SECONDS,
+            "the VM and its noVNC proxy",
+        )
+        job.mark(PHASE_OUTPUTS, "Collecting access data")
+        job.logger.success(f"VM deployment {deployment_id} is running in {dep.namespace}", category=LogCategory.STATUS)
+    except Exception as e:
+        if kube is not None:
+            _cleanup_after_failure(kube, dep, job.logger)
+        raise job.failure(e) from None
+    return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
+
+
 @celery_app.task(bind=True, base=JobTask, name="pods.destroy_deployment")
 def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     """Delete the namespace (which removes everything in it) and wait until it is gone."""
@@ -489,6 +593,7 @@ def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         job.mark(PHASE_DELETE, f"Deleting namespace {dep.namespace}")
         snap = _owned_snapshot(kube, dep, must_exist=False)
         if snap.exists:
+            _delete_clone_grants(kube, dep, snap)
             kube.delete_namespace(dep.namespace)
         job.mark(PHASE_WAIT_GONE, "Waiting for the namespace to disappear")
         wait_until(

@@ -86,6 +86,7 @@ def events(monkeypatch):
     recorder = Events()
     for task in (
         pod_tasks.deploy_application,
+        pod_tasks.deploy_vm_application,
         pod_tasks.destroy_deployment,
         pod_tasks.pause_deployment,
         pod_tasks.resume_deployment,
@@ -522,3 +523,81 @@ def test_default_kube_uses_real_client_when_not_simulating(monkeypatch):
     monkeypatch.setattr(pod_tasks, "KubeApi", lambda: sentinel)
 
     assert pod_tasks._default_kube() is sentinel
+
+
+# --- kubevirt-vm -------------------------------------------------------------
+VM_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "windows-matlab-app",
+    "runtime": "kubevirt-vm",
+    "scope": "user",
+    "vm": {"cpuCores": 4, "memoryGiB": 8, "diskGiB": 90, "imageRef": "windows11-matlab-golden"},
+    "egress": "internet",
+    "access": [
+        {"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"},
+        {"type": "password", "from": "generated-password", "username": "{user}"},
+    ],
+}
+VM_TEAMS = {"Team-1": [member("anna.b")]}
+
+
+@pytest.fixture
+def image_namespace(cluster):
+    """The namespace that holds the golden image exists in the cluster before any deployment."""
+    cluster.namespace_labels["vm-poc"] = {}
+    return "vm-poc"
+
+
+def deploy_vm(spec=VM_SPEC, teams=VM_TEAMS):
+    return pod_tasks.deploy_vm_application.run(
+        DEP, user_vars={}, teams=teams, commit_sha="c" * 40, spec=spec, owner=uid("teacher")
+    )
+
+
+def grants(kube):
+    return [key for key in kube.objects if key[0] == "ReferenceGrant"]
+
+
+def test_a_vm_deploy_waits_for_the_vm_and_its_proxy_and_grants_the_clone(cluster, events, image_namespace):
+    deploy_vm()
+
+    assert grants(cluster) == [("ReferenceGrant", f"clone-{NS}", "vm-poc", "gateway.networking.k8s.io/v1beta1")]
+    assert {"VirtualMachine", "Deployment", "PersistentVolumeClaim", "ServiceAccount", "RoleBinding"} <= set(
+        cluster.kinds(NS)
+    )
+    bindings = {
+        obj["metadata"]["name"]: obj
+        for (kind, _name, ns, _v), obj in cluster.objects.items()
+        if kind == "RoleBinding" and ns == NS
+    }
+    proxy = bindings["appstore-vnc-proxy"]
+    assert proxy["roleRef"]["name"] == settings.K8S_VNC_PROXY_CLUSTER_ROLE
+    assert proxy["subjects"] == [{"kind": "ServiceAccount", "name": "vnc-proxy", "namespace": NS}]
+
+
+def test_a_vm_deploy_fails_when_the_vm_never_becomes_ready(cluster, events, image_namespace, monkeypatch):
+    monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 0)
+    cluster.ready_after_polls = 10**6
+
+    with pytest.raises(Failure, match="timed out"):
+        deploy_vm()
+
+    # The failed deployment leaves neither its namespace nor its grant behind.
+    cluster.snapshot(NS)
+    assert grants(cluster) == []
+
+
+def test_destroying_a_vm_deployment_removes_its_grant_in_the_image_namespace(cluster, events, image_namespace):
+    deploy_vm()
+    assert grants(cluster)
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert grants(cluster) == []
+    assert cluster.snapshot(NS).exists is False
+
+
+def test_a_pod_deployment_touches_no_image_namespace(cluster, events):
+    deploy()
+    pod_tasks.destroy_deployment.run(DEP)
+    assert grants(cluster) == []

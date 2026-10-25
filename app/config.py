@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     APP_MAX_CPU: str = "2"
     APP_MAX_MEMORY: str = "4Gi"
     APP_MAX_STORAGE: str = "20Gi"
+    # Namespaces a kubevirt-vm may clone its golden image from (comma separated).
+    APP_VM_IMAGE_NAMESPACES: str = "vm-poc"
     K8S_MAX_WORKLOADS_PER_DEPLOYMENT: int = 60
     # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
     K8S_ZONE: str = ""
@@ -83,6 +85,8 @@ class Settings(BaseSettings):
     K8S_API_SERVICE_ACCOUNT: str = ""
     K8S_API_NAMESPACE: str = ""
     K8S_READER_CLUSTER_ROLE: str = "appstore-reader"
+    # Bound to the noVNC proxy's service account in each kubevirt-vm namespace (VNC subresource only).
+    K8S_VNC_PROXY_CLUSTER_ROLE: str = "appstore-vnc-proxy"
     # The installation this worker belongs to (e.g. its namespace), where
     # several share one cluster: set as a label on every namespace it
     # creates; the admission policy lets it touch only those.
