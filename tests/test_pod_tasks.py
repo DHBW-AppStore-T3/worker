@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import threading
 import uuid
 
 import pytest
 
-from app import job_runtime, pod_tasks
+from app import job_runtime, pod_tasks, upload_mac
 from app.config import settings
 from app.failure import Failure
 from app.k8s.fake import FakeKube
@@ -269,12 +270,62 @@ def test_the_api_gets_read_access_to_the_namespace_when_configured(cluster, monk
     assert bindings["appstore-api-reader"]["subjects"][0]["name"] == "appstore-api"
 
 
+def sealed(variable: str, slot: str, name: str, data: bytes) -> dict:
+    """A stored file the way the API writes it, including its seal."""
+    return {
+        "name": name,
+        "content_b64": base64.b64encode(data).decode(),
+        "size": len(data),
+        "content_type": "application/zip",
+        "mac": upload_mac.sign(variable, slot, name, data),
+    }
+
+
+@pytest.mark.parametrize("tamper", ["bytes", "name", "slot", "no_mac", "foreign_mac"])
+def test_a_file_the_api_did_not_seal_is_never_mounted(cluster, tamper):
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    entry = sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")
+    slot = "Team-1"
+    if tamper == "bytes":
+        entry["content_b64"] = base64.b64encode(b"MZ\x90\x00").decode()
+    elif tamper == "name":
+        entry["name"] = "b.zip"
+    elif tamper == "slot":
+        slot = "Team-2"
+    elif tamper == "no_mac":
+        del entry["mac"]
+    else:
+        entry["mac"] = "0" * 64
+
+    with pytest.raises(Failure) as failed:
+        deploy(spec=spec, user_vars={"terraform": {"assignment": {slot: entry}}})
+
+    assert "not validated by the API" in str(failed.value)
+    assert not [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
+def test_unsealed_files_of_older_deployments_pass_only_when_allowed(cluster, monkeypatch):
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    legacy = {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4}
+    monkeypatch.setattr(settings, "UPLOAD_MAC_REQUIRED", False)
+
+    deploy(spec=spec, user_vars={"terraform": {"assignment": {"Team-1": legacy}}})
+
+    assert [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
 def test_uploaded_files_reach_exactly_their_workloads(cluster):
     spec = copy.deepcopy(SPEC)
     spec["variables"] = [
         {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
     ]
-    user_vars = {"terraform": {"assignment": {"Team-1": {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4}}}}
+    user_vars = {"terraform": {"assignment": {"Team-1": sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")}}}
 
     deploy(spec=spec, user_vars=user_vars)
 
@@ -293,7 +344,7 @@ def test_team_files_in_the_shape_the_api_stores_them_reach_the_workloads(cluster
     spec["variables"] = [
         {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
     ]
-    stored = {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4, "content_type": "application/zip"}
+    stored = sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")
     user_vars = {"terraform": {"assignment": {"Team-1": {"uploaded": stored}}}}
 
     deploy(spec=spec, user_vars=user_vars)

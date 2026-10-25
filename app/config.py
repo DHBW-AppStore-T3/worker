@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     # the credential key seals the results (as before).
     CREDENTIAL_ENCRYPTION_KEY: str = ""
     RESULTS_ENCRYPTION_KEY: str = ""
+    # Every uploaded file must carry the API's seal (``upload_mac``). Switch off
+    # only while deployments from before the seal existed still have to be
+    # redeployed; a file with a seal that does not match is refused either way.
+    UPLOAD_MAC_REQUIRED: bool = True
 
     # The API as the worker reaches it (internal service URL, no /api
     # prefix). OpenTofu keeps each VM deployment's state there, through the
