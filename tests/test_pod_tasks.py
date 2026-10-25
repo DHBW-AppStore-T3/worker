@@ -270,6 +270,24 @@ def test_the_api_gets_read_access_to_the_namespace_when_configured(cluster, monk
     assert bindings["appstore-api-reader"]["subjects"][0]["name"] == "appstore-api"
 
 
+@pytest.fixture(autouse=True)
+def _results_key(monkeypatch):
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "test-results-key")
+
+
+@pytest.mark.parametrize("mac", ["\u00e4" * 64, 123, ["x"]])
+def test_malformed_seals_are_refused_not_crashing(mac):
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {"name": "a.zip", "mac": mac}, b"x")
+
+
+def test_without_a_key_nothing_is_verified(monkeypatch):
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "")
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "")
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {"name": "a.zip", "mac": "0" * 64}, b"x")
+
+
 def sealed(variable: str, slot: str, name: str, data: bytes) -> dict:
     """A stored file the way the API writes it, including its seal."""
     return {

@@ -20,6 +20,9 @@ class UnsealedUpload(Exception):
 
 def _key() -> bytes:
     secret = settings.RESULTS_ENCRYPTION_KEY or settings.CREDENTIAL_ENCRYPTION_KEY
+    if not secret:
+        # An empty secret would give a key anyone can compute: fail closed.
+        raise UnsealedUpload("no RESULTS_ENCRYPTION_KEY configured; cannot verify uploaded files")
     return hashlib.sha256(b"appstore-upload-mac-v1\0" + secret.encode()).digest()
 
 
@@ -34,5 +37,5 @@ def verify(variable: str, slot: str, entry: dict, data: bytes) -> None:
     if mac is None and not settings.UPLOAD_MAC_REQUIRED:
         return
     expected = sign(variable, slot, str(entry.get("name") or ""), data)
-    if not isinstance(mac, str) or not hmac.compare_digest(mac, expected):
+    if not isinstance(mac, str) or not hmac.compare_digest(mac.encode(), expected.encode()):
         raise UnsealedUpload(f"file {slot!r} of variable {variable!r} was not validated by the API")
