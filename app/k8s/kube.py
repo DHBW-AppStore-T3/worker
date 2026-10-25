@@ -75,7 +75,10 @@ class Snapshot:
 
     def belongs_to(self, deployment_id: str) -> bool:
         """Whether the namespace was created for ``deployment_id`` (by this platform)."""
-        return self.labels.get(DEPLOYMENT_LABEL) == deployment_id and self.labels.get(MANAGED_BY_LABEL) == FIELD_MANAGER
+        return (
+            self.labels.get(DEPLOYMENT_LABEL) == deployment_id
+            and self.labels.get(MANAGED_BY_LABEL) == FIELD_MANAGER
+        )
 
 
 class Kube(Protocol):
@@ -126,7 +129,9 @@ class KubeApi:
                 raise
 
     def namespaces(self, label_selector: str) -> list[str]:
-        return [n.metadata.name for n in self._core.list_namespace(label_selector=label_selector).items]
+        return [
+            n.metadata.name for n in self._core.list_namespace(label_selector=label_selector).items
+        ]
 
     def snapshot(self, namespace: str) -> Snapshot:
         from kubernetes.client.rest import ApiException
@@ -162,12 +167,18 @@ class KubeApi:
         for ev in self._core.list_namespaced_event(namespace).items:
             if ev.type == "Warning":
                 snap.events.append(
-                    EventInfo(f"{ev.involved_object.kind}/{ev.involved_object.name}", ev.reason or "", ev.message or "")
+                    EventInfo(
+                        f"{ev.involved_object.kind}/{ev.involved_object.name}",
+                        ev.reason or "",
+                        ev.message or "",
+                    )
                 )
         return snap
 
     def scale(self, namespace: str, statefulset: str, replicas: int) -> None:
-        self._apps.patch_namespaced_stateful_set_scale(statefulset, namespace, {"spec": {"replicas": replicas}})
+        self._apps.patch_namespaced_stateful_set_scale(
+            statefulset, namespace, {"spec": {"replicas": replicas}}
+        )
 
     def delete_pod(self, namespace: str, pod: str) -> None:
         from kubernetes.client.rest import ApiException
@@ -198,9 +209,15 @@ def _pod_info(p: Any) -> PodInfo:
             info.message = c.state.waiting.message
         if c.state and c.state.terminated and c.state.terminated.reason != "Completed":
             info.waiting_reason = c.state.terminated.reason
-    info.ready = any(cond.type == "Ready" and cond.status == "True" for cond in p.status.conditions or [])
+    info.ready = any(
+        cond.type == "Ready" and cond.status == "True" for cond in p.status.conditions or []
+    )
     for cond in p.status.conditions or []:
-        if cond.type == "PodScheduled" and cond.status == "False" and cond.reason == "Unschedulable":
+        if (
+            cond.type == "PodScheduled"
+            and cond.status == "False"
+            and cond.reason == "Unschedulable"
+        ):
             info.unschedulable = True
             info.message = cond.message
     return info
