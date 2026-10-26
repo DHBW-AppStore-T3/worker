@@ -74,6 +74,7 @@ def cluster(monkeypatch):
     monkeypatch.setattr(settings, "K8S_WORKER_NAMESPACE", "appstore-staging")
     monkeypatch.setattr(settings, "K8S_POLL_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 5)
     # An unschedulable pod fails at once here; the grace period has tests of its own.
     monkeypatch.setattr(settings, "K8S_UNSCHEDULABLE_GRACE_SECONDS", 0)
@@ -645,7 +646,8 @@ def test_a_vm_deploy_waits_for_the_vm_and_its_proxy_and_grants_the_clone(cluster
 
 
 def test_a_vm_deploy_fails_when_the_vm_never_becomes_ready(cluster, events, image_namespace, monkeypatch):
-    monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 600)  # the VM timeout counts here
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
     cluster.ready_after_polls = 10**6
 
     with pytest.raises(Failure, match="timed out"):
@@ -670,6 +672,234 @@ def test_a_pod_deployment_touches_no_image_namespace(cluster, events):
     deploy()
     pod_tasks.destroy_deployment.run(DEP)
     assert grants(cluster) == []
+
+
+# --- kubevirt-vm: pause, resume, restart ------------------------------------
+VM = "team-1-anna-b"
+PROXY = f"{VM}-novnc"
+
+
+def vm_strategy(kube):
+    obj = next(o for (k, n, ns, _v), o in kube.objects.items() if k == "VirtualMachine" and ns == NS)
+    return obj["spec"]["runStrategy"]
+
+
+def test_pausing_a_vm_halts_it_and_scales_its_proxy_to_zero(cluster, events, image_namespace):
+    deploy_vm()
+    assert vm_strategy(cluster) == "Always" and len(cluster.snapshot(NS).pods) == 2
+
+    result = pod_tasks.pause_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies == [(NS, VM, "Halted")]
+    assert cluster.deployment_scales == [(NS, PROXY, 0)]
+    snap = cluster.snapshot(NS)
+    assert snap.pods == [] and snap.vmis == []
+    assert [(v.name, v.run_strategy) for v in snap.virtual_machines] == [(VM, "Halted")]
+    assert "PersistentVolumeClaim" in cluster.kinds(NS)  # the disk stays
+
+
+def test_pausing_a_vm_waits_until_its_pods_are_gone(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.stop_polls = 3
+
+    pod_tasks.pause_deployment.run(DEP)
+
+    assert cluster.snapshot(NS).pods == []
+
+
+def test_a_pause_that_leaves_pods_behind_fails(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    cluster.stop_polls = 10**6
+    monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        pod_tasks.pause_deployment.run(DEP)
+
+
+def test_resuming_a_vm_starts_it_and_its_proxy_and_waits_until_both_are_ready(cluster, events, image_namespace):
+    deploy_vm()
+    pod_tasks.pause_deployment.run(DEP)
+
+    result = pod_tasks.resume_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies[-1] == (NS, VM, "Always")
+    assert cluster.deployment_scales[-1] == (NS, PROXY, 1)
+    snap = cluster.snapshot(NS)
+    assert [v.name for v in snap.vmis if v.ready] == [VM]
+    assert len(snap.pods) == 2 and all(p.ready for p in snap.pods)
+    assert events.phases()[-2:] == ["K8S_SCALE_UP", "K8S_WAIT_READY"]
+
+
+def test_a_resumed_vm_that_never_boots_fails_after_the_vm_timeout(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    pod_tasks.pause_deployment.run(DEP)
+    cluster.ready_after_polls = 10**6
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        pod_tasks.resume_deployment.run(DEP)
+
+
+def test_restarting_a_vm_halts_waits_for_the_pod_to_go_and_starts_it_again(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.stop_polls = 2
+    old_pod = cluster.snapshot(NS).pods[0].name
+
+    result = pod_tasks.redeploy_resource.run(DEP, resource_address=VM)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies == [(NS, VM, "Halted"), (NS, VM, "Always")]
+    assert cluster.deleted_pods == []  # a VMI or pod is never deleted by the deployer
+    assert cluster.deleted_pvcs == []
+    snap = cluster.snapshot(NS)
+    assert [v.ready for v in snap.vmis] == [True] and vm_strategy(cluster) == "Always"
+    assert old_pod  # the fake gives a new virt-launcher pod only after the old one is gone
+
+
+def test_resetting_a_vm_is_not_supported(cluster, events, image_namespace):
+    deploy_vm()
+
+    with pytest.raises(Failure, match="reset is not supported"):
+        pod_tasks.redeploy_resource.run(DEP, resource_address=f"reset:{VM}")
+
+    assert cluster.run_strategies == [] and cluster.deleted_pvcs == []
+
+
+@pytest.mark.parametrize("address", ["nope", f"{VM}-novnc-x", "Team-1"])
+def test_restarting_an_unknown_vm_fails(cluster, events, image_namespace, address):
+    deploy_vm()
+    with pytest.raises(Failure):
+        pod_tasks.redeploy_resource.run(DEP, resource_address=address)
+    assert cluster.run_strategies == []
+
+
+# --- kubevirt-vm: destroy and the clone grant -------------------------------
+class GrantFailsKube(FakeKube):
+    def delete_object(self, api_version, kind, namespace, name):
+        if kind == "ReferenceGrant":
+            raise RuntimeError("403 forbidden")
+        super().delete_object(api_version, kind, namespace, name)
+
+
+def test_a_failing_grant_delete_never_fails_the_destroy_and_the_namespace_goes(
+    events, image_namespace, monkeypatch, caplog
+):
+    kube = GrantFailsKube()
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    kube.namespace_labels["vm-poc"] = {}
+    deploy_vm()
+
+    result = pod_tasks.destroy_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert kube.snapshot(NS).exists is False
+    assert "Could not remove the clone grant" in caplog.text
+
+
+def test_the_namespace_is_deleted_before_the_grant(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    order = []
+    real_ns, real_obj = cluster.delete_namespace, cluster.delete_object
+    monkeypatch.setattr(cluster, "delete_namespace", lambda n: (order.append("namespace"), real_ns(n))[1])
+    monkeypatch.setattr(cluster, "delete_object", lambda *a: (order.append("grant"), real_obj(*a))[1])
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert order == ["namespace", "grant"]
+
+
+def test_a_destroy_after_the_namespace_is_gone_still_removes_the_grant(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.delete_namespace(NS)
+    while cluster.snapshot(NS).exists:  # the namespace finishes terminating
+        pass
+    assert NS not in cluster.namespace_labels
+    assert grants(cluster)  # the grant of the image namespace outlived it
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert grants(cluster) == []
+
+
+def test_a_failed_vm_deploy_removes_the_namespace_even_if_the_grant_delete_fails(events, monkeypatch):
+    kube = GrantFailsKube(ready_after_polls=10**6)
+    kube.namespace_labels["vm-poc"] = {}
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        deploy_vm()
+
+    while kube.snapshot(NS).exists:  # the namespace finishes terminating
+        pass
+    assert NS not in kube.namespace_labels
+
+
+# --- kubevirt-vm: a stuck volume clone --------------------------------------
+def test_a_stuck_volume_clone_fails_the_deploy_with_the_reason_not_after_the_timeout(
+    cluster, events, image_namespace, monkeypatch
+):
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 600)
+    cluster.fail_reason = "pvc"
+
+    with pytest.raises(Failure) as err:
+        deploy_vm()
+
+    assert "stuck Pending" in str(err.value) and "storage quota exceeded" in str(err.value)
+    assert "timed out" not in str(err.value)
+
+
+def test_a_pending_volume_clone_is_no_failure_within_the_grace_period(monkeypatch):
+    from app.k8s.kube import Snapshot
+
+    now = [0.0]
+    monkeypatch.setattr(pod_tasks, "_clock", lambda: now[0])
+    snap = Snapshot(exists=True, pvc_phases={"d": "Pending"}, pvc_issues=[("d", "ProvisioningFailed", "retrying")])
+    grace = pod_tasks.UnschedulableSince(60)
+
+    assert pod_tasks.explain(snap, grace) is None
+    now[0] = 61
+    assert "Volume claim d is stuck Pending" in pod_tasks.explain(snap, grace)
+
+
+def test_a_bound_volume_with_old_warnings_is_no_failure():
+    from app.k8s.kube import Snapshot
+
+    snap = Snapshot(exists=True, pvc_phases={"d": "Bound"}, pvc_issues=[("d", "ProvisioningFailed", "was retried")])
+    assert pod_tasks.explain(snap) is None
+
+
+def test_the_vm_ready_timeout_defaults_to_twenty_minutes_and_the_proxy_image_is_configurable(monkeypatch):
+    assert type(settings).model_fields["K8S_VM_READY_TIMEOUT_SECONDS"].default == 1200
+    assert pod_tasks.render_settings().vnc_proxy_image == "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
+    monkeypatch.setattr(settings, "K8S_VNC_PROXY_IMAGE", "registry.example/novnc@sha256:abc")
+    assert pod_tasks.render_settings().vnc_proxy_image == "registry.example/novnc@sha256:abc"
+
+
+# --- KubeApi: the two new patches --------------------------------------------
+def test_kube_api_patches_the_run_strategy_and_the_proxy_replicas_with_merge_patches():
+    from unittest.mock import MagicMock
+
+    from app.k8s.kube import KubeApi
+
+    api = KubeApi.__new__(KubeApi)  # no cluster connection
+    api._dyn, api._apps = MagicMock(), MagicMock()
+
+    api.set_run_strategy(NS, VM, "Halted")
+    api.scale_deployment(NS, PROXY, 0)
+
+    resource = api._dyn.resources.get.return_value
+    api._dyn.resources.get.assert_called_with(api_version="kubevirt.io/v1", kind="VirtualMachine")
+    api._dyn.patch.assert_called_once_with(
+        resource,
+        body={"spec": {"runStrategy": "Halted"}},
+        name=VM,
+        namespace=NS,
+        content_type="application/merge-patch+json",
+    )
+    api._apps.patch_namespaced_deployment.assert_called_once_with(PROXY, NS, {"spec": {"replicas": 0}})
 
 
 def test_files_in_the_neutral_variable_block_reach_the_workloads(cluster):
