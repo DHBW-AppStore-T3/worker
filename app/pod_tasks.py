@@ -1,4 +1,9 @@
-"""Jobs for apps that run as pods (``runtime: kubernetes``, an appstore.yaml; .github#4).
+"""Jobs for apps that run in the cluster: pods (``runtime: kubernetes``, an appstore.yaml;
+.github#4) and KubeVirt VMs (``runtime: kubevirt-vm``, ``deploy_vm_application``).
+
+Historic naming: the pod jobs came first, so the module, the Celery names
+``pods.*`` and the queue ``pods`` also cover the VM jobs. Deployed workers and
+queued tasks use these names, so they stay.
 
 The API read and validated the app's spec at the pinned commit and put it into
 the job, so this worker never clones or runs anything from the app repository:
@@ -24,26 +29,33 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from . import job_runtime
+from . import job_runtime, upload_mac
 from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
 from .job_task import JobTask
-from .k8s.kube import Kube, KubeApi, Snapshot, deployment_selector
+from .k8s.fake import FakeKube
+from .k8s.kube import Kube, KubeApi, PodInfo, Snapshot, deployment_selector
 from .k8s.render import (
     DEPLOYMENT_LABEL,
     FIELD_MANAGER,
     MANAGED_BY_LABEL,
+    REFERENCE_GRANT_API,
+    VM_NAMESPACE_LABEL,
+    VNC_PROXY_ACCOUNT,
     DeploymentCtx,
     Member,
     RenderSettings,
     Team,
     render,
     render_access,
+    render_vm,
+    vm_clone_grant_name,
     workload_refs,
 )
 from .k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
-from .tasks import _PhaseTracker
+from .phase_tracker import PhaseTracker
+from .task_contract import user_input_variables
 from .utils.logger import LogCategory, get_logger
 
 PHASE_STARTING = "STARTING"
@@ -86,7 +98,16 @@ _FATAL_WAITING = {
 _WORKLOAD_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 KubeFactory = Callable[[], Kube]
-_kube_factory: KubeFactory = KubeApi
+_sim_kube = FakeKube()
+
+
+def _default_kube() -> Kube:
+    return _sim_kube if settings.WORKER_SIMULATE else KubeApi()
+
+
+_kube_factory: KubeFactory = _default_kube
+# The clock of the waits (deadlines, how long a pod is unschedulable); tests replace it.
+_clock: Callable[[], float] = time.monotonic
 
 
 def set_kube_factory(factory: KubeFactory) -> None:
@@ -98,13 +119,18 @@ def set_kube_factory(factory: KubeFactory) -> None:
 def limits() -> PlatformLimits:
     """The platform limits, from the same settings as the API's."""
     return limits_from(
-        settings.APP_IMAGE_REGISTRY_ALLOWLIST, settings.APP_MAX_CPU, settings.APP_MAX_MEMORY, settings.APP_MAX_STORAGE
+        settings.APP_IMAGE_REGISTRY_ALLOWLIST,
+        settings.APP_MAX_CPU,
+        settings.APP_MAX_MEMORY,
+        settings.APP_MAX_STORAGE,
+        settings.APP_VM_IMAGE_NAMESPACES,
     )
 
 
 def render_settings() -> RenderSettings:
+    zone = settings.K8S_ZONE or ("localhost" if settings.WORKER_SIMULATE else "")
     return RenderSettings(
-        zone=settings.K8S_ZONE,
+        zone=zone,
         app_domain_override=settings.K8S_APP_DOMAIN,
         ingress_class=settings.K8S_INGRESS_CLASS,
         ingress_namespace=settings.K8S_INGRESS_NAMESPACE,
@@ -115,6 +141,7 @@ def render_settings() -> RenderSettings:
         tolerations=tuple(json.loads(settings.K8S_STUDENT_TOLERATIONS or "[]")),
         extra_egress_except=tuple(c.strip() for c in settings.K8S_EXTRA_EGRESS_EXCEPT.split(",") if c.strip()),
         environment=settings.K8S_ENVIRONMENT,
+        vnc_proxy_image=settings.K8S_VNC_PROXY_IMAGE,
     )
 
 
@@ -140,7 +167,7 @@ class _Job:
         self.logger.set_event_emitter(
             lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
         )
-        self.tracker = _PhaseTracker(self.logger, phases)
+        self.tracker = PhaseTracker(self.logger, phases)
         self.action = action
 
     def mark(self, phase: str, message: str) -> None:
@@ -165,15 +192,87 @@ class _Job:
         }
 
 
-def explain(snap: Snapshot) -> str | None:
-    """A readable reason when the namespace cannot become ready, else None."""
+def unschedulable_reason(pod: PodInfo) -> str:
+    """Why ``pod`` cannot be scheduled, in words: its volume, the capacity, or its placement."""
+    message = pod.message or ""
+    text = message.lower()
+    if "persistentvolumeclaim" in text or "unbound" in text:
+        what = "is still waiting for its volume"
+    elif "insufficient" in text or "too many pods" in text:
+        what = "cannot be scheduled, the cluster has no capacity"
+    elif "taint" in text or "affinity" in text or "selector" in text:
+        what = "cannot be scheduled, no node matches its placement (node selector, tolerations)"
+    else:
+        what = "cannot be scheduled"
+    return f"Pod {pod.name} {what}: {message}".strip().removesuffix(":")
+
+
+class UnschedulableSince:
+    """When each pod was first seen unschedulable, during one wait.
+
+    A StatefulSet's new pod is unschedulable for a moment: until its volume
+    claim exists and is bound (.github#8; a reset deletes the claim, so it
+    creates exactly this state). That alone is no failure, only a pod that
+    stays unschedulable for longer than ``grace`` seconds is.
+    """
+
+    def __init__(self, grace: float) -> None:
+        self.grace = grace
+        self._since: dict[str, float] = {}
+        self._pvc_since: dict[str, float] = {}
+
+    def overdue(self, snap: Snapshot) -> PodInfo | None:
+        """The first pod of ``snap`` unschedulable for longer than the grace period, if any."""
+        now = _clock()
+        stuck = {pod.uid or pod.name: pod for pod in snap.pods if pod.unschedulable}
+        self._since = {key: self._since.get(key, now) for key in stuck}
+        return next((pod for key, pod in stuck.items() if now - self._since[key] >= self.grace), None)
+
+    def pvc_overdue(self, snap: Snapshot) -> str | None:
+        """The reason a volume claim has been stuck for longer than the grace period, if one has.
+
+        A clone logs ProvisioningFailed warnings while it retries, so a single one is no failure.
+        """
+        now = _clock()
+        stuck = _stuck_pvcs(snap)
+        self._pvc_since = {name: self._pvc_since.get(name, now) for name in stuck}
+        return next((why for name, why in stuck.items() if now - self._pvc_since[name] >= self.grace), None)
+
+
+def _stuck_pvcs(snap: Snapshot) -> dict[str, str]:
+    """Volume claims still Pending with a ProvisioningFailed / quota warning: ``{name: reason in words}``."""
+    out: dict[str, str] = {}
+    for name, reason, message in snap.pvc_issues:
+        if snap.pvc_phases.get(name, "Pending") != "Pending" or name in out:
+            continue
+        if reason == "ProvisioningFailed" or "exceeded quota" in message:
+            what = "storage quota exceeded" if "exceeded quota" in message else "the volume cannot be provisioned"
+            out[name] = f"Volume claim {name} is stuck Pending, {what} ({reason}): {message}".strip().removesuffix(":")
+    return out
+
+
+def explain(snap: Snapshot, unschedulable: UnschedulableSince | None = None) -> str | None:
+    """A readable reason when the namespace cannot become ready, else None.
+
+    Without ``unschedulable`` an unschedulable pod is a failure at once.
+    """
     for pod in snap.pods:
         if pod.waiting_reason in _FATAL_WAITING:
             return f"Pod {pod.name}: {_FATAL_WAITING[pod.waiting_reason]} ({pod.waiting_reason})"
         if pod.waiting_reason == "CrashLoopBackOff" and pod.restarts >= 2:
             return f"Pod {pod.name}: the container keeps crashing (CrashLoopBackOff, {pod.restarts} restarts)"
-        if pod.unschedulable:
-            return f"Pod {pod.name} cannot be scheduled, the cluster has no capacity: {pod.message or ''}".strip()
+    if unschedulable is not None:
+        stuck = unschedulable.overdue(snap)
+    else:
+        stuck = next((pod for pod in snap.pods if pod.unschedulable), None)
+    if stuck is not None:
+        return unschedulable_reason(stuck)
+    if unschedulable is not None:
+        pvc_reason = unschedulable.pvc_overdue(snap)
+    else:
+        pvc_reason = next(iter(_stuck_pvcs(snap).values()), None)
+    if pvc_reason is not None:
+        return pvc_reason
     for event in snap.events:
         if event.reason == "FailedCreate" and "exceeded quota" in event.message:
             return f"{event.object}: resource quota exceeded: {event.message}"
@@ -191,9 +290,12 @@ def wait_until(
 ) -> Snapshot:
     """Poll the namespace until ``done``; raise with a readable reason on a fatal state or timeout.
 
-    A cancel of the job ends the wait (``JobCancelled``) at every poll.
+    A pod may be unschedulable for ``K8S_UNSCHEDULABLE_GRACE_SECONDS`` before
+    that counts as fatal. A cancel of the job ends the wait (``JobCancelled``)
+    at every poll.
     """
-    deadline = time.monotonic() + timeout
+    deadline = _clock() + timeout
+    unschedulable = UnschedulableSince(settings.K8S_UNSCHEDULABLE_GRACE_SECONDS)
     while True:
         job_runtime.check_cancelled()
         snap = kube.snapshot(namespace)
@@ -201,11 +303,13 @@ def wait_until(
             raise RuntimeError("the namespace disappeared while waiting (the deployment was cancelled or destroyed)")
         if done(snap):
             return snap
-        reason = explain(snap) if check_failure else None
+        reason = explain(snap, unschedulable) if check_failure else None
         if reason:
             raise RuntimeError(reason)
-        if time.monotonic() > deadline:
-            raise RuntimeError(f"timed out after {int(timeout)} s waiting for {what}")
+        if _clock() > deadline:
+            stuck = next((pod for pod in snap.pods if pod.unschedulable), None) if check_failure else None
+            detail = f" ({unschedulable_reason(stuck)})" if stuck is not None else ""
+            raise RuntimeError(f"timed out after {int(timeout)} s waiting for {what}{detail}")
         sleep(settings.K8S_POLL_INTERVAL_SECONDS)
 
 
@@ -248,8 +352,9 @@ def _binding(dep: DeploymentCtx, name: str, cluster_role: str, account: str, nam
     }
 
 
-def _bootstrap_objects(dep: DeploymentCtx) -> list[dict[str, Any]]:
-    """RoleBindings in the new namespace: the deployer's own rights there, and read access for the API."""
+def _bootstrap_objects(dep: DeploymentCtx, *, vnc_proxy: bool = False) -> list[dict[str, Any]]:
+    """RoleBindings in the new namespace: the deployer's own rights there, read access for the API,
+    and for a kubevirt-vm namespace the noVNC proxy's right to open its VM's VNC stream."""
     objects = [
         _binding(
             dep,
@@ -269,17 +374,21 @@ def _bootstrap_objects(dep: DeploymentCtx) -> list[dict[str, Any]]:
                 settings.K8S_API_NAMESPACE or settings.K8S_WORKER_NAMESPACE,
             )
         )
+    if vnc_proxy:
+        objects.append(
+            _binding(dep, "appstore-vnc-proxy", settings.K8S_VNC_PROXY_CLUSTER_ROLE, VNC_PROXY_ACCOUNT, dep.namespace)
+        )
     return objects
 
 
 def _file_contents(user_vars: dict[str, Any], spec: AppSpec) -> dict[str, dict[str, bytes]]:
-    """Uploaded files per file variable as ``{slot: bytes}``, from ``userInputVar.terraform``.
+    """Uploaded files per file variable as ``{slot: bytes}``, from the variable block of ``userInputVar`` (``variables``, or the legacy ``terraform``).
 
     The API stores a team-scoped file variable with each slot wrapped as
     ``{"uploaded": file}`` (the shape a VM app's HCL ``map(map(object))``
     needs); both shapes are read, so no team's file is silently dropped.
     """
-    terraform = user_vars.get("terraform") or {}
+    terraform = user_input_variables(user_vars)
     out: dict[str, dict[str, bytes]] = {}
     for v in spec.variables:
         if v.type != "file":
@@ -292,7 +401,10 @@ def _file_contents(user_vars: dict[str, Any], spec: AppSpec) -> dict[str, dict[s
             if isinstance(entry, dict) and isinstance(entry.get("uploaded"), dict):
                 entry = entry["uploaded"]
             if isinstance(entry, dict) and "content_b64" in entry:
-                files[slot] = base64.b64decode(entry["content_b64"])
+                data = base64.b64decode(entry["content_b64"])
+                # Mounted only if the API sealed it after its checks (.github#13, 3.7).
+                upload_mac.verify(v.name, slot, entry, data)
+                files[slot] = data
         out[v.name] = files
     return out
 
@@ -334,12 +446,32 @@ def build_outputs(spec: AppSpec, dep: DeploymentCtx, teams: list[Team], password
     }
 
 
+def _delete_clone_grants(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
+    """Remove the deployment's ReferenceGrants from the image namespaces; best effort, never raises.
+
+    They live outside the deployment's namespace. The name derives from the deployment id, so
+    this also works after the namespace is gone; deleting a grant that does not exist is a
+    no-op. A failure (403, API hiccup) only leaves a grant behind that names a namespace that
+    no longer exists, which the orphan sweep can clean up; it must never block a destroy.
+    """
+    for image_namespace in limits().vm_image_namespaces:
+        try:
+            kube.delete_object(REFERENCE_GRANT_API, "ReferenceGrant", image_namespace, vm_clone_grant_name(dep))
+        except Exception as e:
+            logger.warning(
+                f"Could not remove the clone grant {vm_clone_grant_name(dep)} in {image_namespace}: {e}",
+                category=LogCategory.WARNING,
+            )
+
+
 def _cleanup_after_failure(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
     try:
         snap = kube.snapshot(dep.namespace)
         if snap.exists and snap.belongs_to(dep.id):
             kube.delete_namespace(dep.namespace)
             logger.info(f"Removed {dep.namespace} after the failure", category=LogCategory.OPERATION)
+            if snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+                _delete_clone_grants(kube, dep, logger)
     except Exception as e:  # best effort; the failure being reported is the original one
         logger.warning(f"Could not remove {dep.namespace}: {e}", category=LogCategory.WARNING)
 
@@ -388,7 +520,7 @@ def deploy_application(
             render_settings(),
             passwords,
             files=_file_contents(user_vars, app),
-            variable_values=user_vars.get("terraform") or {},
+            variable_values=user_input_variables(user_vars),
         )
         # Pure, like render: a bad access template fails before anything exists.
         outputs = build_outputs(app, dep, team_list, passwords)
@@ -419,6 +551,87 @@ def deploy_application(
     return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
 
 
+def _vm_all_ready(expected: set[str]) -> Callable[[Snapshot], bool]:
+    """Every VM is Running and its noVNC proxy is ready, so the link that is shown works."""
+    novnc_names = {f"{name}-novnc" for name in expected}
+
+    def check(snap: Snapshot) -> bool:
+        for vmi in snap.vmis:
+            if vmi.phase in ("Failed", "Unknown"):
+                raise RuntimeError(f"the VM {vmi.name} is {vmi.phase}")
+        proxies = {d.name for d in snap.deployments if d.replicas >= 1 and d.ready_replicas >= 1}
+        running = {v.name for v in snap.vmis if v.phase == "Running" and v.ready}
+        proxy_pods = all(p.ready for p in snap.pods if p.workload in novnc_names)
+        return novnc_names <= proxies and expected <= running and proxy_pods
+
+    return check
+
+
+@celery_app.task(bind=True, base=JobTask, name="pods.deploy_vm_application")
+def deploy_vm_application(
+    self,
+    deployment_id: str,
+    user_vars: dict[str, Any] | None = None,
+    teams: dict[str, list] | None = None,
+    commit_sha: str | None = None,
+    spec: dict[str, Any] | None = None,
+    owner: str = "",
+    **_: Any,
+) -> dict[str, Any]:
+    """Deploy a kubevirt-vm app: namespace, PVC clone, VirtualMachine, noVNC proxy, wait."""
+    job = _Job(self, "deploy_vm", deployment_id, PHASES_DEPLOY)
+    dep = DeploymentCtx(id=deployment_id, owner=owner)
+    kube: Kube | None = None
+    user_vars = user_vars or {}
+    try:
+        job.mark(PHASE_STARTING, "Starting")
+        job.mark(PHASE_SPEC_LOAD, "Validating appstore.yaml")
+        try:
+            app = parse_spec(spec or {}, limits())
+        except SpecValidationError as e:
+            raise RuntimeError(f"appstore.yaml is invalid: {e}") from None
+        if app.runtime != "kubevirt-vm":
+            raise RuntimeError("the spec is not a kubevirt-vm app")
+        team_list = _teams(teams or {})
+        refs = workload_refs(app, team_list)
+        if not refs:
+            raise RuntimeError("the deployment has no teams or members to run workloads for")
+        if len(refs) > settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT:
+            raise RuntimeError(f"{len(refs)} workloads exceed the limit of {settings.K8S_MAX_WORKLOADS_PER_DEPLOYMENT}")
+        passwords = {r.name: secrets.token_urlsafe(16) for r in refs}
+        objects = render_vm(app, dep, team_list, render_settings(), passwords)
+        outputs = build_outputs(app, dep, team_list, passwords)
+        kube = _kube_factory()
+
+        job.mark(PHASE_NAMESPACE, f"Creating namespace {dep.namespace}")
+        _owned_snapshot(kube, dep, must_exist=False)
+        kube.apply(objects[0])  # namespace first
+        for obj in _bootstrap_objects(dep, vnc_proxy=True):
+            kube.apply(obj)
+        job.mark(PHASE_POLICIES, "Applying network policies")
+        policy_kinds = {"ResourceQuota", "NetworkPolicy"}
+        for obj in (o for o in objects if o["kind"] in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_APPLY, f"Applying {len(refs)} VM workload(s)")
+        for obj in (o for o in objects[1:] if o["kind"] not in policy_kinds):
+            kube.apply(obj)
+        job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot and the noVNC proxy to become ready")
+        wait_until(
+            kube,
+            dep.namespace,
+            _vm_all_ready({r.name for r in refs}),
+            settings.K8S_VM_READY_TIMEOUT_SECONDS,
+            "the VM and its noVNC proxy",
+        )
+        job.mark(PHASE_OUTPUTS, "Collecting access data")
+        job.logger.success(f"VM deployment {deployment_id} is running in {dep.namespace}", category=LogCategory.STATUS)
+    except Exception as e:
+        if kube is not None:
+            _cleanup_after_failure(kube, dep, job.logger)
+        raise job.failure(e) from None
+    return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
+
+
 @celery_app.task(bind=True, base=JobTask, name="pods.destroy_deployment")
 def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     """Delete the namespace (which removes everything in it) and wait until it is gone."""
@@ -431,6 +644,11 @@ def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         snap = _owned_snapshot(kube, dep, must_exist=False)
         if snap.exists:
             kube.delete_namespace(dep.namespace)
+        # After the namespace (a failing grant must not keep it alive) and also when it is
+        # already gone (an earlier destroy may have died between the two). A pod deployment's
+        # namespace is known not to have grants.
+        if not snap.exists or snap.labels.get(VM_NAMESPACE_LABEL) == "true":
+            _delete_clone_grants(kube, dep, job.logger)
         job.mark(PHASE_WAIT_GONE, "Waiting for the namespace to disappear")
         wait_until(
             kube,
@@ -450,9 +668,37 @@ def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     return job.result(terraform_outputs={})
 
 
+def _is_vm_namespace(snap: Snapshot) -> bool:
+    return snap.labels.get(VM_NAMESPACE_LABEL) == "true"
+
+
+def _stop_vms(kube: Kube, dep: DeploymentCtx, snap: Snapshot) -> None:
+    """Halt the VMs and scale the noVNC proxies to 0.
+
+    Both are patches the pod deployer is allowed to make (``virtualmachines`` and ``deployments``
+    patch; the admission policy admits ``runStrategy`` and at most one replica). A VMI is never
+    deleted: KubeVirt removes it itself once the VM is Halted.
+    """
+    for vm in snap.virtual_machines:
+        kube.set_run_strategy(dep.namespace, vm.name, "Halted")
+    for d in snap.deployments:
+        kube.scale_deployment(dep.namespace, d.name, 0)
+
+
+def _start_vms(kube: Kube, dep: DeploymentCtx, snap: Snapshot, vms: set[str]) -> None:
+    for name in sorted(vms):
+        kube.set_run_strategy(dep.namespace, name, "Always")
+    for d in snap.deployments:
+        kube.scale_deployment(dep.namespace, d.name, 1)
+
+
 @celery_app.task(bind=True, base=JobTask, name="pods.pause_deployment")
 def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
-    """Scale every workload to zero; volumes and secrets stay, so resume brings the data back."""
+    """Scale every workload to zero; volumes and secrets stay, so resume brings the data back.
+
+    kubevirt-vm: every VirtualMachine gets ``runStrategy: Halted`` (KubeVirt then removes the VMI
+    and the virt-launcher pod; the disk claim stays) and every noVNC proxy is scaled to 0.
+    """
     job = _Job(self, "pause", deployment_id, PHASES_PAUSE)
     dep = DeploymentCtx(id=deployment_id)
     try:
@@ -462,6 +708,8 @@ def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         snap = _owned_snapshot(kube, dep)
         for s in snap.statefulsets:
             kube.scale(dep.namespace, s.name, 0)
+        if _is_vm_namespace(snap):
+            _stop_vms(kube, dep, snap)
         job.mark(PHASE_WAIT_STOPPED, "Waiting for the pods to stop")
         wait_until(kube, dep.namespace, lambda s: not s.pods, settings.K8S_DELETE_TIMEOUT_SECONDS, "the pods to stop")
         job.logger.success("Paused", category=LogCategory.STATUS)
@@ -480,6 +728,21 @@ def resume_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
         kube = _kube_factory()
         job.mark(PHASE_SCALE_UP, "Starting the workloads")
         snap = _owned_snapshot(kube, dep)
+        if _is_vm_namespace(snap):
+            vms = {vm.name for vm in snap.virtual_machines}
+            if not vms:
+                raise RuntimeError(f"namespace {dep.namespace} has no VirtualMachines to start")
+            _start_vms(kube, dep, snap, vms)
+            job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot and the noVNC proxy to become ready")
+            wait_until(
+                kube,
+                dep.namespace,
+                _vm_all_ready(vms),
+                settings.K8S_VM_READY_TIMEOUT_SECONDS,
+                "the VM and its noVNC proxy",
+            )
+            job.logger.success("Resumed", category=LogCategory.STATUS)
+            return job.result(terraform_outputs={})
         names = {s.name for s in snap.statefulsets}
         for name in names:
             kube.scale(dep.namespace, name, 1)
@@ -489,6 +752,38 @@ def resume_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     except Exception as e:
         raise job.failure(e) from None
     return job.result(terraform_outputs={})
+
+
+def _restart_vm(job: _Job, kube: Kube, dep: DeploymentCtx, snap: Snapshot, workload: str, reset: bool) -> None:
+    """Restart one VM: Halted, wait until its VMI and pod are gone, Always, wait until it is ready.
+
+    The deployer may not delete a VirtualMachineInstance (admission policy, RBAC: read only), so
+    this is the only restart it has; the disk and so the guest's data stay. Resetting the disk
+    (re-clone of the golden image) is not supported for VMs.
+    """
+    if reset:
+        raise RuntimeError("reset is not supported for VM deployments")
+    if workload not in {vm.name for vm in snap.virtual_machines}:
+        raise RuntimeError(f"unknown workload {workload!r}")
+    job.mark(PHASE_RESTART, f"Restarting {workload}")
+    kube.set_run_strategy(dep.namespace, workload, "Halted")
+    wait_until(
+        kube,
+        dep.namespace,
+        lambda s: not any(v.name == workload for v in s.vmis) and not any(p.workload == workload for p in s.pods),
+        settings.K8S_DELETE_TIMEOUT_SECONDS,
+        "the VM to stop",
+    )
+    kube.set_run_strategy(dep.namespace, workload, "Always")
+    job.mark(PHASE_WAIT_READY, "Waiting for the VM to boot")
+    wait_until(
+        kube,
+        dep.namespace,
+        _vm_all_ready({workload}),
+        settings.K8S_VM_READY_TIMEOUT_SECONDS,
+        "the VM",
+    )
+    job.logger.success(f"{workload} is running again", category=LogCategory.STATUS)
 
 
 @celery_app.task(bind=True, base=JobTask, name="pods.redeploy_resource")
@@ -509,6 +804,9 @@ def redeploy_resource(self, deployment_id: str, resource_address: str | None = N
             raise RuntimeError(f"invalid workload name {workload!r}")
         kube = _kube_factory()
         snap = _owned_snapshot(kube, dep)
+        if _is_vm_namespace(snap):
+            _restart_vm(job, kube, dep, snap, workload, reset)
+            return job.result(terraform_outputs={})
         if workload not in {s.name for s in snap.statefulsets}:
             raise RuntimeError(f"unknown workload {workload!r}")
         old_pods = {p.name: p.uid for p in snap.pods if p.workload == workload}

@@ -27,60 +27,39 @@ def _fernet_key_problem(key: str) -> str | None:
 
 
 class Settings(BaseSettings):
-    # "development" allows the published test keys and any https Keystone
-    # when OPENSTACK_ALLOWED_AUTH_URLS is empty; anything else is production
-    # and refuses to start with a test key (.github#7 O).
+    # "development" allows the published test keys; anything else is
+    # production and refuses to start with a test key (.github#7 O).
     APP_ENV: Literal["development", "production"] = "production"
 
     # Database (.github#5): the worker's own role ``appstore_worker`` on the
     # application database. It may use the task queue, append task events
     # and write the result columns of ``tasks``, nothing else (no users, no
-    # credentials). Tool subprocesses never see it (``job_context``).
+    # credentials).
     DATABASE_URL: str
 
     # Celery broker: the ``pgq`` transport on that database. Empty means
     # ``pgq+`` + DATABASE_URL.
     CELERY_BROKER_URL: str = ""
 
-    # Worker settings
-    TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
-
-    # OpenTofu/Packer paths (installed in container)
-    TOFU_PATH: str = "/usr/local/bin/tofu"
-    PACKER_PATH: str = "/usr/local/bin/packer"
-    # TF_LOG for OpenTofu (e.g. DEBUG); off by default, it drowns the errors.
-    WORKER_TF_LOG: str = ""
-
     # Fernet keys shared with the backend (``utils.crypto``), at least one:
-    # CREDENTIAL_ENCRYPTION_KEY decrypts what the API sends a VM job (the
-    # OpenStack credential envelope, the state token), so only the VM
-    # executor gets it; RESULTS_ENCRYPTION_KEY seals a task's results
-    # (``tasks.outputs_enc``), the only key the pod deployer gets. Without it
-    # the credential key seals the results (as before).
+    # RESULTS_ENCRYPTION_KEY seals a task's results (``tasks.outputs_enc``).
+    # Without it the CREDENTIAL_ENCRYPTION_KEY seals them (as before; kept
+    # until the API has dropped its credential key as well).
     CREDENTIAL_ENCRYPTION_KEY: str = ""
     RESULTS_ENCRYPTION_KEY: str = ""
-
-    # The API as the worker reaches it (internal service URL, no /api
-    # prefix). OpenTofu keeps each VM deployment's state there, through the
-    # API's HTTP state backend, authenticated with the task's own token.
-    APPSTORE_API_URL: str = "http://localhost:8000"
-
-    # Keystone URLs a credential may point to, comma-separated; same
-    # setting as the API (.github#7 C). Empty: in development any https
-    # URL, in production none.
-    OPENSTACK_ALLOWED_AUTH_URLS: str = ""
-
-    # Git: app repositories are public and fetched anonymously, only from
-    # these hosts (comma-separated, exact names; the API checks the same
-    # list, .github#7 B).
-    APP_GIT_ALLOWED_HOSTS: str = "github.com"
+    # Every uploaded file must carry the API's seal (``upload_mac``). Switch off
+    # only while deployments from before the seal existed still have to be
+    # redeployed; a file with a seal that does not match is refused either way.
+    UPLOAD_MAC_REQUIRED: bool = True
 
     # Pod apps (.github#4; the pod deployer, queue "pods") ------------------
     # Platform limits for an appstore.yaml: same settings as the API's.
-    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/"
+    APP_IMAGE_REGISTRY_ALLOWLIST: str = "ghcr.io/dhbw-appstore-t3/apps/"
     APP_MAX_CPU: str = "2"
     APP_MAX_MEMORY: str = "4Gi"
     APP_MAX_STORAGE: str = "20Gi"
+    # Namespaces a kubevirt-vm may clone its golden image from (comma separated).
+    APP_VM_IMAGE_NAMESPACES: str = "vm-poc"
     K8S_MAX_WORKLOADS_PER_DEPLOYMENT: int = 60
     # App hosts are <workload>-<deployment>.<K8S_APP_DOMAIN or apps.<K8S_ZONE>>.
     K8S_ZONE: str = ""
@@ -99,6 +78,11 @@ class Settings(BaseSettings):
     K8S_POLL_INTERVAL_SECONDS: float = 3.0
     K8S_READY_TIMEOUT_SECONDS: int = 600
     K8S_DELETE_TIMEOUT_SECONDS: int = 300
+    # kubevirt-vm deployments (deploy, resume, restart): the PVC clone and Windows' first boot take minutes.
+    K8S_VM_READY_TIMEOUT_SECONDS: int = 1200
+    # A pod may be unschedulable this long before a wait fails (.github#8): a
+    # StatefulSet's new pod is, until its volume claim exists and is bound.
+    K8S_UNSCHEDULABLE_GRACE_SECONDS: int = 60
     # The deployer's rights in each namespace it creates (a RoleBinding to
     # this ClusterRole), and read access there for the API's account.
     K8S_DEPLOYER_CLUSTER_ROLE: str = "appstore-deployer"
@@ -107,6 +91,10 @@ class Settings(BaseSettings):
     K8S_API_SERVICE_ACCOUNT: str = ""
     K8S_API_NAMESPACE: str = ""
     K8S_READER_CLUSTER_ROLE: str = "appstore-reader"
+    # Bound to the noVNC proxy's service account in each kubevirt-vm namespace (VNC subresource only).
+    K8S_VNC_PROXY_CLUSTER_ROLE: str = "appstore-vnc-proxy"
+    # Image of the noVNC proxy deployment of each kubevirt-vm workload.
+    K8S_VNC_PROXY_IMAGE: str = "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
     # The installation this worker belongs to (e.g. its namespace), where
     # several share one cluster: set as a label on every namespace it
     # creates; the admission policy lets it touch only those.
@@ -124,15 +112,14 @@ class Settings(BaseSettings):
     # Upper bound of one job (Celery soft time limit; the hard limit is
     # five minutes later).
     WORKER_JOB_TIMEOUT_SECONDS: int = 7200
-    # When set, worker slot n runs its tools as UID/GID base+n (.github#7 A,
-    # ``job_context``); the worker itself must run as root then.
-    WORKER_JOB_UID_BASE: int | None = None
-    # Homes of the slot users (plugin caches survive from job to job).
-    WORKER_JOB_HOME_BASE: str = "/var/lib/appstore-worker"
     # Touched every 30 s by the worker's main process; the container
     # healthcheck reads its age (``celery inspect ping`` needs remote
     # control, which the pgq transport does not have).
     WORKER_HEARTBEAT_FILE: str = "/tmp/worker-heartbeat"
+
+    # Local development without a Kubernetes cluster: pod jobs run against
+    # FakeKube instead of the real API server. Only allowed in development.
+    WORKER_SIMULATE: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -163,6 +150,8 @@ class Settings(BaseSettings):
                 raise ValueError(f"unsafe production configuration: {name} is a published test key")
         if not self.is_development and self.RESULTS_ENCRYPTION_KEY == self.CREDENTIAL_ENCRYPTION_KEY:
             raise ValueError("unsafe production configuration: RESULTS_ENCRYPTION_KEY is the credential key")
+        if self.WORKER_SIMULATE and not self.is_development:
+            raise ValueError("WORKER_SIMULATE requires APP_ENV=development")
         return self
 
     @property

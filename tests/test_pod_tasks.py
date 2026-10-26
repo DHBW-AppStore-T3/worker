@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import threading
 import uuid
 
 import pytest
 
-from app import job_runtime, pod_tasks
+from app import job_runtime, pod_tasks, upload_mac
 from app.config import settings
 from app.failure import Failure
 from app.k8s.fake import FakeKube
@@ -73,7 +74,10 @@ def cluster(monkeypatch):
     monkeypatch.setattr(settings, "K8S_WORKER_NAMESPACE", "appstore-staging")
     monkeypatch.setattr(settings, "K8S_POLL_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 5)
+    # An unschedulable pod fails at once here; the grace period has tests of its own.
+    monkeypatch.setattr(settings, "K8S_UNSCHEDULABLE_GRACE_SECONDS", 0)
     kube = FakeKube()
     monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
     return kube
@@ -84,6 +88,7 @@ def events(monkeypatch):
     recorder = Events()
     for task in (
         pod_tasks.deploy_application,
+        pod_tasks.deploy_vm_application,
         pod_tasks.destroy_deployment,
         pod_tasks.pause_deployment,
         pod_tasks.resume_deployment,
@@ -266,12 +271,80 @@ def test_the_api_gets_read_access_to_the_namespace_when_configured(cluster, monk
     assert bindings["appstore-api-reader"]["subjects"][0]["name"] == "appstore-api"
 
 
+@pytest.fixture(autouse=True)
+def _results_key(monkeypatch):
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "test-results-key")
+
+
+@pytest.mark.parametrize("mac", ["\u00e4" * 64, 123, ["x"]])
+def test_malformed_seals_are_refused_not_crashing(mac):
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {"name": "a.zip", "mac": mac}, b"x")
+
+
+def test_without_a_key_nothing_is_verified(monkeypatch):
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "")
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "")
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {"name": "a.zip", "mac": "0" * 64}, b"x")
+
+
+def sealed(variable: str, slot: str, name: str, data: bytes) -> dict:
+    """A stored file the way the API writes it, including its seal."""
+    return {
+        "name": name,
+        "content_b64": base64.b64encode(data).decode(),
+        "size": len(data),
+        "content_type": "application/zip",
+        "mac": upload_mac.sign(variable, slot, name, data),
+    }
+
+
+@pytest.mark.parametrize("tamper", ["bytes", "name", "slot", "no_mac", "foreign_mac"])
+def test_a_file_the_api_did_not_seal_is_never_mounted(cluster, tamper):
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    entry = sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")
+    slot = "Team-1"
+    if tamper == "bytes":
+        entry["content_b64"] = base64.b64encode(b"MZ\x90\x00").decode()
+    elif tamper == "name":
+        entry["name"] = "b.zip"
+    elif tamper == "slot":
+        slot = "Team-2"
+    elif tamper == "no_mac":
+        del entry["mac"]
+    else:
+        entry["mac"] = "0" * 64
+
+    with pytest.raises(Failure) as failed:
+        deploy(spec=spec, user_vars={"terraform": {"assignment": {slot: entry}}})
+
+    assert "not validated by the API" in str(failed.value)
+    assert not [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
+def test_unsealed_files_of_older_deployments_pass_only_when_allowed(cluster, monkeypatch):
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    legacy = {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4}
+    monkeypatch.setattr(settings, "UPLOAD_MAC_REQUIRED", False)
+
+    deploy(spec=spec, user_vars={"terraform": {"assignment": {"Team-1": legacy}}})
+
+    assert [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
 def test_uploaded_files_reach_exactly_their_workloads(cluster):
     spec = copy.deepcopy(SPEC)
     spec["variables"] = [
         {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
     ]
-    user_vars = {"terraform": {"assignment": {"Team-1": {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4}}}}
+    user_vars = {"terraform": {"assignment": {"Team-1": sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")}}}
 
     deploy(spec=spec, user_vars=user_vars)
 
@@ -290,7 +363,7 @@ def test_team_files_in_the_shape_the_api_stores_them_reach_the_workloads(cluster
     spec["variables"] = [
         {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
     ]
-    stored = {"name": "a.zip", "content_b64": "UEsDBA==", "size": 4, "content_type": "application/zip"}
+    stored = sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")
     user_vars = {"terraform": {"assignment": {"Team-1": {"uploaded": stored}}}}
 
     deploy(spec=spec, user_vars=user_vars)
@@ -363,6 +436,104 @@ def test_reset_waits_until_the_volume_is_really_gone(cluster):
     assert seen_scale_up_with_pvc == []
 
 
+# --- unschedulable pods (.github#8) -------------------------------------------
+MISSING_CLAIM = '0/1 nodes are available: persistentvolumeclaim "data-team-1-ben-0" not found.'
+
+
+class VolumeLateKube(FakeKube):
+    """Every new pod is unschedulable for its first ``polls`` snapshots, as a
+    StatefulSet's pod is until its volume claim exists and is bound."""
+
+    def __init__(self, polls: int, message: str = MISSING_CLAIM):
+        super().__init__()
+        self.polls = polls
+        self.message = message
+        self._seen: dict[str, int] = {}
+
+    def snapshot(self, namespace):
+        snap = super().snapshot(namespace)
+        for pod in snap.pods:
+            seen = self._seen[pod.uid] = self._seen.get(pod.uid, 0) + 1
+            if seen <= self.polls:
+                pod.unschedulable, pod.ready, pod.phase, pod.message = True, False, "Pending", self.message
+        return snap
+
+
+class Clock:
+    """A clock that moves ``step`` seconds every time it is read."""
+
+    def __init__(self, step: float):
+        self.now, self.step = 0.0, step
+
+    def __call__(self) -> float:
+        self.now += self.step
+        return self.now
+
+
+@pytest.fixture
+def volume_late(monkeypatch):
+    def make(polls, message=MISSING_CLAIM, grace=60, step=5):
+        kube = VolumeLateKube(polls, message)
+        monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+        monkeypatch.setattr(pod_tasks, "_clock", Clock(step))
+        monkeypatch.setattr(settings, "K8S_UNSCHEDULABLE_GRACE_SECONDS", grace)
+        monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 600)
+        return kube
+
+    return make
+
+
+def test_pods_waiting_for_their_volume_are_no_failure(volume_late):
+    kube = volume_late(polls=3)
+
+    assert deploy()["status"] == "success"
+    assert kube.deployment_label(NS) == DEP
+
+
+def test_a_pod_unschedulable_past_the_grace_period_fails_the_deploy(volume_late):
+    kube = volume_late(polls=10**6)
+
+    with pytest.raises(Failure, match="is still waiting for its volume"):
+        deploy()
+    kube.snapshot(NS)
+    kube.snapshot(NS)
+    assert NS not in kube.namespace_labels
+
+
+def test_reset_survives_the_new_pod_waiting_for_its_volume(volume_late):
+    kube = volume_late(polls=3)
+    deploy()
+
+    result = pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
+
+    assert result["status"] == "success"
+    assert kube.deleted_pvcs == [(NS, "team-1-ben")]
+
+
+def test_a_timeout_names_the_pod_that_cannot_be_scheduled(volume_late):
+    volume_late(polls=10**6, message="0/1 nodes are available: 1 Insufficient memory.", grace=10**6)
+
+    with pytest.raises(Failure, match=r"timed out after 600 s waiting for the pods \(Pod .* no capacity"):
+        deploy()
+
+
+@pytest.mark.parametrize(
+    ("message", "text"),
+    [
+        (MISSING_CLAIM, "is still waiting for its volume"),
+        ("0/1 nodes are available: pod has unbound immediate PersistentVolumeClaims.", "waiting for its volume"),
+        ("0/1 nodes are available: 1 Insufficient cpu.", "the cluster has no capacity"),
+        ("0/1 nodes are available: 1 Too many pods.", "the cluster has no capacity"),
+        ("0/2 nodes are available: 2 node(s) had untolerated taint {a: b}.", "no node matches its placement"),
+        ("0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.", "no node matches"),
+        ("something new", "cannot be scheduled: something new"),
+    ],
+)
+def test_unschedulable_reasons_are_told_apart(message, text):
+    pod = pod_tasks.PodInfo(name="team-1-ben-0", workload="team-1-ben", unschedulable=True, message=message)
+    assert text in pod_tasks.unschedulable_reason(pod)
+
+
 class _CancelledJob:
     """Stands in for the running job of ``job_runtime``; ``cancelled`` is set when ``when()`` holds."""
 
@@ -395,3 +566,368 @@ def test_a_cancel_before_anything_is_created_creates_nothing(cluster, monkeypatc
     with pytest.raises(job_runtime.JobCancelled):
         deploy()
     assert cluster.objects == {}
+
+
+def test_worker_simulate_singleton_persists_across_tasks(events, monkeypatch):
+    """Regression test: WORKER_SIMULATE must reuse the same FakeKube across tasks."""
+    sim_kube = FakeKube()
+    monkeypatch.setattr(settings, "WORKER_SIMULATE", True)
+    monkeypatch.setattr(settings, "K8S_ZONE", "")
+    monkeypatch.setattr(pod_tasks, "_sim_kube", sim_kube)
+    monkeypatch.setattr(pod_tasks, "_kube_factory", pod_tasks._default_kube)
+
+    result = deploy()
+    assert result["status"] == "success"
+    assert NS in sim_kube.namespace_labels
+    for account in accounts_of(result).values():
+        assert account["url"].endswith(".apps.localhost")
+    assert pod_tasks.pause_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.resume_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
+    assert NS not in sim_kube.namespace_labels
+
+
+def test_default_kube_uses_real_client_when_not_simulating(monkeypatch):
+    monkeypatch.setattr(settings, "WORKER_SIMULATE", False)
+    sentinel = object()
+    monkeypatch.setattr(pod_tasks, "KubeApi", lambda: sentinel)
+
+    assert pod_tasks._default_kube() is sentinel
+
+
+# --- kubevirt-vm -------------------------------------------------------------
+VM_SPEC = {
+    "apiVersion": "appstore/v2",
+    "name": "windows-matlab-app",
+    "runtime": "kubevirt-vm",
+    "scope": "user",
+    "vm": {"cpuCores": 4, "memoryGiB": 8, "diskGiB": 90, "imageRef": "windows11-matlab-golden"},
+    "egress": "internet",
+    "access": [
+        {"type": "url", "template": "https://{workload}-{deployment}.apps.{zone}"},
+        {"type": "password", "from": "generated-password", "username": "{user}"},
+    ],
+}
+VM_TEAMS = {"Team-1": [member("anna.b")]}
+
+
+@pytest.fixture
+def image_namespace(cluster):
+    """The namespace that holds the golden image exists in the cluster before any deployment."""
+    cluster.namespace_labels["vm-poc"] = {}
+    return "vm-poc"
+
+
+def deploy_vm(spec=VM_SPEC, teams=VM_TEAMS):
+    return pod_tasks.deploy_vm_application.run(
+        DEP, user_vars={}, teams=teams, commit_sha="c" * 40, spec=spec, owner=uid("teacher")
+    )
+
+
+def grants(kube):
+    return [key for key in kube.objects if key[0] == "ReferenceGrant"]
+
+
+def test_a_vm_deploy_waits_for_the_vm_and_its_proxy_and_grants_the_clone(cluster, events, image_namespace):
+    deploy_vm()
+
+    assert grants(cluster) == [("ReferenceGrant", f"clone-{NS}", "vm-poc", "gateway.networking.k8s.io/v1beta1")]
+    assert {"VirtualMachine", "Deployment", "PersistentVolumeClaim", "ServiceAccount", "RoleBinding"} <= set(
+        cluster.kinds(NS)
+    )
+    bindings = {
+        obj["metadata"]["name"]: obj
+        for (kind, _name, ns, _v), obj in cluster.objects.items()
+        if kind == "RoleBinding" and ns == NS
+    }
+    proxy = bindings["appstore-vnc-proxy"]
+    assert proxy["roleRef"]["name"] == settings.K8S_VNC_PROXY_CLUSTER_ROLE
+    assert proxy["subjects"] == [{"kind": "ServiceAccount", "name": "vnc-proxy", "namespace": NS}]
+
+
+def test_a_vm_deploy_fails_when_the_vm_never_becomes_ready(cluster, events, image_namespace, monkeypatch):
+    monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 600)  # the VM timeout counts here
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
+    cluster.ready_after_polls = 10**6
+
+    with pytest.raises(Failure, match="timed out"):
+        deploy_vm()
+
+    # The failed deployment leaves neither its namespace nor its grant behind.
+    cluster.snapshot(NS)
+    assert grants(cluster) == []
+
+
+def test_destroying_a_vm_deployment_removes_its_grant_in_the_image_namespace(cluster, events, image_namespace):
+    deploy_vm()
+    assert grants(cluster)
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert grants(cluster) == []
+    assert cluster.snapshot(NS).exists is False
+
+
+def test_a_pod_deployment_touches_no_image_namespace(cluster, events):
+    deploy()
+    pod_tasks.destroy_deployment.run(DEP)
+    assert grants(cluster) == []
+
+
+# --- kubevirt-vm: pause, resume, restart ------------------------------------
+VM = "team-1-anna-b"
+PROXY = f"{VM}-novnc"
+
+
+def vm_strategy(kube):
+    obj = next(o for (k, n, ns, _v), o in kube.objects.items() if k == "VirtualMachine" and ns == NS)
+    return obj["spec"]["runStrategy"]
+
+
+def test_pausing_a_vm_halts_it_and_scales_its_proxy_to_zero(cluster, events, image_namespace):
+    deploy_vm()
+    assert vm_strategy(cluster) == "Always" and len(cluster.snapshot(NS).pods) == 2
+
+    result = pod_tasks.pause_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies == [(NS, VM, "Halted")]
+    assert cluster.deployment_scales == [(NS, PROXY, 0)]
+    snap = cluster.snapshot(NS)
+    assert snap.pods == [] and snap.vmis == []
+    assert [(v.name, v.run_strategy) for v in snap.virtual_machines] == [(VM, "Halted")]
+    assert "PersistentVolumeClaim" in cluster.kinds(NS)  # the disk stays
+
+
+def test_pausing_a_vm_waits_until_its_pods_are_gone(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.stop_polls = 3
+
+    pod_tasks.pause_deployment.run(DEP)
+
+    assert cluster.snapshot(NS).pods == []
+
+
+def test_a_pause_that_leaves_pods_behind_fails(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    cluster.stop_polls = 10**6
+    monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        pod_tasks.pause_deployment.run(DEP)
+
+
+def test_resuming_a_vm_starts_it_and_its_proxy_and_waits_until_both_are_ready(cluster, events, image_namespace):
+    deploy_vm()
+    pod_tasks.pause_deployment.run(DEP)
+
+    result = pod_tasks.resume_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies[-1] == (NS, VM, "Always")
+    assert cluster.deployment_scales[-1] == (NS, PROXY, 1)
+    snap = cluster.snapshot(NS)
+    assert [v.name for v in snap.vmis if v.ready] == [VM]
+    assert len(snap.pods) == 2 and all(p.ready for p in snap.pods)
+    assert events.phases()[-2:] == ["K8S_SCALE_UP", "K8S_WAIT_READY"]
+
+
+def test_a_resumed_vm_that_never_boots_fails_after_the_vm_timeout(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    pod_tasks.pause_deployment.run(DEP)
+    cluster.ready_after_polls = 10**6
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        pod_tasks.resume_deployment.run(DEP)
+
+
+def test_restarting_a_vm_halts_waits_for_the_pod_to_go_and_starts_it_again(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.stop_polls = 2
+    old_pod = cluster.snapshot(NS).pods[0].name
+
+    result = pod_tasks.redeploy_resource.run(DEP, resource_address=VM)
+
+    assert result["status"] == "success"
+    assert cluster.run_strategies == [(NS, VM, "Halted"), (NS, VM, "Always")]
+    assert cluster.deleted_pods == []  # a VMI or pod is never deleted by the deployer
+    assert cluster.deleted_pvcs == []
+    snap = cluster.snapshot(NS)
+    assert [v.ready for v in snap.vmis] == [True] and vm_strategy(cluster) == "Always"
+    assert old_pod  # the fake gives a new virt-launcher pod only after the old one is gone
+
+
+def test_resetting_a_vm_is_not_supported(cluster, events, image_namespace):
+    deploy_vm()
+
+    with pytest.raises(Failure, match="reset is not supported"):
+        pod_tasks.redeploy_resource.run(DEP, resource_address=f"reset:{VM}")
+
+    assert cluster.run_strategies == [] and cluster.deleted_pvcs == []
+
+
+@pytest.mark.parametrize("address", ["nope", f"{VM}-novnc-x", "Team-1"])
+def test_restarting_an_unknown_vm_fails(cluster, events, image_namespace, address):
+    deploy_vm()
+    with pytest.raises(Failure):
+        pod_tasks.redeploy_resource.run(DEP, resource_address=address)
+    assert cluster.run_strategies == []
+
+
+# --- kubevirt-vm: destroy and the clone grant -------------------------------
+class GrantFailsKube(FakeKube):
+    def delete_object(self, api_version, kind, namespace, name):
+        if kind == "ReferenceGrant":
+            raise RuntimeError("403 forbidden")
+        super().delete_object(api_version, kind, namespace, name)
+
+
+def test_a_failing_grant_delete_never_fails_the_destroy_and_the_namespace_goes(
+    events, image_namespace, monkeypatch, caplog
+):
+    kube = GrantFailsKube()
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    kube.namespace_labels["vm-poc"] = {}
+    deploy_vm()
+
+    result = pod_tasks.destroy_deployment.run(DEP)
+
+    assert result["status"] == "success"
+    assert kube.snapshot(NS).exists is False
+    assert "Could not remove the clone grant" in caplog.text
+
+
+def test_the_namespace_is_deleted_before_the_grant(cluster, events, image_namespace, monkeypatch):
+    deploy_vm()
+    order = []
+    real_ns, real_obj = cluster.delete_namespace, cluster.delete_object
+    monkeypatch.setattr(cluster, "delete_namespace", lambda n: (order.append("namespace"), real_ns(n))[1])
+    monkeypatch.setattr(cluster, "delete_object", lambda *a: (order.append("grant"), real_obj(*a))[1])
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert order == ["namespace", "grant"]
+
+
+def test_a_destroy_after_the_namespace_is_gone_still_removes_the_grant(cluster, events, image_namespace):
+    deploy_vm()
+    cluster.delete_namespace(NS)
+    while cluster.snapshot(NS).exists:  # the namespace finishes terminating
+        pass
+    assert NS not in cluster.namespace_labels
+    assert grants(cluster)  # the grant of the image namespace outlived it
+
+    pod_tasks.destroy_deployment.run(DEP)
+
+    assert grants(cluster) == []
+
+
+def test_a_failed_vm_deploy_removes_the_namespace_even_if_the_grant_delete_fails(events, monkeypatch):
+    kube = GrantFailsKube(ready_after_polls=10**6)
+    kube.namespace_labels["vm-poc"] = {}
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
+
+    with pytest.raises(Failure, match="timed out"):
+        deploy_vm()
+
+    while kube.snapshot(NS).exists:  # the namespace finishes terminating
+        pass
+    assert NS not in kube.namespace_labels
+
+
+# --- kubevirt-vm: a stuck volume clone --------------------------------------
+def test_a_stuck_volume_clone_fails_the_deploy_with_the_reason_not_after_the_timeout(
+    cluster, events, image_namespace, monkeypatch
+):
+    monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 600)
+    cluster.fail_reason = "pvc"
+
+    with pytest.raises(Failure) as err:
+        deploy_vm()
+
+    assert "stuck Pending" in str(err.value) and "storage quota exceeded" in str(err.value)
+    assert "timed out" not in str(err.value)
+
+
+def test_a_pending_volume_clone_is_no_failure_within_the_grace_period(monkeypatch):
+    from app.k8s.kube import Snapshot
+
+    now = [0.0]
+    monkeypatch.setattr(pod_tasks, "_clock", lambda: now[0])
+    snap = Snapshot(exists=True, pvc_phases={"d": "Pending"}, pvc_issues=[("d", "ProvisioningFailed", "retrying")])
+    grace = pod_tasks.UnschedulableSince(60)
+
+    assert pod_tasks.explain(snap, grace) is None
+    now[0] = 61
+    assert "Volume claim d is stuck Pending" in pod_tasks.explain(snap, grace)
+
+
+def test_a_bound_volume_with_old_warnings_is_no_failure():
+    from app.k8s.kube import Snapshot
+
+    snap = Snapshot(exists=True, pvc_phases={"d": "Bound"}, pvc_issues=[("d", "ProvisioningFailed", "was retried")])
+    assert pod_tasks.explain(snap) is None
+
+
+def test_the_vm_ready_timeout_defaults_to_twenty_minutes_and_the_proxy_image_is_configurable(monkeypatch):
+    assert type(settings).model_fields["K8S_VM_READY_TIMEOUT_SECONDS"].default == 1200
+    assert pod_tasks.render_settings().vnc_proxy_image == "ghcr.io/dhbw-appstore-t3/novnc-proxy:latest"
+    monkeypatch.setattr(settings, "K8S_VNC_PROXY_IMAGE", "registry.example/novnc@sha256:abc")
+    assert pod_tasks.render_settings().vnc_proxy_image == "registry.example/novnc@sha256:abc"
+
+
+# --- KubeApi: the two new patches --------------------------------------------
+def test_kube_api_patches_the_run_strategy_and_the_proxy_replicas_with_merge_patches():
+    from unittest.mock import MagicMock
+
+    from app.k8s.kube import KubeApi
+
+    api = KubeApi.__new__(KubeApi)  # no cluster connection
+    api._dyn, api._apps = MagicMock(), MagicMock()
+
+    api.set_run_strategy(NS, VM, "Halted")
+    api.scale_deployment(NS, PROXY, 0)
+
+    resource = api._dyn.resources.get.return_value
+    api._dyn.resources.get.assert_called_with(api_version="kubevirt.io/v1", kind="VirtualMachine")
+    api._dyn.patch.assert_called_once_with(
+        resource,
+        body={"spec": {"runStrategy": "Halted"}},
+        name=VM,
+        namespace=NS,
+        content_type="application/merge-patch+json",
+    )
+    api._apps.patch_namespaced_deployment.assert_called_once_with(PROXY, NS, {"spec": {"replicas": 0}})
+
+
+def test_files_in_the_neutral_variable_block_reach_the_workloads(cluster):
+    """Phase 1 of the contract rename (.github#15): ``variables`` is read like ``terraform``."""
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    user_vars = {"variables": {"assignment": {"Team-1": sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")}}}
+
+    deploy(spec=spec, user_vars=user_vars)
+
+    assert [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
+def test_files_sealed_with_the_credential_key_still_verify(monkeypatch):
+    """Seals made while no results key was set (credential-key seal) stay valid; sign() uses the primary key only."""
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "test-credential-secret")
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "")
+    legacy = sealed("v", "s", "a.zip", b"x")
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "test-results-key")
+    assert legacy["mac"] != upload_mac.sign("v", "s", "a.zip", b"x")
+    upload_mac.verify("v", "s", legacy, b"x")  # accepted through the verify-only fallback
+    upload_mac.verify("v", "s", sealed("v", "s", "a.zip", b"x"), b"x")  # and the primary seal
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {**legacy, "name": "b.zip"}, b"x")
+
+
+def test_a_credential_key_equal_to_the_results_key_adds_no_second_candidate(monkeypatch):
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "test-results-key")
+    assert len(upload_mac._verify_keys()) == 1

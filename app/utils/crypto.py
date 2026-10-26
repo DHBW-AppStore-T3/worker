@@ -3,14 +3,11 @@
 Same surface as `backend/app/utils/crypto.py`, two Fernet keys shared with
 the backend:
 
-- `CREDENTIAL_ENCRYPTION_KEY` decrypts what the API sends a VM job: the
-  OpenStack credential envelope and the state token. Only the VM executor
-  needs it.
+- `CREDENTIAL_ENCRYPTION_KEY` is the fallback key for sealing task results
+  written before `RESULTS_ENCRYPTION_KEY` existed; the pod deployer uses it
+  only if `RESULTS_ENCRYPTION_KEY` is not set.
 - `RESULTS_ENCRYPTION_KEY` seals a task's results for the database
-  (`tasks.outputs_enc`). The pod deployer gets only this one: it can read
-  the job queue, where the VM jobs' credential envelopes travel, and has no
-  business decrypting them. Without it the credential key seals the results,
-  as before.
+  (`tasks.outputs_enc`). Preferred over the credential key.
 """
 
 from __future__ import annotations
@@ -46,10 +43,7 @@ results_cipher = (
 
 def _credentials() -> Fernet:
     if _credential_cipher is None:
-        raise RuntimeError(
-            "CREDENTIAL_ENCRYPTION_KEY is not set: this worker cannot decrypt credential envelopes "
-            "(only the VM executor has that key)"
-        )
+        raise RuntimeError("CREDENTIAL_ENCRYPTION_KEY is not set")
     return _credential_cipher
 
 

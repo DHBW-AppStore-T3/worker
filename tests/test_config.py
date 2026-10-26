@@ -22,10 +22,15 @@ class TestConfiguration:
 
         assert hasattr(settings, "DATABASE_URL")
         assert hasattr(settings, "CELERY_BROKER_URL")
-        assert hasattr(settings, "TEMP_REPO_BASE_PATH")
-        assert hasattr(settings, "APP_GIT_ALLOWED_HOSTS")
-        # App repositories are read anonymously (.github#7 B).
-        assert not hasattr(settings, "GIT_ACCESS_TOKEN")
+        # The VM path (OpenTofu, Packer, OpenStack, Git clone) is gone (.github#12).
+        for gone in (
+            "TEMP_REPO_BASE_PATH",
+            "TOFU_PATH",
+            "PACKER_PATH",
+            "OPENSTACK_ALLOWED_AUTH_URLS",
+            "WORKER_JOB_UID_BASE",
+        ):
+            assert not hasattr(settings, gone)
         assert hasattr(settings, "CREDENTIAL_ENCRYPTION_KEY")
 
     @patch.dict(
@@ -34,7 +39,6 @@ class TestConfiguration:
             "APP_ENV": "development",
             "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
             "DATABASE_URL": "postgresql+psycopg2://appstore_worker:pw@postgres:5432/appstore",
-            "APP_GIT_ALLOWED_HOSTS": "github.com,gitlab.dhbw.cloud",
         },
         clear=True,
     )
@@ -48,7 +52,6 @@ class TestConfiguration:
 
         # The broker defaults to the database, through the pgq transport.
         assert config.settings.celery_broker_url == "pgq+postgresql://appstore_worker:pw@postgres:5432/appstore"
-        assert config.settings.APP_GIT_ALLOWED_HOSTS == "github.com,gitlab.dhbw.cloud"
 
     @patch.dict(
         os.environ,
@@ -86,6 +89,13 @@ class TestConfiguration:
                 },
                 "RESULTS_ENCRYPTION_KEY is the credential key",
             ),
+            (
+                {
+                    "CREDENTIAL_ENCRYPTION_KEY": "yJdwFtdm0sMMuyiokYEj4Fbt6lDnkhfRV9PqcSvhvxQ=",
+                    "WORKER_SIMULATE": "true",
+                },
+                "WORKER_SIMULATE requires APP_ENV=development",
+            ),
         ],
     )
     def test_unsafe_keys_never_start(self, env, message):
@@ -112,7 +122,7 @@ class TestConfiguration:
         assert key == settings.RESULTS_ENCRYPTION_KEY
         assert not settings.CREDENTIAL_ENCRYPTION_KEY
 
-    def test_production_with_a_real_key_starts_and_the_tfstate_database_is_gone(self):
+    def test_production_with_a_real_key_starts(self):
         from cryptography.fernet import Fernet
 
         from app.config import Settings
@@ -123,5 +133,4 @@ class TestConfiguration:
         ):
             settings = Settings(_env_file=None)
         assert settings.APP_ENV == "production"
-        assert settings.TOFU_PATH.endswith("tofu")
         assert not hasattr(settings, "TFSTATE_DATABASE_URL")

@@ -7,7 +7,6 @@ redelivered job after a dead worker is failed instead of run again.
 """
 
 import json
-import sys
 import threading
 import time
 import uuid
@@ -18,7 +17,6 @@ from app import job_runtime
 from app.celery_app import celery_app
 from app.failure import Failure
 from app.job_task import JobTask
-from app.services.terraform_executor import _stream_subprocess
 from app.task_contract import (
     EVENT_FAILED,
     EVENT_LOG,
@@ -69,16 +67,11 @@ def failing_task(self):
 @celery_app.task(bind=True, base=JobTask, name="test.long_tool")
 def long_tool_task(self, seconds=30):
     self.send_event(EVENT_LOG, deployment_id="x", level="INFO", message="starting tool")
-    code = "import time\nfor i in range(1000):\n    print(i, flush=True)\n    time.sleep(0.05)"
-    rc, _, _ = _stream_subprocess(
-        [sys.executable, "-c", code],
-        cwd=".",
-        env=None,
-        timeout=seconds,
-        tool_name="sleeper",
-        output_callback=None,
-    )
-    raise AssertionError(f"tool ended on its own (rc={rc}), cancel did not stop it")
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        job_runtime.check_cancelled()
+        time.sleep(0.05)
+    raise AssertionError("tool ended on its own, cancel did not stop it")
 
 
 def _task(pg, status="PENDING", **cols):
@@ -115,7 +108,8 @@ def test_success_records_status_logs_sealed_results_and_events(pg):
     assert json.loads(row["logs"]) == [{"timestamp": "2026-10-09T12:00:00Z", "level": "INFO", "message": "done"}]
     assert row["outputs"] is None and row["tf_state"] is None  # nothing in plaintext
     results = open_results(results_cipher, row["outputs_enc"])
-    assert results == {"terraform_outputs": {"ip": {"value": "::1"}}, "tf_state": '{"version": 4}'}
+    assert results["terraform_outputs"] == {"ip": {"value": "::1"}} and results["tf_state"] == '{"version": 4}'
+    assert results["outputs"] == results["terraform_outputs"] and results["state"] == results["tf_state"]
     assert row["current_phase"] == "STARTING" and row["progress_pct"] == 50
 
     events = _events(pg, task_id)
@@ -190,7 +184,7 @@ def _cancel_like_the_api(pg_url, task_id, delay):
 
 
 @pytest.mark.timeout(60)
-def test_cancel_kills_the_running_tool_and_releases_the_parked_destroy(pg, pg_url):
+def test_cancel_stops_the_running_tool_and_releases_the_parked_destroy(pg, pg_url):
     task_id, _ = _task(pg)
     destroy_id = str(uuid.uuid4())
     pg.execute(
@@ -318,24 +312,3 @@ def test_jobs_need_no_more_than_the_worker_role(pg, pg_url, as_worker_role):
     unknown_id, _ = _task(pg)
     job_runtime.fail_unknown(unknown_id, "tasks.nope")
     assert _row(pg, unknown_id)["status"] == "FAILED"
-
-
-def test_a_slot_that_cannot_be_prepared_fails_the_task_without_running_it(pg, monkeypatch):
-    task_id, _ = _task(pg)
-
-    def broken(slot):
-        raise RuntimeError("could not stop the processes of slot user 20000")
-
-    monkeypatch.setattr(job_runtime.job_context, "slot_session", broken)
-    ran = []
-    monkeypatch.setattr(ok_task, "run", lambda *a, **k: ran.append(1))
-
-    with pytest.raises(RuntimeError):
-        ok_task.apply(task_id=task_id, throw=True)
-
-    row = _row(pg, task_id)
-    assert row["status"] == "FAILED" and row["lease_until"] is None
-    assert job_runtime.SLOT_NOT_READY_MESSAGE in row["logs"]
-    assert not ran and job_runtime.current() is None
-    terminal = _events(pg, task_id)[-1]
-    assert terminal[0] == EVENT_FAILED and terminal[1]["failure_kind"] == FAILURE_KIND_INFRASTRUCTURE

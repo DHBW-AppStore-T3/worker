@@ -7,13 +7,12 @@ to its row in ``tasks``, which is the only truth about it:
   and a lease. A message that arrives for a task that is already RUNNING
   under an expired lease is a redelivery after a dead worker: the task is
   failed as ``worker_lost`` and the job is **not** run again (a
-  half-applied Terraform run needs a person). Cancelled or finished tasks
+  half-applied deployment needs a person). Cancelled or finished tasks
   are skipped.
 - **While it runs**: a heartbeat renews the lease every third of
   ``TASK_LEASE_SECONDS`` and notices a cancel request or a lost lease; a
-  listener on ``NOTIFY task_cancel`` reacts at once. Cancelling kills the
-  process group of the running tool (SIGTERM, SIGKILL after a grace
-  period) and makes the next tool call raise :class:`JobCancelled`.
+  listener on ``NOTIFY task_cancel`` reacts at once. Cancelling makes the next
+  :func:`check_cancelled` raise :class:`JobCancelled`.
   Events (progress, log lines) go into ``task_events`` through a buffered
   writer, which also keeps ``current_phase``/``progress_pct`` current.
 - **Epilogue** (:meth:`Job.finish`): status, logs and the sealed results
@@ -31,15 +30,13 @@ import json
 import logging
 import os
 import queue
-import signal
-import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 from psycopg.types.json import Jsonb
 
-from . import db, job_context
+from . import db
 from .config import settings
 from .pgq import NOTIFY_PREFIX
 from .task_contract import (
@@ -60,15 +57,10 @@ from .task_contract import (
 from .utils.crypto import results_cipher
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     import psycopg
 
 logger = logging.getLogger(__name__)
 
-# Grace for a tool to stop after SIGTERM (Packer removes its build VM)
-# before its process group gets SIGKILL.
-KILL_GRACE_SECONDS = 10
 # The event writer flushes at least this often while a job runs.
 FLUSH_INTERVAL_SECONDS = 0.2
 FLUSH_BATCH = 200
@@ -79,19 +71,14 @@ WORKER_LOST_MESSAGE = (
     "Zustand der Ressourcen und starten Sie die Aktion bei Bedarf erneut."
 )
 CANCELLED_MESSAGE = "Abgebrochen: Die laufende Aktion wurde beendet."
-SLOT_NOT_READY_MESSAGE = (
-    "Der Worker konnte den Arbeitsbereich für diesen Auftrag nicht vorbereiten; der Auftrag "
-    "wurde nicht ausgeführt. Bitte den Administrator informieren."
-)
 
 
 class JobCancelled(BaseException):  # noqa: N818 - not an error, a stop signal
-    """The job was cancelled (or lost its lease); raised at the next tool call.
+    """The job was cancelled (or lost its lease); raised at the next check.
 
     A ``BaseException`` on purpose: the task bodies catch ``Exception`` to
-    clean up after a failed tool (e.g. ``terraform destroy`` after a failed
-    apply); a cancelled job must stop instead, and the destroy that follows
-    a cancel cleans up.
+    clean up after a failed step; a cancelled job must stop instead, and the
+    destroy that follows a cancel cleans up.
     """
 
 
@@ -113,36 +100,6 @@ def check_cancelled() -> None:
     job = _current
     if job is not None and job.cancelled.is_set():
         raise JobCancelled(job.cancel_reason)
-
-
-@contextlib.contextmanager
-def track(process: subprocess.Popen) -> Iterator[subprocess.Popen]:
-    """Register a tool process so a cancel can stop it; check for a cancel when it ends."""
-    job = _current
-    if job is None:
-        yield process
-        return
-    with job._procs_lock:
-        job._procs.add(process)
-    try:
-        if job.cancelled.is_set():
-            job._kill(process)
-        yield process
-    finally:
-        with job._procs_lock:
-            job._procs.discard(process)
-
-
-def kill_process_group(process: subprocess.Popen, sig: int) -> None:
-    """Signal the tool's whole process group (it runs in a session of its own)."""
-    poll = getattr(process, "poll", None)
-    if poll is not None and poll() is not None:
-        return
-    with contextlib.suppress(OSError, ProcessLookupError):
-        if hasattr(os, "killpg"):
-            os.killpg(process.pid, sig)
-        else:  # pragma: no cover - Windows development only: no process groups, kill the tree
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, check=False)
 
 
 # ----------------------------------------------------------------
@@ -284,8 +241,6 @@ class Job:
         self.worker = worker
         self.cancelled = threading.Event()
         self.cancel_reason = ""
-        self._procs: set[subprocess.Popen] = set()
-        self._procs_lock = threading.Lock()
         self._stop = threading.Event()
         self._events: queue.SimpleQueue[tuple[str, dict] | None] = queue.SimpleQueue()
         self._emit_lock = threading.Lock()
@@ -295,29 +250,12 @@ class Job:
         # without returning one (cancelled, unexpected error).
         self.log_entries: list[dict[str, Any]] = []
         self._threads: list[threading.Thread] = []
-        self._context: contextlib.ExitStack | None = None
 
     # -- lifecycle --------------------------------------------------
     def __enter__(self) -> Job:
         global _current
         with _lock:
             _current = self
-        self._context = contextlib.ExitStack()
-        try:
-            # The slot's user, home and deadline; nothing of the slot's
-            # previous job may still be around (job_context.slot_session).
-            self._context.enter_context(job_context.slot_session(job_context.current_slot()))
-        except Exception as exc:
-            logger.exception("task %s: the worker slot could not be prepared", self.task_id)
-            self.finish(
-                "FAILED",
-                logs=f"[err] {SLOT_NOT_READY_MESSAGE}\n\n--- Technische Details ---\n{exc}",
-                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-            )
-            with _lock:
-                if _current is self:
-                    _current = None
-            raise
         for target, name in ((self._heartbeat_loop, "lease"), (self._flush_loop, "events")):
             thread = threading.Thread(target=target, name=f"job-{name}-{self.task_id[:8]}", daemon=True)
             thread.start()
@@ -330,8 +268,6 @@ class Job:
         self._events.put(None)
         for thread in self._threads:
             thread.join(timeout=10)
-        if self._context is not None:
-            self._context.close()
         with _lock:
             if _current is self:
                 _current = None
@@ -448,22 +384,7 @@ class Job:
             return
         self.cancel_reason = reason
         self.cancelled.set()
-        logger.warning("task %s: %s, stopping the running tool", self.task_id, reason)
-        with self._procs_lock:
-            procs = list(self._procs)
-        for process in procs:
-            self._kill(process)
-
-    def _kill(self, process: subprocess.Popen) -> None:
-        kill_process_group(process, signal.SIGTERM)
-
-        def finish_off() -> None:
-            try:
-                process.wait(timeout=KILL_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                kill_process_group(process, getattr(signal, "SIGKILL", signal.SIGTERM))
-
-        threading.Thread(target=finish_off, name=f"job-kill-{process.pid}", daemon=True).start()
+        logger.warning("task %s: %s, stopping at the next check", self.task_id, reason)
 
     # -- epilogue ---------------------------------------------------
     def finish(
@@ -607,8 +528,6 @@ __all__ = [
     "check_cancelled",
     "current",
     "format_failure_logs",
-    "kill_process_group",
     "start",
-    "track",
     "transcript",
 ]

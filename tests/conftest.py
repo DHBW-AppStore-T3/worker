@@ -31,13 +31,28 @@ SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 # Marker implizit ``unit``. Damit gilt: **default ist unit**, und
 # nur Tests, die echte externe Abhängigkeiten brauchen (DB, Broker,
 # Netz), müssen explizit als ``integration`` markiert werden.
+#
+# Ausnahme: ein Test, der die Datenbank anfordert (``pg``/``pg_url``),
+# wird ``integration``. In der unit-Lane gibt es keine Datenbank, die
+# Fixture würde ihn dort lautlos überspringen. Ein ausdrücklich als
+# ``unit`` markierter Test mit diesen Fixtures ist ein Widerspruch und
+# bricht die Sammlung ab.
+DB_FIXTURES = {"pg", "pg_url"}
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         markers = {m.name for m in item.iter_markers()}
+        uses_db = bool(DB_FIXTURES & set(item.fixturenames))
+        if uses_db and "unit" in markers:
+            raise pytest.UsageError(
+                f"{item.nodeid} is marked 'unit' but uses the database; the unit lane has none "
+                "and would skip it. Mark it 'integration'."
+            )
         # ``integration`` / ``slow`` haben Vorrang — wer explizit
         # markiert, will nicht in die unit-Lane gezogen werden.
         if "integration" not in markers and "slow" not in markers and "unit" not in markers:
-            item.add_marker(pytest.mark.unit)
+            item.add_marker(pytest.mark.integration if uses_db else pytest.mark.unit)
 
 
 @pytest.fixture
