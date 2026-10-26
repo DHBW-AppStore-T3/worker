@@ -7,8 +7,6 @@ redelivered job after a dead worker is failed instead of run again.
 """
 
 import json
-import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -69,12 +67,11 @@ def failing_task(self):
 @celery_app.task(bind=True, base=JobTask, name="test.long_tool")
 def long_tool_task(self, seconds=30):
     self.send_event(EVENT_LOG, deployment_id="x", level="INFO", message="starting tool")
-    code = "import time\nfor i in range(1000):\n    print(i, flush=True)\n    time.sleep(0.05)"
-    process = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
-    with job_runtime.track(process):
-        rc = process.wait(timeout=seconds)
-    job_runtime.check_cancelled()
-    raise AssertionError(f"tool ended on its own (rc={rc}), cancel did not stop it")
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        job_runtime.check_cancelled()
+        time.sleep(0.05)
+    raise AssertionError("tool ended on its own, cancel did not stop it")
 
 
 def _task(pg, status="PENDING", **cols):

@@ -4,8 +4,7 @@ Loaded into a real ``celery worker`` with ``-I tests.e2e_tasks``; they run
 through ``JobTask`` like the real deploy tasks, without Git or OpenStack.
 """
 
-import subprocess
-import sys
+import time
 
 from app import job_runtime
 from app.celery_app import celery_app
@@ -24,13 +23,12 @@ def ok(self):
 
 @celery_app.task(bind=True, base=JobTask, name="e2e.marked_tool")
 def marked_tool(self, marker_path, seconds):
-    """Note each start in ``marker_path``, then run a tool that prints for ``seconds``."""
+    """Note each start in ``marker_path``, then run a step that polls for a cancel for ``seconds``."""
     with open(marker_path, "a", encoding="utf-8") as f:
         f.write(f"{self.request.id}\n")
     self.send_event(EVENT_LOG, deployment_id="x", level="INFO", message="tool starts")
-    code = f"import time\nfor i in range({int(seconds * 10)}):\n    print(i, flush=True)\n    time.sleep(0.1)"
-    process = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
-    with job_runtime.track(process):
-        rc = process.wait(timeout=seconds + 30)
-    job_runtime.check_cancelled()
-    return {"logs": [{"level": "INFO", "message": f"tool exited {rc}"}]}
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        job_runtime.check_cancelled()
+        time.sleep(0.1)
+    return {"logs": [{"level": "INFO", "message": "tool exited 0"}]}
