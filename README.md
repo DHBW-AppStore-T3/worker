@@ -52,7 +52,7 @@ for lane in unit integration; do
 done
 ```
 
-Ergebnis mit dem Stand `dev`: 180 Unit-Tests und 17 Integrationstests bestanden.
+Ergebnis mit dem Stand `dev`: 183 Unit-Tests und 17 Integrationstests bestanden.
 
 ## Konfiguration (Umgebungsvariablen)
 
