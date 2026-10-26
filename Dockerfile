@@ -32,6 +32,9 @@ RUN poetry install --no-root --only=main --no-ansi
 # -----------------------------------------------------------------------------
 FROM python:3.11-slim AS pod-deployer
 
+# SECURITY_REFRESH changes in every CI build (the workflow passes the run id), so the upgrade below never comes from
+# the build cache: a cached layer keeps the package state of its first build and misses every fix released since.
+ARG SECURITY_REFRESH
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
     useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin appstore
 
