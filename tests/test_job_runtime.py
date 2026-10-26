@@ -184,7 +184,7 @@ def _cancel_like_the_api(pg_url, task_id, delay):
 
 
 @pytest.mark.timeout(60)
-def test_cancel_kills_the_running_tool_and_releases_the_parked_destroy(pg, pg_url):
+def test_cancel_stops_the_running_tool_and_releases_the_parked_destroy(pg, pg_url):
     task_id, _ = _task(pg)
     destroy_id = str(uuid.uuid4())
     pg.execute(
