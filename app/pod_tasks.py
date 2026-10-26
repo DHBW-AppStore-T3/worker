@@ -55,6 +55,7 @@ from .k8s.render import (
 )
 from .k8s.spec import AppSpec, PlatformLimits, SpecValidationError, limits_from, parse_spec
 from .phase_tracker import PhaseTracker
+from .task_contract import user_input_variables
 from .utils.logger import LogCategory, get_logger
 
 PHASE_STARTING = "STARTING"
@@ -381,13 +382,13 @@ def _bootstrap_objects(dep: DeploymentCtx, *, vnc_proxy: bool = False) -> list[d
 
 
 def _file_contents(user_vars: dict[str, Any], spec: AppSpec) -> dict[str, dict[str, bytes]]:
-    """Uploaded files per file variable as ``{slot: bytes}``, from ``userInputVar.terraform``.
+    """Uploaded files per file variable as ``{slot: bytes}``, from the variable block of ``userInputVar`` (``variables``, or the legacy ``terraform``).
 
     The API stores a team-scoped file variable with each slot wrapped as
     ``{"uploaded": file}`` (the shape a VM app's HCL ``map(map(object))``
     needs); both shapes are read, so no team's file is silently dropped.
     """
-    terraform = user_vars.get("terraform") or {}
+    terraform = user_input_variables(user_vars)
     out: dict[str, dict[str, bytes]] = {}
     for v in spec.variables:
         if v.type != "file":
@@ -519,7 +520,7 @@ def deploy_application(
             render_settings(),
             passwords,
             files=_file_contents(user_vars, app),
-            variable_values=user_vars.get("terraform") or {},
+            variable_values=user_input_variables(user_vars),
         )
         # Pure, like render: a bad access template fails before anything exists.
         outputs = build_outputs(app, dep, team_list, passwords)

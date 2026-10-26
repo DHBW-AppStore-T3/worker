@@ -21,7 +21,7 @@ from celery import Task
 
 from . import job_runtime
 from .failure import Failure
-from .task_contract import FAILURE_KIND_TIME_LIMIT, FAILURE_KIND_WORKER
+from .task_contract import FAILURE_KIND_TIME_LIMIT, FAILURE_KIND_WORKER, result_outputs, result_state
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +49,8 @@ class JobTask(Task):
                 job.finish(
                     "FAILED",
                     logs=job_runtime.format_failure_logs(data),
-                    terraform_outputs=data.get("terraform_outputs"),
-                    tf_state=data.get("tf_state"),
+                    terraform_outputs=result_outputs(data),
+                    tf_state=result_state(data),
                     failure_kind=FAILURE_KIND_WORKER,
                 )
             except Exception as exc:
@@ -76,8 +76,8 @@ class JobTask(Task):
                 job.finish(
                     "SUCCESS",
                     logs=json.dumps(logs, ensure_ascii=False) if isinstance(logs, list) else logs,
-                    terraform_outputs=result.get("terraform_outputs"),
-                    tf_state=result.get("tf_state"),
+                    terraform_outputs=result_outputs(result),
+                    tf_state=result_state(result),
                 )
         return None
 

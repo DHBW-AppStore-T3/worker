@@ -1,17 +1,15 @@
 # worker
 
 Teil der DHBW-AppStore-T3 Organisation — sechs eigenständige Repos, kein Monorepo.
-Harness-Gesamtkonzept: siehe https://github.com/DHBW-AppStore-T3/.github/blob/main/docs/HARNESS.md
+Harness-Gesamtkonzept: https://github.com/DHBW-AppStore-T3/.github/blob/main/docs/HARNESS.md
 
-Details zu diesem Repo:
-- Lebendes Übergabedokument: `claude_docs/HANDOVER.md` (zwingend zu Beginn jeder Session lesen und vor Session-Ende aktualisieren)
-- Architektur: `claude_docs/architecture/`
-- Entscheidungen: `claude_docs/decisions/`
-- Debugging: `claude_docs/debugging/`
+- Übergabedokument (Ist-Zustand): `claude_docs/HANDOVER.md`
+- README: Varianten, Start, Tests, Konfiguration, Module
+- Architektur: `claude_docs/architecture/`, Entscheidungen: `claude_docs/decisions/`, Fehlersuche: `claude_docs/debugging/`
 
-## Lokale Befehle
-- Einzeltest (TDD): `poetry run pytest tests/unit/test_foo.py -v`
-- Unit-Tests: `poetry run pytest -m unit -v`
-- Integrationstests: `poetry run pytest -m integration -v`
-- Linting & Formatter: `poetry run ruff check . && poetry run black --check . && poetry run isort --check-only .`
-
+## Befehle
+Im Container (`make shell-worker` in `deployment/`) oder mit lokalem Poetry:
+- Einzeltest: `poetry run pytest tests/test_foo.py -v`
+- Lanes wie CI: `poetry run pytest -m unit`, `poetry run pytest -m integration` (Postgres nötig)
+- Lint wie CI: `poetry run ruff check . && poetry run black --check . && poetry run isort --check-only . && poetry run mypy app/ --ignore-missing-imports`
+- Formatieren: `poetry run black . && poetry run isort . && poetry run ruff check --fix .`

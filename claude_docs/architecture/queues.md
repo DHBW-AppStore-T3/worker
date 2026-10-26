@@ -1,46 +1,32 @@
-# Worker — Queues & Routing
+# Worker — Queue, Lease, Cancel
 
-## Broker (.github#5)
+## Broker
 
-- **Broker:** die Anwendungs-Postgres über den Kombu-Transport `pgq` (`app/pgq.py`, identisch im Backend):
-  `pgq+postgresql://appstore_worker:…@postgres:5432/<db>` (Default: abgeleitet aus `DATABASE_URL`). Kein RabbitMQ,
-  kein Redis.
-- **Kein Result-Backend** (`task_ignore_result=True`): Der Job schreibt Status, Transkript und die verschlüsselten
-  Ergebnisse (`tasks.outputs_enc`) selbst in die Task-Zeile.
-- **Serializer:** JSON.
-- **Datenbankrolle `appstore_worker`:** nur `celery_queue`, Inserts in `task_events` und die Ergebnis-Spalten von
-  `tasks` (Migration `5e1f0c2a9b7d` im Backend). Die Werkzeuge (Terraform, Packer, OpenStack-CLI) sehen weder diese
-  Zugangsdaten noch den Fernet-Schlüssel (`app/job_context.py`, .github#7 A).
+Die Anwendungs-Postgres über den Kombu-Transport `pgq` (`app/pgq.py`, identisch im Backend): `pgq+postgresql://appstore_worker:…@<host>/<db>` (Standard: abgeleitet aus `DATABASE_URL`). Kein RabbitMQ, kein Redis, kein Result-Backend (`task_ignore_result=True`), Serializer JSON.
 
-## Worker-Konfiguration & Task-Verhalten
+Routing (`celery_app.py`, gleich in der API): `pods.*` → Queue `pods`. Der Worker konsumiert nur diese Queue (`-Q pods`), auch im Dev-Image.
 
-### 1. Feste Concurrency, Prefetch 1
-`--concurrency=N` (Image: 4) statt `--autoscale`: Slot *n* führt seine Werkzeuge als UID `20000+n` aus. Jeder
-Prozess holt genau eine Nachricht (`worker_prefetch_multiplier=1`).
+## Datenbankrolle `appstore_worker`
 
-### 2. Späte Bestätigung, Lease, kein Doppellauf
-- `task_acks_late=True`: Die Queue-Zeile wird erst nach dem Job gelöscht. Der Worker-Hauptprozess erneuert die Lease
-  der gehaltenen Nachrichten (`WORKER_QUEUE_VISIBILITY_SECONDS`, Default 300).
-- Der Job selbst hält eine Lease auf der Task-Zeile (`TASK_LEASE_SECONDS`, Default 90, alle 30 s erneuert).
-- Stirbt der Worker, wird die Nachricht nach Ablauf wieder sichtbar. Der Prolog (`app/job_runtime.py`) sieht die Task
-  dann RUNNING mit abgelaufener Lease und setzt sie auf FAILED (`worker_lost`), **ohne** den Job erneut zu starten.
-  Stirbt nur ein Kindprozess, quittiert Celery die Nachricht; das Backend erkennt die abgelaufene Lease (Reconciler).
+Rechte nur auf `celery_queue`, INSERT in `task_events`, die Ergebnis-Spalten von `tasks` (Migrationen im Backend). Kein Zugriff auf Nutzer, Apps, Zugangsdaten.
 
-### 3. Events & Status
-Celery-Events, Remote Control, Gossip und Mingle sind aus (der Transport hat kein Fanout). Fortschritt und Logzeilen
-schreibt `JobTask.send_event` gepuffert in `task_events`; ein Trigger meldet sie per `NOTIFY task_events` an das
-Backend. Der Healthcheck prüft das Alter der Heartbeat-Datei (`WORKER_HEARTBEAT_FILE`).
+## Prozessmodell
 
-### 4. Cancel
-Das Backend setzt `cancel_requested_at` und sendet `NOTIFY task_cancel`. Der Listener des Kindprozesses (Fallback:
-der Lease-Heartbeat) beendet die Prozessgruppe des laufenden Werkzeugs (SIGTERM, nach 10 s SIGKILL); der nächste
-Werkzeugaufruf wirft `JobCancelled`. Ein Destroy, das hinter dem abgebrochenen Job geparkt ist
-(`celery_queue.after_task`), wird im Epilog freigegeben.
+- `--concurrency=4` (Images), feste Zahl statt Autoscale. Dev: `--pool=solo`.
+- `worker_prefetch_multiplier=1`, `task_acks_late=True`: die Queue-Zeile wird erst nach dem Job gelöscht. Der Hauptprozess erneuert die Sichtbarkeit gehaltener Nachrichten (`WORKER_QUEUE_VISIBILITY_SECONDS`, 300 s).
+- Celery-Events, Remote Control, Gossip, Mingle, Heartbeat sind aus (kein Fanout im Transport). Gesundheit: `HeartbeatFile` berührt `WORKER_HEARTBEAT_FILE` alle 30 s; der Docker-Healthcheck schlägt bei Alter > 120 s fehl.
+- Zeitlimit: Soft `WORKER_JOB_TIMEOUT_SECONDS` (7200 s), Hard +300 s; danach läuft die Lease ab und die API setzt `worker_lost`.
+- Unbekannter Task-Name (API und Worker nicht im Takt): die Task-Zeile wird sofort `failed` (`job_runtime.fail_unknown`).
 
-## Fehler- und Retry-Strategie
+## Lease und Doppellauf
 
-- **Deterministische Fehler (`Failure`, `app/failure.py`):** werden mit Transkript, State und Outputs in die Task-Zeile
-  geschrieben (FAILED, `failure_kind=worker_failure`). Kein automatischer Retry.
-- **Worker-Verlust:** FAILED (`worker_lost`), kein automatischer Neustart; Destroy oder erneuter Deploy aus der UI.
-- **Build-Lock:** Postgres-Advisory-Lock je `(Projekt, Image)` auf einer eigenen Session; endet die Session (Absturz),
-  ist der Lock sofort frei.
+Der Job hält eine Lease auf der Task-Zeile (`TASK_LEASE_SECONDS`, 90 s, Erneuerung alle 30 s). Stirbt der Worker, wird die Nachricht wieder sichtbar; der Prolog setzt die Task `worker_lost` ohne erneuten Lauf. Stirbt nur ein Kindprozess, quittiert Celery die Nachricht; die API erkennt die abgelaufene Lease (Reconciler).
+
+## Cancel
+
+Die API setzt `cancel_requested_at` und sendet `NOTIFY task_cancel`. Der Listener (Rückfall: Lease-Heartbeat) unterbricht den Job (`JobCancelled`); Pod-Jobs prüfen den Cancel in jeder Warteschleife. Ein hinter dem Job geparkter Destroy (`celery_queue.after_task`) wird im Epilog freigegeben.
+
+## Fehler
+
+- Deterministischer Fehler (`Failure`): FAILED mit Transkript, State, Outputs, `failure_kind=worker_failure`. Kein Retry.
+- Worker-Verlust: FAILED (`worker_lost`), kein Neustart; Destroy oder erneuter Deploy aus der UI.

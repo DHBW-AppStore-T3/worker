@@ -108,7 +108,8 @@ def test_success_records_status_logs_sealed_results_and_events(pg):
     assert json.loads(row["logs"]) == [{"timestamp": "2026-10-09T12:00:00Z", "level": "INFO", "message": "done"}]
     assert row["outputs"] is None and row["tf_state"] is None  # nothing in plaintext
     results = open_results(results_cipher, row["outputs_enc"])
-    assert results == {"terraform_outputs": {"ip": {"value": "::1"}}, "tf_state": '{"version": 4}'}
+    assert results["terraform_outputs"] == {"ip": {"value": "::1"}} and results["tf_state"] == '{"version": 4}'
+    assert results["outputs"] == results["terraform_outputs"] and results["state"] == results["tf_state"]
     assert row["current_phase"] == "STARTING" and row["progress_pct"] == 50
 
     events = _events(pg, task_id)

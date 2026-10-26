@@ -900,3 +900,34 @@ def test_kube_api_patches_the_run_strategy_and_the_proxy_replicas_with_merge_pat
         content_type="application/merge-patch+json",
     )
     api._apps.patch_namespaced_deployment.assert_called_once_with(PROXY, NS, {"spec": {"replicas": 0}})
+
+
+def test_files_in_the_neutral_variable_block_reach_the_workloads(cluster):
+    """Phase 1 of the contract rename (.github#15): ``variables`` is read like ``terraform``."""
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"}
+    ]
+    user_vars = {"variables": {"assignment": {"Team-1": sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")}}}
+
+    deploy(spec=spec, user_vars=user_vars)
+
+    assert [k for k in cluster.objects if k[0] == "Secret" and k[1].endswith("-files")]
+
+
+def test_files_sealed_with_the_credential_key_still_verify(monkeypatch):
+    """Seals made while no results key was set (credential-key seal) stay valid; sign() uses the primary key only."""
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "test-credential-secret")
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "")
+    legacy = sealed("v", "s", "a.zip", b"x")
+    monkeypatch.setattr(settings, "RESULTS_ENCRYPTION_KEY", "test-results-key")
+    assert legacy["mac"] != upload_mac.sign("v", "s", "a.zip", b"x")
+    upload_mac.verify("v", "s", legacy, b"x")  # accepted through the verify-only fallback
+    upload_mac.verify("v", "s", sealed("v", "s", "a.zip", b"x"), b"x")  # and the primary seal
+    with pytest.raises(upload_mac.UnsealedUpload):
+        upload_mac.verify("v", "s", {**legacy, "name": "b.zip"}, b"x")
+
+
+def test_a_credential_key_equal_to_the_results_key_adds_no_second_candidate(monkeypatch):
+    monkeypatch.setattr(settings, "CREDENTIAL_ENCRYPTION_KEY", "test-results-key")
+    assert len(upload_mac._verify_keys()) == 1

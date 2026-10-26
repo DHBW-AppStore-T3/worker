@@ -1,45 +1,29 @@
 # Handover — Worker
 
-Lebendes Übergabedokument gemäß [HARNESS.md](https://github.com/DHBW-AppStore-T3/.github/blob/main/docs/HARNESS.md) Abschnitt 1.2.
-Jede Session liest dieses Dokument zu Beginn und aktualisiert es vor dem Abschluss.
+Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHBW-AppStore-T3/.github/blob/main/docs/HARNESS.md)). Beschreibt den Ist-Zustand von `dev`; Stand wird mit jeder Änderung angepasst.
 
----
+## 1. Zustand
 
-> **Stand Oktober 2026 (.github#12):** Der OpenStack-VM-Pfad (Packer, OpenTofu, OpenStack-Auth, Git-Clone) ist aus diesem Repo entfernt; der Worker ist nur noch der Pod-Deployer (`app/pod_tasks.py`). Die Abschnitte unten beschreiben teilweise noch den alten Stand und sind beim nächsten Anfassen zu bereinigen.
+- **Stack:** Python 3.11, Poetry, Celery 5 über den Postgres-Transport `pgq`, psycopg 3, kubernetes-Client.
+- **Image:** ein Docker-Target `pod-deployer` (Queue `pods`, UID 10001); `ghcr.io/dhbw-appstore-t3/worker-pods`, in Kubernetes die Komponente `pod-deployer`. Der OpenStack-VM-Pfad (Image `runtime`, Queue `vm`) ist entfernt (.github#12).
+- **Isolation:** Datenbankrolle `appstore_worker`; Fernet-Schlüssel nur für Ergebnisse (siehe `claude_docs/decisions/`).
+- **Branches:** `dev` → Staging, `main` → Produktion. Feature-Branches gehen per PR auf `dev`.
+- **Dokumentation:** `README.md` (Varianten, Start, Tests, Konfiguration, Module), `claude_docs/architecture/` (Überblick, Queues, Live-Events).
 
-## 1. Status & Fokus
-- **Stack:** Python 3.11, Poetry, Celery 5 über den Postgres-Transport `pgq` (Branch `spike/dev`, .github#5; auf `dev` noch RabbitMQ + Redis), Terraform 1.x, Packer 1.x, GitPython.
-- **Rolle:** Asynchrone Ausführung von Infrastruktur-Deployments auf OpenStack (Klonen von App-Repos, Packer-Image-Builds, Terraform-Provisionierung, State-Verwaltung, Streaming von Logs).
-- **Die 2 Flows (Harness Engineering):**
-  - **Flow 1 (`/user-story`):** Asynchrone Task-Contracts und Pydantic-Payloads werden vorab im Issue spezifiziert.
-  - **Flow 2 (`/harness-workflow`):** Autonome Umsetzung via `dev`-Trunk -> TDD (Pytest) -> PR auf `dev` -> CI grün -> Auto-Merge -> Automatisches Staging Deployment -> Hermes Discord Statusmeldung.
-  - **Push auf `main`:** Bleibt rein menschlich! Abgesichert durch automatisiertes **Test Coverage Gate** (Coverage >= 60% erforderlich).
-- **Isolation:** Auf `spike/dev` verbindet sich der Worker mit der App-Datenbank, aber nur als Rolle `appstore_worker` (Queue, Task-Events, Ergebnis-Spalten). Werkzeuge laufen mit Minimal-Umgebung als eigene UID je Slot (`app/job_context.py`, .github#7 A). State liegt weiter in `postgres-tfstate`; Credentials werden via Fernet in-process entschlüsselt.
-- **CI/CD:** `ci.yml` unterstützt jetzt `main` und `dev`. Push auf `dev` baut Images und stößt Staging-Deploy in `DHBW-AppStore-T3/deployment` an.
+## 2. CI (`.github/workflows/ci.yml`, Branches `main` und `dev`)
 
----
+Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service `worker_test`, echter `celery worker`) · Coverage (Gate ≥ 60 %) · Security (Trivy, pip-audit) · Build des Targets `pod-deployer` · Image-Scan · Push nach `ghcr.io` (Push auf `main`/`dev`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment`.
 
-## 2. In Arbeit & Nächste Schritte
-- [x] Reengineering auf 2 Flows: `ci.yml` auf `dev`-Trunk und Test Coverage Gate für `main` umgestellt.
-- [x] Staging-Trigger korrigiert auf `DHBW-AppStore-T3/deployment --ref dev`.
-- [x] Sicherheits-Dependencies bereinigt (PR #2 gemergt).
-- [x] Graphify-Graph und `claude_docs/` aufgesetzt (PR #3 gemergt).
+## 3. Regeln im Code
 
----
+1. `app/pgq.py` und `app/task_contract.py` sind byte-gleich mit dem Backend (`tests/test_shared_files.py` prüft den Hash). Änderung immer in beiden Repos, beide Hashes.
+2. `app/upload_mac.py` bleibt im Takt mit `backend/app/utils/upload_mac.py`.
+3. Die Grenzwerte (`APP_IMAGE_REGISTRY_ALLOWLIST`, `APP_MAX_*`, `APP_VM_IMAGE_NAMESPACES`) haben in API und Worker dieselben Werte; der Worker prüft erneut.
+4. Der Name `pods.*` und die Queue `pods` gelten auch für KubeVirt-Jobs (`pods.deploy_vm_application`) und bleiben bestehen.
+5. Tests ohne DB-Fixture sind automatisch `unit`, mit `pg`/`pg_url` `integration`; ein ausdrücklich als `unit` markierter Test mit DB-Fixture bricht die Sammlung ab.
+6. Integrationstests brauchen eine Test-Datenbank in `DATABASE_URL`; `tests/schema.sql` baut den Worker-Teil des Schemas samt Rolle `appstore_worker` (Superuser nötig). Die Prozess-Tests (`tests/test_worker_process.py`, inkl. `kill -9`) laufen vollständig nur unter Linux.
+7. Drei Formatierer (ruff, black, isort), alle `line-length = 120`.
 
-## 3. Bekannte Fallstricke & Blocker
-1. **Drei Formatter im Einsatz:** `worker` nutzt `ruff`, `black` und `isort`. Alle sind auf `line-length = 120` konfiguriert; bei Lint-Fehlern in CI prüfen, welches Tool die Datei zuletzt formatiert hat.
-2. **Postgres-tfstate Verbindung:** `TFSTATE_DATABASE_URL` muss im Container gesetzt sein; schemas heißen `deployment_{uuid_ohne_bindestriche}`.
-3. **Coverage Gate:** PRs auf `main` verlangen mindestens 60% Testabdeckung.
-4. **Packer Concurrency Lock:** `PackerBuildLock` (auf `spike/dev` ein Postgres-Advisory-Lock, vorher Redis) verhindert redundante Builds identischer Images bei gleichzeitigen Tasks.
-5. **Gemeinsamer Code mit dem Backend:** `app/pgq.py` und `app/task_contract.py` sind identisch mit dem Backend; `tests/test_shared_files.py` prüft den Hash in beiden Repos. Änderung = beide Dateien und beide Hashes.
-6. **Integrationstests brauchen Postgres:** `DATABASE_URL` auf eine Test-DB; `tests/schema.sql` baut den Worker-Teil des Schemas samt Rolle `appstore_worker` (Superuser nötig). Die Prozess-Tests (`tests/test_worker_process.py`, inkl. kill -9) laufen vollständig nur unter Linux.
+## 4. Offen
 
----
-
-## 4. Letzte Übergaben (Historie)
-- **2026-10-25 (Test-Marker, Branch `test/db-tests-never-default-to-unit`):** CI wählt nur `-m unit` und `-m integration`. Der Worker war davor schon geschützt: die Hook in `tests/conftest.py` gibt jedem Test ohne Marker implizit `unit`. Lücke geschlossen: ein Test, der `pg`/`pg_url` anfordert, wird dabei `integration` (die unit-Lane hat keine Datenbank, die Fixture würde ihn dort lautlos überspringen); ein ausdrücklich als `unit` markierter Test mit diesen Fixtures bricht die Sammlung ab. Heute ändert das nichts (25 integration, alle mit `pg`; 457 unit, keiner mit `pg`). Das Backend hat die strengere Variante (`pytest_collection_modifyitems` verweigert Tests ohne Marker, backend#45).
-- **2026-10-09 (.github#5 Postgres-Queue, Branch `spike/dev`):** Celery über `pgq` statt RabbitMQ/Redis; `JobTask` (`app/job_task.py`, `app/job_runtime.py`): Prolog mit Lease, Wiederzustellung nach totem Worker = FAILED `worker_lost` ohne zweiten Lauf, Events in `task_events`, Cancel per `NOTIFY task_cancel` (killpg), Ergebnis + Fernet-versiegelte Outputs/State im Epilog, Freigabe eines geparkten Destroy. Build-Lock als Advisory-Lock. Voraussetzung .github#7 A (Minimal-Umgebung, UID je Slot). Feste Concurrency, Heartbeat-Healthcheck, `poetry.lock` committet. Gefunden im Ende-zu-Ende-Lauf mit der echten Rolle: Der Epilog las Spalten, die die Rolle nur schreiben darf (behoben, Tests laufen jetzt als Rolle). ADR: `deployment/claude_docs/decisions/2026-postgres-queue.md`.
-- **2026-09-18 (Harness 2-Flow Reengineering):** `ci.yml` für `dev`-Branch und Staging-Deploy konfiguriert; Test Coverage Gate für `main` integriert; `HANDOVER.md` aktualisiert.
-- **2026-09-18:** Sicherheits-Dependencies (PR #2) und `claude_docs/` + Graphify (PR #3) in `main` gemergt.
-- **2026-09-17:** Sicherheits-Dependencies in PR #2 aktualisiert (`cryptography`, `gitpython`, `.trivyignore`).
+- Die Windows-App läuft über KubeVirt (`pods.deploy_vm_application`); der Betrieb ist ein eigenes Thema (siehe `deployment/k8s/README.md`).
