@@ -84,7 +84,7 @@ def pg_url():
     """The test database with the worker's tables; skips when it is not reachable."""
     import psycopg
 
-    from app.pgq import libpq_url
+    from app.db import libpq_url
 
     url = libpq_url(os.environ["DATABASE_URL"])
     try:
@@ -102,4 +102,4 @@ def pg(pg_url):
 
     with psycopg.connect(pg_url, autocommit=True) as conn:
         yield conn
-        conn.execute("TRUNCATE task_events, celery_queue, tasks, deployments CASCADE")
+        conn.execute("TRUNCATE task_events, tasks, deployments CASCADE")

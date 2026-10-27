@@ -1,6 +1,6 @@
 # Worker — Überblick
 
-Der Worker ist der Pod-Deployer und konsumiert die Queue `pods`. Jeder Job läuft auf derselben Job-Runtime (`app/job_runtime.py`, `app/job_task.py`): die Task-Zeile `tasks` ist die einzige Wahrheit über den Job.
+Der Worker ist der Pod-Deployer und holt die Tasks aus der Tabelle `tasks` (`app/runner.py`). Jeder Job läuft auf derselben Job-Runtime (`app/job_runtime.py`): die Task-Zeile `tasks` ist die einzige Wahrheit über den Job.
 
 ## Job-Runtime
 
@@ -8,7 +8,7 @@ Der Worker ist der Pod-Deployer und konsumiert die Queue `pods`. Jeder Job läuf
 2. **Während des Jobs:** ein Heartbeat erneuert die Lease alle `TASK_LEASE_SECONDS/3` und erkennt Cancel oder verlorene Lease; ein Listener auf `NOTIFY task_cancel` reagiert sofort. Events und Logzeilen gehen gepuffert in `task_events`; `current_phase` und `progress_pct` der Task-Zeile werden mitgeführt.
 3. **Epilog** (`Job.finish`): Status, Transkript (`logs`) und versiegelte Ergebnisse (`outputs_enc`) in einer Transaktion mit dem Terminal-Event; Lease frei, hinter dem Task geparkte Nachrichten sichtbar, `NOTIFY task_released`.
 
-Die Celery-ID eines Jobs ist die `taskId` der Task-Zeile. Fehler: `Failure` (`app/failure.py`) trägt Transkript, State, Outputs und Commit in die fehlgeschlagene Zeile.
+Ein Job ist eine Task-Zeile (`taskId`). Fehler: `Failure` (`app/failure.py`) trägt Transkript, State, Outputs und Commit in die fehlgeschlagene Zeile.
 
 ## Jobs (Queue `pods`, `app/pod_tasks.py`)
 

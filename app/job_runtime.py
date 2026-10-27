@@ -1,26 +1,34 @@
-"""Run a Celery task as a job on the Postgres queue (.github#5).
+"""Run a task of the queue as a job (.github#5).
 
-Celery delivers the message (``pgq`` transport); this module ties the job
-to its row in ``tasks``, which is the only truth about it:
+The task row in ``tasks`` is the queue entry and the only truth about a job:
 
-- **Prologue** (:func:`start`): ``PENDING -> RUNNING`` with ``claimed_by``
-  and a lease. A message that arrives for a task that is already RUNNING
-  under an expired lease is a redelivery after a dead worker: the task is
-  failed as ``worker_lost`` and the job is **not** run again (a
-  half-applied deployment needs a person). Cancelled or finished tasks
-  are skipped.
+- **Claim** (:func:`claim`): the oldest PENDING task becomes RUNNING with
+  ``claimed_by`` and a lease, in one statement (``FOR UPDATE SKIP LOCKED``:
+  two workers never get the same task). A task waits while another task of
+  its deployment still holds a lease: the destroy the API queues after a
+  cancel starts only once the cancelled job's worker let go of it, or once
+  the lease of a dead worker ran out (security review A-5, race 2).
 - **While it runs**: a heartbeat renews the lease every third of
   ``TASK_LEASE_SECONDS`` and notices a cancel request or a lost lease; a
   listener on ``NOTIFY task_cancel`` reacts at once. Cancelling makes the next
-  :func:`check_cancelled` raise :class:`JobCancelled`.
+  :func:`check_cancelled` raise :class:`JobCancelled`; a job past
+  ``WORKER_JOB_TIMEOUT_SECONDS`` gets :class:`JobTimeLimit` there instead.
   Events (progress, log lines) go into ``task_events`` through a buffered
   writer, which also keeps ``current_phase``/``progress_pct`` current.
 - **Epilogue** (:meth:`Job.finish`): status, logs and the sealed results
   (``outputs_enc``) in one transaction with the terminal event; the lease is
-  released, messages parked behind this task are made visible and
-  ``NOTIFY task_released`` tells the API.
+  released and ``NOTIFY task_released`` tells the workers that a task of the
+  deployment may run now.
 
-The task's Celery id is the task row's ``taskId``.
+A task is never run twice. A worker that dies leaves its task RUNNING; once
+the lease ran out, the API's reconciler fails it as ``worker_lost`` (a
+half-applied deployment needs a person).
+
+The jobs are functions registered under the name the API queues them with
+(:func:`register`, ``tasks.job``); :func:`run` calls one with the task's
+``job_kwargs`` and records its outcome. Several jobs run at once, one per
+thread of the runner (``app.runner``); :func:`current` is the job of the
+calling thread.
 """
 
 from __future__ import annotations
@@ -28,29 +36,31 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import queue
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from psycopg.types.json import Jsonb
 
 from . import db
 from .config import settings
-from .pgq import NOTIFY_PREFIX
+from .failure import Failure
 from .task_contract import (
     EVENT_FAILED,
     EVENT_LOG,
     EVENT_PROGRESS,
     EVENT_SUCCEEDED,
     FAILURE_KIND_INFRASTRUCTURE,
+    FAILURE_KIND_TIME_LIMIT,
     FAILURE_KIND_WORKER,
-    FAILURE_KIND_WORKER_LOST,
     MAX_LOG_EVENTS,
     NOTIFY_TASK_CANCEL,
     NOTIFY_TASK_RELEASED,
     event_payload,
+    result_outputs,
+    result_state,
     seal_results,
     terminal_payload,
 )
@@ -64,13 +74,33 @@ logger = logging.getLogger(__name__)
 # The event writer flushes at least this often while a job runs.
 FLUSH_INTERVAL_SECONDS = 0.2
 FLUSH_BATCH = 200
+# A job still running this long after its time limit is given up: its lease
+# runs out and the API fails the task as worker_lost.
+HARD_LIMIT_GRACE_SECONDS = 300
 
-WORKER_LOST_MESSAGE = (
-    "Der Worker, der diesen Auftrag ausgeführt hat, wurde beendet, bevor der Auftrag "
-    "fertig war. Der Auftrag wird nicht automatisch wiederholt. Bitte prüfen Sie den "
-    "Zustand der Ressourcen und starten Sie die Aktion bei Bedarf erneut."
-)
 CANCELLED_MESSAGE = "Abgebrochen: Die laufende Aktion wurde beendet."
+UNKNOWN_JOB_MESSAGE = (
+    "Der Worker hat den Task-Typ nicht erkannt — Backend und Worker sind nicht synchron. "
+    "Bitte den Administrator informieren; die Aktion wurde nicht ausgeführt."
+)
+
+JobFunction = Callable[..., Any]
+#: The jobs this worker runs, by the name the API queues them under (``tasks.job``).
+JOBS: dict[str, JobFunction] = {}
+
+
+def register(name: str) -> Callable[[JobFunction], JobFunction]:
+    """Register a function as the job ``name``; :func:`run` calls it with the task's ``job_kwargs``.
+
+    It returns the result document (``logs``, outputs, state) or raises
+    :class:`~app.failure.Failure` with what it got that far.
+    """
+
+    def add(function: JobFunction) -> JobFunction:
+        JOBS[name] = function
+        return function
+
+    return add
 
 
 class JobCancelled(BaseException):  # noqa: N818 - not an error, a stop signal
@@ -82,142 +112,143 @@ class JobCancelled(BaseException):  # noqa: N818 - not an error, a stop signal
     """
 
 
+class JobTimeLimit(Exception):  # noqa: N818 - named like the signal it is
+    """The job ran past ``WORKER_JOB_TIMEOUT_SECONDS``; raised at the next check.
+
+    An ``Exception``: the task bodies clean up after it like after any
+    failed step.
+    """
+
+
 # ----------------------------------------------------------------
-# Per-process state (one job at a time per prefork child)
+# Per-process state
 # ----------------------------------------------------------------
+_local = threading.local()
 _lock = threading.Lock()
-_current: Job | None = None
-_listener_pid: int | None = None
+# The jobs of this process by task id, for the cancel listener.
+_running: dict[str, Job] = {}
+_listener_started = False
 
 
 def current() -> Job | None:
-    """The job running in this process, if any."""
-    return _current
+    """The job running in the calling thread, if any."""
+    return getattr(_local, "job", None)
 
 
 def check_cancelled() -> None:
-    """Raise :class:`JobCancelled` if the current job has been cancelled."""
-    job = _current
-    if job is not None and job.cancelled.is_set():
+    """Raise :class:`JobCancelled` if the current job was cancelled, :class:`JobTimeLimit` if its time is up."""
+    job = current()
+    if job is None:
+        return
+    if job.cancelled.is_set():
         raise JobCancelled(job.cancel_reason)
+    if job.out_of_time():
+        raise JobTimeLimit(f"the job ran longer than {settings.WORKER_JOB_TIMEOUT_SECONDS} seconds")
+
+
+def emit(event_type: str, **fields: Any) -> None:
+    """Hand a progress or log event to the job running in the calling thread; without one it is dropped."""
+    job = current()
+    if job is not None:
+        job.emit(event_type, fields)
 
 
 # ----------------------------------------------------------------
-# Prologue
+# Claim
 # ----------------------------------------------------------------
-def start(task_id: str) -> Job | None:
-    """Claim the task row for this worker; None when the job must not run."""
+_CLAIM = """
+    WITH next AS (
+        SELECT t."taskId", t.job, t.job_kwargs
+          FROM tasks t
+         WHERE t.status = 'PENDING'
+           AND NOT EXISTS (
+                SELECT 1 FROM tasks b
+                 WHERE b."deploymentId" = t."deploymentId" AND b.lease_until > now())
+         ORDER BY t.created_at
+         LIMIT 1
+           FOR UPDATE SKIP LOCKED
+    )
+    UPDATE tasks
+       SET status = 'RUNNING', started_at = timezone('UTC', now()), claimed_by = %s,
+           lease_until = now() + make_interval(secs => %s)
+      FROM next
+     WHERE tasks."taskId" = next."taskId"
+    RETURNING tasks."taskId", tasks."deploymentId", tasks.type, next.job, next.job_kwargs
+"""
+
+
+def claim(conn: psycopg.Connection) -> Job | None:
+    """Claim the next task for this worker process; None when there is none it may run."""
     _ensure_cancel_listener()
     me = db.worker_id()
-    with db.connect("claim") as conn:
-        row = conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'RUNNING', started_at = timezone('UTC', now()), claimed_by = %s,
-                   lease_until = now() + make_interval(secs => %s)
-             WHERE "taskId" = %s AND status = 'PENDING'
-            RETURNING "deploymentId", type
-            """,
-            (me, settings.TASK_LEASE_SECONDS, task_id),
-        ).fetchone()
-        if row is not None:
-            return Job(task_id, deployment_id=str(row[0]), task_type=str(row[1]).lower(), worker=me)
-
-        state = conn.execute(
-            """SELECT status, lease_until > now() AS held, claimed_by, "deploymentId", type
-                 FROM tasks WHERE "taskId" = %s""",
-            (task_id,),
-        ).fetchone()
-        if state is None:
-            logger.warning("task %s: no such task row, dropping the message", task_id)
-            return None
-        status, held, holder, deployment_id, task_type = state
-        if status == "RUNNING" and not held:
-            _fail_lost(conn, task_id, str(deployment_id), str(task_type).lower(), holder)
-        elif status == "RUNNING":
-            logger.warning("task %s: still held by %s, dropping this delivery", task_id, holder)
-        else:
-            logger.info("task %s is %s, nothing to run", task_id, status)
+    row = conn.execute(_CLAIM, (me, settings.TASK_LEASE_SECONDS)).fetchone()
+    if row is None:
         return None
+    task_id, deployment_id, task_type, name, kwargs = row
+    return Job(
+        str(task_id),
+        deployment_id=str(deployment_id),
+        task_type=str(task_type).lower(),
+        worker=me,
+        name=name,
+        kwargs=kwargs or {},
+    )
 
 
-def _fail_lost(conn: psycopg.Connection, task_id: str, deployment_id: str, task_type: str, holder: str) -> None:
-    """A redelivered job whose first worker died: fail it, do not run it again."""
-    with conn.transaction():
-        failed = conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'FAILED', finished_at = timezone('UTC', now()), lease_until = NULL, logs = %s
-             WHERE "taskId" = %s AND status = 'RUNNING' AND (lease_until IS NULL OR lease_until < now())
-            RETURNING 1
-            """,
-            # The dead worker never wrote a transcript (that happens at the
-            # end of a job), so there is nothing to keep.
-            (WORKER_LOST_MESSAGE, task_id),
-        ).fetchone()
-        if failed is None:
-            return
-        _insert_events(
-            conn,
-            task_id,
-            [
-                (
-                    EVENT_FAILED,
-                    terminal_payload(
-                        EVENT_FAILED,
-                        deployment_id=deployment_id,
-                        task_id=task_id,
-                        task_type=task_type,
-                        failure_kind=FAILURE_KIND_WORKER_LOST,
-                    ),
-                )
-            ],
-        )
-        conn.execute("SELECT pg_notify(%s, %s)", (NOTIFY_TASK_RELEASED, task_id))
-    logger.warning("task %s: redelivered after worker %s died; failed as worker_lost, not re-run", task_id, holder)
+def _note(transcript_: str, note: str) -> str:
+    return f"{transcript_}\n\n{note}" if transcript_ else note
 
 
-UNKNOWN_TASK_MESSAGE = (
-    "Der Worker hat den Task-Typ nicht erkannt — Backend und Worker sind nicht synchron. "
-    "Bitte den Administrator informieren; die Aktion wurde nicht ausgeführt."
-)
-
-
-def fail_unknown(task_id: str | None, name: str | None) -> None:
-    """Fail a PENDING task whose message names a task this worker does not have."""
-    if not task_id:
-        return
-    try:
-        with db.connect("unknown") as conn, conn.transaction():
-            row = conn.execute(
-                """
-                UPDATE tasks
-                   SET status = 'FAILED', finished_at = timezone('UTC', now()), logs = %s
-                 WHERE "taskId" = %s AND status = 'PENDING'
-                RETURNING "deploymentId", type
-                """,
-                (f"{UNKNOWN_TASK_MESSAGE}\n\n--- Technische Details ---\nunregistered task {name}", task_id),
-            ).fetchone()
-            if row is None:
-                return
-            _insert_events(
-                conn,
-                task_id,
-                [
-                    (
-                        EVENT_FAILED,
-                        terminal_payload(
-                            EVENT_FAILED,
-                            deployment_id=str(row[0]),
-                            task_id=task_id,
-                            task_type=str(row[1]).lower(),
-                            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-                        ),
-                    )
-                ],
+def run(job: Job) -> None:
+    """Run a claimed job's function in the calling thread and record the outcome in the task row."""
+    function = JOBS.get(job.name or "")
+    with job:
+        if function is None:
+            logger.error("task %s: unknown job %r", job.task_id, job.name)
+            job.finish(
+                "FAILED",
+                logs=f"{UNKNOWN_JOB_MESSAGE}\n\n--- Technische Details ---\nunknown job {job.name}",
+                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
             )
-    except Exception:  # noqa: BLE001 - the API's reconciler fails it later anyway
-        logger.exception("could not fail task %s with unknown name %s", task_id, name)
+            return
+        try:
+            result = function(**job.kwargs)
+        except JobCancelled:
+            job.finish("CANCELLED", logs=_note(transcript(job.log_entries), CANCELLED_MESSAGE))
+        except Failure as failure:
+            data = failure.to_dict()
+            job.finish(
+                "FAILED",
+                logs=format_failure_logs(data),
+                terraform_outputs=result_outputs(data),
+                tf_state=result_state(data),
+                failure_kind=FAILURE_KIND_WORKER,
+            )
+        except Exception as exc:
+            logger.exception("task %s failed outside its own error handling", job.task_id)
+            job.finish(
+                "FAILED",
+                logs=_note(transcript(job.log_entries), f"[err] Error: {type(exc).__name__}: {exc}"),
+                failure_kind=FAILURE_KIND_TIME_LIMIT if isinstance(exc, JobTimeLimit) else FAILURE_KIND_WORKER,
+            )
+        except BaseException as exc:
+            # The process is going down: record it rather than leave the row
+            # to the lease, then let it propagate.
+            job.finish(
+                "FAILED",
+                logs=_note(transcript(job.log_entries), f"[err] Worker stopped: {type(exc).__name__}"),
+                failure_kind=FAILURE_KIND_WORKER,
+            )
+            raise
+        else:
+            result = result if isinstance(result, dict) else {}
+            logs = result.get("logs")
+            job.finish(
+                "SUCCESS",
+                logs=json.dumps(logs, ensure_ascii=False) if isinstance(logs, list) else logs,
+                terraform_outputs=result_outputs(result),
+                tf_state=result_state(result),
+            )
 
 
 def _insert_events(conn: psycopg.Connection, task_id: str, events: list[tuple[str, dict]]) -> None:
@@ -232,15 +263,31 @@ def _insert_events(conn: psycopg.Connection, task_id: str, events: list[tuple[st
 # The running job
 # ----------------------------------------------------------------
 class Job:
-    """One claimed task while its body runs in this process."""
+    """One claimed task while its body runs in a thread of this process."""
 
-    def __init__(self, task_id: str, *, deployment_id: str, task_type: str, worker: str) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        *,
+        deployment_id: str,
+        task_type: str,
+        worker: str,
+        name: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+    ) -> None:
         self.task_id = task_id
         self.deployment_id = deployment_id
         self.task_type = task_type
         self.worker = worker
+        # The registered job to run (``app.runner.JOBS``) and its keyword arguments.
+        self.name = name
+        self.kwargs = kwargs or {}
+        self.deadline = time.monotonic() + settings.WORKER_JOB_TIMEOUT_SECONDS
         self.cancelled = threading.Event()
         self.cancel_reason = ""
+        # Set when the job overran its time limit by HARD_LIMIT_GRACE_SECONDS
+        # and its lease is no longer renewed; the runner frees its slot.
+        self.abandoned = threading.Event()
         self._stop = threading.Event()
         self._events: queue.SimpleQueue[tuple[str, dict] | None] = queue.SimpleQueue()
         self._emit_lock = threading.Lock()
@@ -253,9 +300,9 @@ class Job:
 
     # -- lifecycle --------------------------------------------------
     def __enter__(self) -> Job:
-        global _current
+        _local.job = self
         with _lock:
-            _current = self
+            _running[self.task_id] = self
         for target, name in ((self._heartbeat_loop, "lease"), (self._flush_loop, "events")):
             thread = threading.Thread(target=target, name=f"job-{name}-{self.task_id[:8]}", daemon=True)
             thread.start()
@@ -263,21 +310,24 @@ class Job:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        global _current
         self._stop.set()
         self._events.put(None)
         for thread in self._threads:
             thread.join(timeout=10)
         with _lock:
-            if _current is self:
-                _current = None
+            if _running.get(self.task_id) is self:
+                del _running[self.task_id]
+        if current() is self:
+            _local.job = None
+
+    def out_of_time(self) -> bool:
+        return time.monotonic() > self.deadline
 
     # -- events -----------------------------------------------------
     def emit(self, event_type: str, fields: dict[str, Any]) -> None:
         """Queue one event for ``task_events``; never blocks the job, never raises."""
         fields = {key: value for key, value in fields.items() if key not in ("deployment_id", "task_id")}
         if event_type == EVENT_LOG:
-            # Called from the job's thread and from the tools' reader threads.
             with self._emit_lock:
                 self.log_entries.append(fields)
                 self._log_count += 1
@@ -351,6 +401,14 @@ class Job:
         interval = max(settings.TASK_LEASE_SECONDS / 3, 1.0)
         conn: psycopg.Connection | None = None
         while not self._stop.wait(interval):
+            if time.monotonic() > self.deadline + HARD_LIMIT_GRACE_SECONDS:
+                logger.error(
+                    "task %s: still running %ss after its time limit; giving up its lease",
+                    self.task_id,
+                    HARD_LIMIT_GRACE_SECONDS,
+                )
+                self.abandoned.set()
+                break
             try:
                 if conn is None or conn.closed:
                     conn = db.connect("lease")
@@ -379,7 +437,7 @@ class Job:
             conn.close()
 
     def cancel(self, reason: str) -> None:
-        """Stop the job: kill the running tool; the next tool call raises :class:`JobCancelled`."""
+        """Stop the job: the next :func:`check_cancelled` raises :class:`JobCancelled`."""
         if self.cancelled.is_set():
             return
         self.cancel_reason = reason
@@ -396,7 +454,7 @@ class Job:
         tf_state: str | None = None,
         failure_kind: str | None = None,
     ) -> None:
-        """Record the outcome, release the lease and the parked messages; one transaction.
+        """Record the outcome and release the lease; one transaction.
 
         ``status`` is SUCCESS, FAILED or CANCELLED. It only replaces RUNNING:
         a task the API cancelled (or failed as worker_lost) keeps that
@@ -448,13 +506,6 @@ class Job:
                         )
                     ],
                 )
-            released = conn.execute(
-                "UPDATE celery_queue SET visible_after = now(), after_task = NULL WHERE after_task = %s"
-                " RETURNING queue",
-                (self.task_id,),
-            ).fetchall()
-            for queue_name in {row[0] for row in released}:
-                conn.execute("SELECT pg_notify(%s, '')", (NOTIFY_PREFIX + queue_name,))
             conn.execute("SELECT pg_notify(%s, %s)", (NOTIFY_TASK_RELEASED, self.task_id))
         recorded = status if previous is not None and previous[0] == "RUNNING" else (previous or ["?"])[0]
         logger.info("task %s finished: %s", self.task_id, recorded)
@@ -464,12 +515,12 @@ class Job:
 # Cancel listener (one per process)
 # ----------------------------------------------------------------
 def _ensure_cancel_listener() -> None:
-    """Start the LISTEN task_cancel thread of this process (again after a fork)."""
-    global _listener_pid
+    """Start the LISTEN task_cancel thread of this process."""
+    global _listener_started
     with _lock:
-        if _listener_pid == os.getpid():
+        if _listener_started:
             return
-        _listener_pid = os.getpid()
+        _listener_started = True
     threading.Thread(target=_cancel_listen_loop, name="cancel-listener", daemon=True).start()
 
 
@@ -481,8 +532,9 @@ def _cancel_listen_loop() -> None:
                 conn.execute(f"LISTEN {NOTIFY_TASK_CANCEL}")
                 backoff = 1.0
                 for notify in conn.notifies():
-                    job = _current
-                    if job is not None and notify.payload == job.task_id:
+                    with _lock:
+                        job = _running.get(notify.payload)
+                    if job is not None:
                         job.cancel("cancelled")
         except Exception as exc:  # noqa: BLE001 - keep listening
             logger.warning("cancel listener: connection lost (%s); retrying in %.0fs", exc, backoff)
@@ -521,13 +573,16 @@ def transcript(entries: list[dict[str, Any]]) -> str:
 
 
 __all__ = [
-    "FAILURE_KIND_WORKER",
+    "JOBS",
     "Job",
-    "fail_unknown",
     "JobCancelled",
+    "JobTimeLimit",
     "check_cancelled",
+    "claim",
     "current",
+    "emit",
     "format_failure_logs",
-    "start",
+    "register",
+    "run",
     "transcript",
 ]

@@ -86,20 +86,12 @@ def cluster(monkeypatch):
 @pytest.fixture
 def events(monkeypatch):
     recorder = Events()
-    for task in (
-        pod_tasks.deploy_application,
-        pod_tasks.deploy_vm_application,
-        pod_tasks.destroy_deployment,
-        pod_tasks.pause_deployment,
-        pod_tasks.resume_deployment,
-        pod_tasks.redeploy_resource,
-    ):
-        monkeypatch.setattr(task, "send_event", recorder)
+    monkeypatch.setattr(job_runtime, "emit", recorder)
     return recorder
 
 
 def deploy(spec=SPEC, teams=TEAMS, user_vars=None):
-    return pod_tasks.deploy_application.run(
+    return pod_tasks.deploy_application(
         DEP, user_vars=user_vars or {}, teams=teams, commit_sha="c" * 40, spec=spec, owner=uid("teacher")
     )
 
@@ -244,9 +236,9 @@ def test_a_namespace_of_another_deployment_is_never_touched(cluster):
         deploy()
     for task in (pod_tasks.destroy_deployment, pod_tasks.pause_deployment, pod_tasks.resume_deployment):
         with pytest.raises(Failure, match="belongs to another deployment"):
-            task.run(DEP)
+            task(DEP)
     with pytest.raises(Failure, match="belongs to another deployment"):
-        pod_tasks.redeploy_resource.run(DEP, resource_address="team-1-ben")
+        pod_tasks.redeploy_resource(DEP, resource_address="team-1-ben")
 
     assert NS in cluster.namespace_labels and NS not in cluster._terminating
     assert cluster.kinds(NS) == []
@@ -378,18 +370,18 @@ def test_team_files_in_the_shape_the_api_stores_them_reach_the_workloads(cluster
 
 def test_pause_stops_all_pods_and_resume_brings_them_back(cluster):
     deploy()
-    pod_tasks.pause_deployment.run(DEP)
+    pod_tasks.pause_deployment(DEP)
     snap = cluster.snapshot(NS)
     assert snap.pods == [] and all(s.replicas == 0 for s in snap.statefulsets)
     assert "StatefulSet" in cluster.kinds(NS)  # volume claims and secrets stay
-    pod_tasks.resume_deployment.run(DEP)
+    pod_tasks.resume_deployment(DEP)
     snap = cluster.snapshot(NS)
     assert len(snap.pods) == 6 and all(p.ready for p in snap.pods)
 
 
 def test_destroy_removes_the_namespace_and_everything_with_the_label(cluster):
     deploy()
-    result = pod_tasks.destroy_deployment.run(DEP)
+    result = pod_tasks.destroy_deployment(DEP)
     assert result["status"] == "success"
     assert NS not in cluster.namespace_labels
     assert cluster.namespaces(f"appstore.dhbw/deployment-id={DEP}") == []
@@ -397,19 +389,19 @@ def test_destroy_removes_the_namespace_and_everything_with_the_label(cluster):
 
 
 def test_destroy_of_an_already_removed_namespace_succeeds():
-    assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.destroy_deployment(DEP)["status"] == "success"
 
 
 def test_redeploy_restarts_only_that_workload_and_keeps_its_data(cluster):
     deploy()
-    pod_tasks.redeploy_resource.run(DEP, resource_address="team-1-ben")
+    pod_tasks.redeploy_resource(DEP, resource_address="team-1-ben")
     assert cluster.deleted_pods == ["team-1-ben-0"]
     assert cluster.deleted_pvcs == []
 
 
 def test_redeploy_reset_deletes_the_volume(cluster):
     deploy()
-    pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
+    pod_tasks.redeploy_resource(DEP, resource_address="reset:team-1-ben")
     assert cluster.deleted_pvcs == [(NS, "team-1-ben")]
 
 
@@ -417,7 +409,7 @@ def test_redeploy_reset_deletes_the_volume(cluster):
 def test_redeploy_rejects_unknown_or_malformed_workloads(address):
     deploy()
     with pytest.raises(Failure):
-        pod_tasks.redeploy_resource.run(DEP, resource_address=address)
+        pod_tasks.redeploy_resource(DEP, resource_address=address)
 
 
 def test_reset_waits_until_the_volume_is_really_gone(cluster):
@@ -432,7 +424,7 @@ def test_reset_waits_until_the_volume_is_really_gone(cluster):
         real_scale(ns, name, replicas)
 
     cluster.scale = scale
-    pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
+    pod_tasks.redeploy_resource(DEP, resource_address="reset:team-1-ben")
     assert seen_scale_up_with_pvc == []
 
 
@@ -504,7 +496,7 @@ def test_reset_survives_the_new_pod_waiting_for_its_volume(volume_late):
     kube = volume_late(polls=3)
     deploy()
 
-    result = pod_tasks.redeploy_resource.run(DEP, resource_address="reset:team-1-ben")
+    result = pod_tasks.redeploy_resource(DEP, resource_address="reset:team-1-ben")
 
     assert result["status"] == "success"
     assert kube.deleted_pvcs == [(NS, "team-1-ben")]
@@ -548,21 +540,26 @@ class _CancelledJob:
             self._event.set()
         return self._event
 
+    def out_of_time(self):
+        return False
+
 
 def test_a_cancel_ends_the_deploy_and_leaves_the_namespace_to_the_queued_destroy(cluster, monkeypatch):
     cluster.ready_after_polls = 10**6
-    monkeypatch.setattr(job_runtime, "_current", _CancelledJob(lambda: NS in cluster.namespace_labels))
+    job = _CancelledJob(lambda: NS in cluster.namespace_labels)
+    monkeypatch.setattr(job_runtime, "current", lambda: job)
 
     with pytest.raises(job_runtime.JobCancelled):
         deploy()
 
-    monkeypatch.setattr(job_runtime, "_current", None)
-    assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
+    monkeypatch.setattr(job_runtime, "current", lambda: None)
+    assert pod_tasks.destroy_deployment(DEP)["status"] == "success"
     assert NS not in cluster.namespace_labels
 
 
 def test_a_cancel_before_anything_is_created_creates_nothing(cluster, monkeypatch):
-    monkeypatch.setattr(job_runtime, "_current", _CancelledJob(lambda: True))
+    job = _CancelledJob(lambda: True)
+    monkeypatch.setattr(job_runtime, "current", lambda: job)
     with pytest.raises(job_runtime.JobCancelled):
         deploy()
     assert cluster.objects == {}
@@ -581,9 +578,9 @@ def test_worker_simulate_singleton_persists_across_tasks(events, monkeypatch):
     assert NS in sim_kube.namespace_labels
     for account in accounts_of(result).values():
         assert account["url"].endswith(".apps.localhost")
-    assert pod_tasks.pause_deployment.run(DEP)["status"] == "success"
-    assert pod_tasks.resume_deployment.run(DEP)["status"] == "success"
-    assert pod_tasks.destroy_deployment.run(DEP)["status"] == "success"
+    assert pod_tasks.pause_deployment(DEP)["status"] == "success"
+    assert pod_tasks.resume_deployment(DEP)["status"] == "success"
+    assert pod_tasks.destroy_deployment(DEP)["status"] == "success"
     assert NS not in sim_kube.namespace_labels
 
 
@@ -619,7 +616,7 @@ def image_namespace(cluster):
 
 
 def deploy_vm(spec=VM_SPEC, teams=VM_TEAMS):
-    return pod_tasks.deploy_vm_application.run(
+    return pod_tasks.deploy_vm_application(
         DEP, user_vars={}, teams=teams, commit_sha="c" * 40, spec=spec, owner=uid("teacher")
     )
 
@@ -662,7 +659,7 @@ def test_destroying_a_vm_deployment_removes_its_grant_in_the_image_namespace(clu
     deploy_vm()
     assert grants(cluster)
 
-    pod_tasks.destroy_deployment.run(DEP)
+    pod_tasks.destroy_deployment(DEP)
 
     assert grants(cluster) == []
     assert cluster.snapshot(NS).exists is False
@@ -670,7 +667,7 @@ def test_destroying_a_vm_deployment_removes_its_grant_in_the_image_namespace(clu
 
 def test_a_pod_deployment_touches_no_image_namespace(cluster, events):
     deploy()
-    pod_tasks.destroy_deployment.run(DEP)
+    pod_tasks.destroy_deployment(DEP)
     assert grants(cluster) == []
 
 
@@ -688,7 +685,7 @@ def test_pausing_a_vm_halts_it_and_scales_its_proxy_to_zero(cluster, events, ima
     deploy_vm()
     assert vm_strategy(cluster) == "Always" and len(cluster.snapshot(NS).pods) == 2
 
-    result = pod_tasks.pause_deployment.run(DEP)
+    result = pod_tasks.pause_deployment(DEP)
 
     assert result["status"] == "success"
     assert cluster.run_strategies == [(NS, VM, "Halted")]
@@ -703,7 +700,7 @@ def test_pausing_a_vm_waits_until_its_pods_are_gone(cluster, events, image_names
     deploy_vm()
     cluster.stop_polls = 3
 
-    pod_tasks.pause_deployment.run(DEP)
+    pod_tasks.pause_deployment(DEP)
 
     assert cluster.snapshot(NS).pods == []
 
@@ -714,14 +711,14 @@ def test_a_pause_that_leaves_pods_behind_fails(cluster, events, image_namespace,
     monkeypatch.setattr(settings, "K8S_DELETE_TIMEOUT_SECONDS", 0)
 
     with pytest.raises(Failure, match="timed out"):
-        pod_tasks.pause_deployment.run(DEP)
+        pod_tasks.pause_deployment(DEP)
 
 
 def test_resuming_a_vm_starts_it_and_its_proxy_and_waits_until_both_are_ready(cluster, events, image_namespace):
     deploy_vm()
-    pod_tasks.pause_deployment.run(DEP)
+    pod_tasks.pause_deployment(DEP)
 
-    result = pod_tasks.resume_deployment.run(DEP)
+    result = pod_tasks.resume_deployment(DEP)
 
     assert result["status"] == "success"
     assert cluster.run_strategies[-1] == (NS, VM, "Always")
@@ -734,12 +731,12 @@ def test_resuming_a_vm_starts_it_and_its_proxy_and_waits_until_both_are_ready(cl
 
 def test_a_resumed_vm_that_never_boots_fails_after_the_vm_timeout(cluster, events, image_namespace, monkeypatch):
     deploy_vm()
-    pod_tasks.pause_deployment.run(DEP)
+    pod_tasks.pause_deployment(DEP)
     cluster.ready_after_polls = 10**6
     monkeypatch.setattr(settings, "K8S_VM_READY_TIMEOUT_SECONDS", 0)
 
     with pytest.raises(Failure, match="timed out"):
-        pod_tasks.resume_deployment.run(DEP)
+        pod_tasks.resume_deployment(DEP)
 
 
 def test_restarting_a_vm_halts_waits_for_the_pod_to_go_and_starts_it_again(cluster, events, image_namespace):
@@ -747,7 +744,7 @@ def test_restarting_a_vm_halts_waits_for_the_pod_to_go_and_starts_it_again(clust
     cluster.stop_polls = 2
     old_pod = cluster.snapshot(NS).pods[0].name
 
-    result = pod_tasks.redeploy_resource.run(DEP, resource_address=VM)
+    result = pod_tasks.redeploy_resource(DEP, resource_address=VM)
 
     assert result["status"] == "success"
     assert cluster.run_strategies == [(NS, VM, "Halted"), (NS, VM, "Always")]
@@ -762,7 +759,7 @@ def test_resetting_a_vm_is_not_supported(cluster, events, image_namespace):
     deploy_vm()
 
     with pytest.raises(Failure, match="reset is not supported"):
-        pod_tasks.redeploy_resource.run(DEP, resource_address=f"reset:{VM}")
+        pod_tasks.redeploy_resource(DEP, resource_address=f"reset:{VM}")
 
     assert cluster.run_strategies == [] and cluster.deleted_pvcs == []
 
@@ -771,7 +768,7 @@ def test_resetting_a_vm_is_not_supported(cluster, events, image_namespace):
 def test_restarting_an_unknown_vm_fails(cluster, events, image_namespace, address):
     deploy_vm()
     with pytest.raises(Failure):
-        pod_tasks.redeploy_resource.run(DEP, resource_address=address)
+        pod_tasks.redeploy_resource(DEP, resource_address=address)
     assert cluster.run_strategies == []
 
 
@@ -791,7 +788,7 @@ def test_a_failing_grant_delete_never_fails_the_destroy_and_the_namespace_goes(
     kube.namespace_labels["vm-poc"] = {}
     deploy_vm()
 
-    result = pod_tasks.destroy_deployment.run(DEP)
+    result = pod_tasks.destroy_deployment(DEP)
 
     assert result["status"] == "success"
     assert kube.snapshot(NS).exists is False
@@ -805,7 +802,7 @@ def test_the_namespace_is_deleted_before_the_grant(cluster, events, image_namesp
     monkeypatch.setattr(cluster, "delete_namespace", lambda n: (order.append("namespace"), real_ns(n))[1])
     monkeypatch.setattr(cluster, "delete_object", lambda *a: (order.append("grant"), real_obj(*a))[1])
 
-    pod_tasks.destroy_deployment.run(DEP)
+    pod_tasks.destroy_deployment(DEP)
 
     assert order == ["namespace", "grant"]
 
@@ -818,7 +815,7 @@ def test_a_destroy_after_the_namespace_is_gone_still_removes_the_grant(cluster, 
     assert NS not in cluster.namespace_labels
     assert grants(cluster)  # the grant of the image namespace outlived it
 
-    pod_tasks.destroy_deployment.run(DEP)
+    pod_tasks.destroy_deployment(DEP)
 
     assert grants(cluster) == []
 

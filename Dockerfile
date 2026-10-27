@@ -26,7 +26,7 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --only=main --no-ansi
 
 # -----------------------------------------------------------------------------
-# Pod deployer (.github#4): pod jobs only (queue "pods"). It renders the
+# Pod deployer (.github#4): pod and KubeVirt jobs only. It renders the
 # Kubernetes objects itself and runs nothing from the app repositories, so it
 # needs no git, OpenTofu, Packer or OpenStack CLI, and no root.
 # -----------------------------------------------------------------------------
@@ -57,4 +57,4 @@ USER 10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
 
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "pods", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+CMD ["python", "-m", "app.runner"]

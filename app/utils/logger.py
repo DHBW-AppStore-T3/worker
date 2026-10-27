@@ -9,7 +9,7 @@ Three concerns are kept separate here:
   a dedicated sink so the buffer and the Python logger stay independent.
 * **Event sink** — an optional callable that ships every entry to a
   downstream consumer. The deploy task wires the task's live events here
-  (``JobTask.send_event`` -> ``task_events``) so the API can stream entries
+  (``job_runtime.emit`` -> ``task_events``) so the API can stream entries
   to the browser.
 
 A single ``StructuredLogger`` orchestrates these. The class is threadsafe:
@@ -261,7 +261,7 @@ class _ConsoleSink:
 EventEmitter = Callable[[str, dict[str, Any]], None]
 """Signature: ``emit(event_name, payload_dict) -> None``.
 
-The deploy task plugs the task's ``send_event`` here so every log entry
+The deploy job plugs ``job_runtime.emit`` in here so every log entry
 also turns into a ``task-log`` event on the bus. ``None`` disables it.
 """
 

@@ -7,7 +7,7 @@ Pod-Job-Meldungen (Phasen, Wartezustand, Fehlergründe)
 StructuredLogger (app/utils/logger.py)
         ├─ Speicher-Buffer      → tasks.logs (Transkript, am Ende)
         ├─ Konsole              → docker logs
-        └─ Event-Sink           → JobTask.send_event (app/job_task.py)
+        └─ Event-Sink           → job_runtime.emit (app/job_runtime.py)
                                       │ Puffer, Batch-INSERT alle 200 ms (app/job_runtime.py)
                                       ▼
                            task_events (Postgres)
