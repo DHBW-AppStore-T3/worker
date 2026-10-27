@@ -190,6 +190,18 @@ class _Job:
         }
 
 
+def not_answering_reason(snap: Snapshot) -> str | None:
+    """Why a pod that runs is not ready: its app does not answer on its port, with the readiness probe's last word."""
+    for pod in snap.pods:
+        if pod.phase == "Running" and not pod.ready and not pod.waiting_reason:
+            probe = next(
+                (e.message for e in reversed(snap.events) if e.reason == "Unhealthy" and e.object == f"Pod/{pod.name}"),
+                None,
+            )
+            return f"Pod {pod.name} runs, but its app does not answer on its port" + (f": {probe}" if probe else "")
+    return None
+
+
 def unschedulable_reason(pod: PodInfo) -> str:
     """Why ``pod`` cannot be scheduled, in words: its volume, the capacity, or its placement."""
     message = pod.message or ""
@@ -306,7 +318,10 @@ def wait_until(
             raise RuntimeError(reason)
         if _clock() > deadline:
             stuck = next((pod for pod in snap.pods if pod.unschedulable), None) if check_failure else None
-            detail = f" ({unschedulable_reason(stuck)})" if stuck is not None else ""
+            why = unschedulable_reason(stuck) if stuck is not None else None
+            if why is None and check_failure:
+                why = not_answering_reason(snap)
+            detail = f" ({why})" if why else ""
             raise RuntimeError(f"timed out after {int(timeout)} s waiting for {what}{detail}")
         sleep(settings.K8S_POLL_INTERVAL_SECONDS)
 
