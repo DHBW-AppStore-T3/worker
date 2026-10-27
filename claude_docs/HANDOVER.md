@@ -4,7 +4,7 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 
 ## 1. Zustand
 
-- **Stack:** Python 3.11, Poetry, Celery 5 über den Postgres-Transport `pgq`, psycopg 3, kubernetes-Client.
+- **Stack:** Python 3.11, Poetry, psycopg 3 (Task-Queue in Postgres, eigener Runner), kubernetes-Client.
 - **Image:** ein Docker-Target `pod-deployer` (Queue `pods`, UID 10001); `ghcr.io/dhbw-appstore-t3/worker-pods`, in Kubernetes die Komponente `pod-deployer`. Der OpenStack-VM-Pfad (Image `runtime`, Queue `vm`) ist entfernt (.github#12).
 - **Isolation:** Datenbankrolle `appstore_worker`; Fernet-Schlüssel nur für Ergebnisse (siehe `claude_docs/decisions/`).
 - **Branches:** `dev` → Staging, `main` → Produktion. Feature-Branches gehen per PR auf `dev`.
@@ -12,11 +12,11 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 
 ## 2. CI (`.github/workflows/ci.yml`, Branches `main` und `dev`)
 
-Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service `worker_test`, echter `celery worker`) · Coverage (Gate ≥ 60 %) · Security (Trivy, pip-audit) · Build des Targets `pod-deployer` · Image-Scan · Push nach `ghcr.io` (Push auf `main`/`dev`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment`.
+Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service `worker_test`, echter Runner) · Coverage (Gate ≥ 60 %) · Security (Trivy, pip-audit) · Build des Targets `pod-deployer` · Image-Scan · Push nach `ghcr.io` (Push auf `main`/`dev`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment`.
 
 ## 3. Regeln im Code
 
-1. `app/pgq.py` und `app/task_contract.py` sind byte-gleich mit dem Backend (`tests/test_shared_files.py` prüft den Hash). Änderung immer in beiden Repos, beide Hashes.
+1. `app/task_contract.py` und `app/k8s/` sind byte-gleich mit dem Backend (`tests/test_shared_files.py` prüft den Hash). Änderung immer in beiden Repos, beide Hashes.
 2. `app/upload_mac.py` bleibt im Takt mit `backend/app/utils/upload_mac.py`.
 3. Die Grenzwerte (`APP_IMAGE_REGISTRY_ALLOWLIST`, `APP_MAX_*`, `APP_VM_IMAGE_NAMESPACES`) haben in API und Worker dieselben Werte; der Worker prüft erneut.
 4. Der Name `pods.*` und die Queue `pods` gelten auch für KubeVirt-Jobs (`pods.deploy_vm_application`) und bleiben bestehen.

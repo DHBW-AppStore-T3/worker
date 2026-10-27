@@ -112,8 +112,8 @@ jobs:
     needs: [test-unit]
 
     # The task queue is a Postgres table (.github#5): the integration tests
-    # build the worker's part of the schema (tests/schema.sql) and run a
-    # real ``celery worker`` against it.
+    # build the worker's part of the schema (tests/schema.sql) and run the
+    # real runner (``python -m app.runner``) against it.
     services:
       postgres:
         image: postgres:16-alpine

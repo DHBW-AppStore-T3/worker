@@ -1,10 +1,10 @@
 # Worker
 
-Führt die Deployment-Aufträge des AppStore aus. Holt Jobs aus der Postgres-Queue `pgq`, schreibt Fortschritt, Logs und versiegelte Ergebnisse in die Datenbank der API.
+Führt die Deployment-Aufträge des AppStore aus. Holt Jobs aus der Postgres-Queue (die Tabelle `tasks` der API), schreibt Fortschritt, Logs und versiegelte Ergebnisse in die Datenbank der API. Start: `python -m app.runner`.
 
-Image und Docker-Target `pod-deployer`, Queue `pods`, läuft als UID 10001 ohne Root. Der Worker rendert die Kubernetes-Objekte einer App mit `appstore.yaml` selbst (`runtime: kubernetes` und `kubevirt-vm`) und führt nichts aus dem App-Repository aus.
+Image und Docker-Target `pod-deployer`, läuft als UID 10001 ohne Root. Der Worker rendert die Kubernetes-Objekte einer App mit `appstore.yaml` selbst (`runtime: kubernetes` und `kubevirt-vm`) und führt nichts aus dem App-Repository aus.
 
-Aufgaben (Celery-Namen): `pods.deploy_application`, `pods.deploy_vm_application` (KubeVirt), `pods.destroy_deployment`, `pods.pause_deployment`, `pods.resume_deployment`, `pods.redeploy_resource`.
+Jobs (`tasks.job`): `pods.deploy_application`, `pods.deploy_vm_application` (KubeVirt), `pods.destroy_deployment`, `pods.pause_deployment`, `pods.resume_deployment`, `pods.redeploy_resource`.
 
 Den früheren OpenStack-VM-Pfad (Queue `vm`, Packer, OpenTofu) gibt es nicht mehr (.github#12).
 
@@ -21,7 +21,7 @@ cd deployment
 make init
 ```
 
-Lokal gibt es einen Worker-Container `worker-sim` (`Dockerfile.dev`): ein Prozess (`--pool=solo`), Queue `pods`, `WORKER_SIMULATE=true` (Pod-Jobs gegen In-Memory-`FakeKube`, kein Cluster nötig; der Zustand ist nach einem Worker-Neustart weg).
+Lokal gibt es einen Worker-Container `worker-sim` (`Dockerfile.dev`): ein Job zur Zeit, `WORKER_SIMULATE=true` (Pod-Jobs gegen In-Memory-`FakeKube`, kein Cluster nötig; der Zustand ist nach einem Worker-Neustart weg).
 
 | Befehl (in `deployment/`) | Wirkung |
 |---|---|
@@ -37,7 +37,7 @@ Lint wie CI (im Container nach `make shell-worker` oder mit lokalem Poetry):
 poetry run ruff check . && poetry run black --check . && poetry run isort --check-only . && poetry run mypy app/ --ignore-missing-imports
 ```
 
-Tests ohne DB-Fixture gelten automatisch als `unit`, mit `pg`/`pg_url`-Fixture als `integration` (`tests/conftest.py`). Integrationstests bauen den Worker-Teil des Schemas aus `tests/schema.sql` in der Datenbank aus `DATABASE_URL` und starten einen echten `celery worker`.
+Tests ohne DB-Fixture gelten automatisch als `unit`, mit `pg`/`pg_url`-Fixture als `integration` (`tests/conftest.py`). Integrationstests bauen den Worker-Teil des Schemas aus `tests/schema.sql` in der Datenbank aus `DATABASE_URL` und starten den echten Runner (`python -m app.runner`).
 
 Die Umgebung des Dev-Containers (`WORKER_SIMULATE`, `RESULTS_ENCRYPTION_KEY`, Rolle `appstore_worker` in `DATABASE_URL` …) ist nicht die von CI. Rezept mit der Umgebung von CI (in `deployment/`; Test-Datenbank einmalig anlegen):
 
@@ -61,7 +61,6 @@ Ergebnis mit dem Stand `dev`: 183 Unit-Tests und 17 Integrationstests bestanden.
 | Variable | Bedeutung | Standard |
 |---|---|---|
 | `DATABASE_URL` | Anwendungs-Postgres als Rolle `appstore_worker` | – |
-| `CELERY_BROKER_URL` | leer: `pgq+` + `DATABASE_URL` | leer |
 | `RESULTS_ENCRYPTION_KEY` | Fernet-Schlüssel der Task-Ergebnisse, gleich wie in der API; bevorzugt vor dem Credential-Schlüssel | leer (dann Credential-Schlüssel) |
 | `CREDENTIAL_ENCRYPTION_KEY` | Rückfall-Schlüssel für Ergebnisse, die vor `RESULTS_ENCRYPTION_KEY` versiegelt wurden | leer |
 | `UPLOAD_MAC_REQUIRED` | Uploads müssen das Siegel der API tragen | `true` |
@@ -72,31 +71,30 @@ Ergebnis mit dem Stand `dev`: 183 Unit-Tests und 17 Integrationstests bestanden.
 | `K8S_READY_TIMEOUT_SECONDS`, `K8S_DELETE_TIMEOUT_SECONDS`, `K8S_UNSCHEDULABLE_GRACE_SECONDS` | Wartezeiten | 600, 300, 60 |
 | `K8S_MAX_WORKLOADS_PER_DEPLOYMENT` | Obergrenze | 60 |
 | `TASK_LEASE_SECONDS` | Lease der Task-Zeile (Erneuerung alle ⅓) | 90 |
-| `WORKER_QUEUE_VISIBILITY_SECONDS` | Lease der Queue-Nachricht | 300 |
-| `WORKER_JOB_TIMEOUT_SECONDS` | Soft-Limit je Job (Hard-Limit +300 s) | 7200 |
-| `WORKER_HEARTBEAT_FILE` | alle 30 s berührt; Healthcheck prüft das Alter (max. 120 s) | `/tmp/worker-heartbeat` |
+| `WORKER_CONCURRENCY` | Jobs gleichzeitig, je ein Thread (mit `WORKER_SIMULATE` immer 1) | 4 |
+| `WORKER_POLL_INTERVAL_SECONDS` | Suche nach Arbeit ohne `NOTIFY` | 5 |
+| `WORKER_JOB_TIMEOUT_SECONDS` | Zeitlimit je Job (danach scheitert er beim nächsten Check; 300 s später wird die Lease aufgegeben) | 7200 |
+| `WORKER_HEARTBEAT_FILE` | in jeder Runde des Runners berührt; Healthcheck prüft das Alter (max. 120 s) | `/tmp/worker-heartbeat` |
 | `WORKER_SIMULATE` | Pod-Jobs gegen `FakeKube` (nur `APP_ENV=development`) | `false` |
 
 ## Code-Struktur
 
 ```
 app/
-├── celery_app.py     Celery-App, Transport pgq, Routing, Heartbeat-Datei
+├── runner.py         Der Prozess: Slots, Claim, LISTEN, Heartbeat-Datei, SIGTERM
 ├── config.py         Settings
 ├── db.py             DB-Zugriff (psycopg 3, SQL), Rolle appstore_worker
-├── job_task.py       Basisklasse aller Jobs (Events, Cancel)
-├── job_runtime.py    Prolog/Epilog auf der Task-Zeile, Lease, Event-Schreiber
+├── job_runtime.py    Claim, Lease, Cancel, Zeitlimit, Event-Schreiber, Ergebnis; Job-Registry
 ├── failure.py        Failure: strukturierter Fehler mit Transkript, State, Outputs
-├── pod_tasks.py      Die Jobs (Queue pods, Pods und KubeVirt)
+├── pod_tasks.py      Die Jobs (Pods und KubeVirt)
 ├── phase_tracker.py  Fortschrittsphasen
 ├── k8s/              spec (appstore.yaml), render, kube (API-Client), fake (FakeKube)
 ├── utils/            crypto (Fernet), logger (StructuredLogger)
-├── pgq.py            Kombu-Transport (identisch mit backend)
 ├── task_contract.py  Event-/Ergebnis-Vertrag (identisch mit backend)
 ├── upload_mac.py     Siegel der API auf Uploads prüfen (im Takt mit backend/app/utils/upload_mac.py)
 ```
 
-`pgq.py` und `task_contract.py` sind byte-gleich mit dem Backend; `tests/test_shared_files.py` prüft den Hash.
+`task_contract.py` und `k8s/` sind byte-gleich mit dem Backend; `tests/test_shared_files.py` prüft den Hash.
 
 ## Ablauf eines Jobs
 

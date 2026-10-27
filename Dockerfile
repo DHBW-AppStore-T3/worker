@@ -25,8 +25,12 @@ RUN pip install --no-cache-dir poetry
 COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --only=main --no-ansi
 
+# The venv's own pip is not needed to run the worker, and it bundles copies of
+# urllib3, msgpack and pkg_resources that Trivy reports (see the next stage).
+RUN .venv/bin/python -m pip uninstall -y pip
+
 # -----------------------------------------------------------------------------
-# Pod deployer (.github#4): pod jobs only (queue "pods"). It renders the
+# Pod deployer (.github#4): pod and KubeVirt jobs only. It renders the
 # Kubernetes objects itself and runs nothing from the app repositories, so it
 # needs no git, OpenTofu, Packer or OpenStack CLI, and no root.
 # -----------------------------------------------------------------------------
@@ -38,10 +42,12 @@ ARG SECURITY_REFRESH
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
     useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin appstore
 
-# The base image's pip / setuptools / wheel (unused here, the worker runs from
-# the venv) with their security fixes, as in the runtime stage: Trivy scans
-# the system site-packages too.
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# No pip, setuptools or wheel in the base image's Python: the worker runs from
+# the venv and installs nothing at runtime. Trivy scans these system
+# site-packages too, and pip bundles its own urllib3, msgpack and
+# pkg_resources (pip/_vendor/bom.cdx.json); even the newest pip ships
+# versions with HIGH CVEs, so removing it is the fix, not an upgrade.
+RUN python -m pip uninstall -y pip setuptools wheel
 
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
@@ -57,4 +63,4 @@ USER 10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
 
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "pods", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+CMD ["python", "-m", "app.runner"]

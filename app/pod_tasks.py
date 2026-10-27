@@ -1,17 +1,17 @@
 """Jobs for apps that run in the cluster: pods (``runtime: kubernetes``, an appstore.yaml;
 .github#4) and KubeVirt VMs (``runtime: kubevirt-vm``, ``deploy_vm_application``).
 
-Historic naming: the pod jobs came first, so the module, the Celery names
-``pods.*`` and the queue ``pods`` also cover the VM jobs. Deployed workers and
-queued tasks use these names, so they stay.
+Historic naming: the pod jobs came first, so the module and the job names
+``pods.*`` also cover the VM jobs. Queued tasks carry these names, so they
+stay.
 
 The API read and validated the app's spec at the pinned commit and put it into
 the job, so this worker never clones or runs anything from the app repository:
 it validates the spec again, renders the Kubernetes objects itself
 (:mod:`app.k8s.render`), applies them with Server-Side Apply and waits for
 them. There is no OpenTofu state; a deployment's state is its namespace
-``dep-<id>``. The jobs run on the same job runtime as the VM jobs (queue
-``pods``): live phases and logs, lease, cancel checked in every wait loop,
+``dep-<id>``. The jobs run on the job runtime (:mod:`app.job_runtime`): live
+phases and logs, lease, cancel and time limit checked in every wait loop,
 results sealed into the task row. Ported from the pod MVP.
 
 The pod deployer runs without root and without OpenTofu or Packer. Before it
@@ -30,10 +30,8 @@ from collections.abc import Callable
 from typing import Any
 
 from . import job_runtime, upload_mac
-from .celery_app import celery_app
 from .config import settings
 from .failure import Failure
-from .job_task import JobTask
 from .k8s.fake import FakeKube
 from .k8s.kube import Kube, KubeApi, PodInfo, Snapshot, deployment_selector
 from .k8s.render import (
@@ -161,11 +159,11 @@ def _teams(teams: dict[str, list]) -> list[Team]:
 class _Job:
     """Logger, live events and phase bar of one pod job."""
 
-    def __init__(self, bound_task: Any, action: str, deployment_id: str, phases: tuple[str, ...]):
+    def __init__(self, action: str, deployment_id: str, phases: tuple[str, ...]):
         self.deployment_id = deployment_id
         self.logger = get_logger(f"{action}:{deployment_id}", correlation_id=deployment_id)
         self.logger.set_event_emitter(
-            lambda name, payload: bound_task.send_event(name, deployment_id=deployment_id, **payload)
+            lambda name, payload: job_runtime.emit(name, deployment_id=deployment_id, **payload)
         )
         self.tracker = PhaseTracker(self.logger, phases)
         self.action = action
@@ -476,9 +474,8 @@ def _cleanup_after_failure(kube: Kube, dep: DeploymentCtx, logger: Any) -> None:
         logger.warning(f"Could not remove {dep.namespace}: {e}", category=LogCategory.WARNING)
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.deploy_application")
+@job_runtime.register("pods.deploy_application")
 def deploy_application(
-    self,
     deployment_id: str,
     user_vars: dict[str, Any] | None = None,
     teams: dict[str, list] | None = None,
@@ -493,7 +490,7 @@ def deploy_application(
     is raised with a readable reason (ImagePullBackOff, no capacity, quota, ...).
     A cancel leaves it to the destroy the API queues behind this job.
     """
-    job = _Job(self, "deploy", deployment_id, PHASES_DEPLOY)
+    job = _Job("deploy", deployment_id, PHASES_DEPLOY)
     dep = DeploymentCtx(id=deployment_id, owner=owner)
     kube: Kube | None = None
     user_vars = user_vars or {}
@@ -567,9 +564,8 @@ def _vm_all_ready(expected: set[str]) -> Callable[[Snapshot], bool]:
     return check
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.deploy_vm_application")
+@job_runtime.register("pods.deploy_vm_application")
 def deploy_vm_application(
-    self,
     deployment_id: str,
     user_vars: dict[str, Any] | None = None,
     teams: dict[str, list] | None = None,
@@ -579,7 +575,7 @@ def deploy_vm_application(
     **_: Any,
 ) -> dict[str, Any]:
     """Deploy a kubevirt-vm app: namespace, PVC clone, VirtualMachine, noVNC proxy, wait."""
-    job = _Job(self, "deploy_vm", deployment_id, PHASES_DEPLOY)
+    job = _Job("deploy_vm", deployment_id, PHASES_DEPLOY)
     dep = DeploymentCtx(id=deployment_id, owner=owner)
     kube: Kube | None = None
     user_vars = user_vars or {}
@@ -632,10 +628,10 @@ def deploy_vm_application(
     return job.result(commit_info={"hash": commit_sha or "", "message": "", "author": ""}, terraform_outputs=outputs)
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.destroy_deployment")
-def destroy_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
+@job_runtime.register("pods.destroy_deployment")
+def destroy_deployment(deployment_id: str, **_: Any) -> dict[str, Any]:
     """Delete the namespace (which removes everything in it) and wait until it is gone."""
-    job = _Job(self, "destroy", deployment_id, PHASES_DESTROY)
+    job = _Job("destroy", deployment_id, PHASES_DESTROY)
     dep = DeploymentCtx(id=deployment_id)
     try:
         job.mark(PHASE_STARTING, "Starting")
@@ -692,14 +688,14 @@ def _start_vms(kube: Kube, dep: DeploymentCtx, snap: Snapshot, vms: set[str]) ->
         kube.scale_deployment(dep.namespace, d.name, 1)
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.pause_deployment")
-def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
+@job_runtime.register("pods.pause_deployment")
+def pause_deployment(deployment_id: str, **_: Any) -> dict[str, Any]:
     """Scale every workload to zero; volumes and secrets stay, so resume brings the data back.
 
     kubevirt-vm: every VirtualMachine gets ``runStrategy: Halted`` (KubeVirt then removes the VMI
     and the virt-launcher pod; the disk claim stays) and every noVNC proxy is scaled to 0.
     """
-    job = _Job(self, "pause", deployment_id, PHASES_PAUSE)
+    job = _Job("pause", deployment_id, PHASES_PAUSE)
     dep = DeploymentCtx(id=deployment_id)
     try:
         job.mark(PHASE_STARTING, "Starting")
@@ -718,10 +714,10 @@ def pause_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
     return job.result(terraform_outputs={})
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.resume_deployment")
-def resume_deployment(self, deployment_id: str, **_: Any) -> dict[str, Any]:
+@job_runtime.register("pods.resume_deployment")
+def resume_deployment(deployment_id: str, **_: Any) -> dict[str, Any]:
     """Scale every workload back to one and wait until it is ready."""
-    job = _Job(self, "resume", deployment_id, PHASES_RESUME)
+    job = _Job("resume", deployment_id, PHASES_RESUME)
     dep = DeploymentCtx(id=deployment_id)
     try:
         job.mark(PHASE_STARTING, "Starting")
@@ -786,14 +782,14 @@ def _restart_vm(job: _Job, kube: Kube, dep: DeploymentCtx, snap: Snapshot, workl
     job.logger.success(f"{workload} is running again", category=LogCategory.STATUS)
 
 
-@celery_app.task(bind=True, base=JobTask, name="pods.redeploy_resource")
-def redeploy_resource(self, deployment_id: str, resource_address: str | None = None, **_: Any) -> dict[str, Any]:
+@job_runtime.register("pods.redeploy_resource")
+def redeploy_resource(deployment_id: str, resource_address: str | None = None, **_: Any) -> dict[str, Any]:
     """Restart one team's or person's workload by deleting its pod; the data stays.
 
     ``resource_address`` is the workload name; ``reset:<name>`` also deletes
     the volume, so the workload starts from scratch.
     """
-    job = _Job(self, "redeploy", deployment_id, PHASES_REDEPLOY)
+    job = _Job("redeploy", deployment_id, PHASES_REDEPLOY)
     dep = DeploymentCtx(id=deployment_id)
     try:
         job.mark(PHASE_STARTING, "Starting")

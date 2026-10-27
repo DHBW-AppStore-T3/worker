@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "worker"
 version = "0.1.0"
-description = "Celery Worker für Click-n-Deploy"
+description = "Worker für Click-n-Deploy: führt die Jobs der Postgres-Task-Queue aus"
 license = "Apache-2.0"
 package-mode = false
 authors = [
     "Your Name <your.email@example.com>"
 ]
-keywords = ["celery", "postgres", "kubernetes", "worker"]
+keywords = ["postgres", "kubernetes", "worker"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -18,17 +18,13 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
-# Broker: the API's Postgres through the pgq transport (app/pgq.py,
-# .github#5); no RabbitMQ, no Redis.
-celery = "^5.3.4"
-# psycopg 3: transport, task events, leases, cancel LISTEN, build lock.
+# psycopg 3: the task queue (tasks table, LISTEN/NOTIFY), task events, leases.
 psycopg = {extras = ["binary"], version = ">=3.2"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.14.2"
 python-dotenv = "^1.0.0"
 pyyaml = "^6.0.1"
 cryptography = ">=50.0.1"
-msgpack = ">=1.2.1"
 # Pod apps (.github#4): the pod deployer applies and watches namespaces.
 kubernetes = ">=31.0.0"
 
@@ -45,7 +41,7 @@ pytest-asyncio = "^0.23"
 pytest-cov = "^4.1"
 # pytest-timeout: kills a single test after ``timeout`` seconds so
 # a hung dependency call (e.g. a real git clone that escaped its
-# mock, a Celery broker connection that wasn't faked) cannot
+# mock, a database connection that wasn't faked) cannot
 # freeze the entire run. ``timeout_method = "thread"`` is essential
 # — the default ``signal`` method cannot interrupt C-extension
 # calls or subprocess waits.

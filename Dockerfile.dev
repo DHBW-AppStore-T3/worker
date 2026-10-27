@@ -24,8 +24,6 @@ RUN poetry install --no-root --no-interaction --no-ansi
 # Copy application code
 COPY . .
 
-# Starte Celery Worker mit poetry run (single process so in-memory FakeKube
-# state is shared across deploy/pause/resume/destroy in WORKER_SIMULATE mode;
-# consumes the pods queue; no events, gossip or mingle:
-# the Postgres transport has no fanout, .github#5 / .github#6)
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--pool=solo", "-Q", "pods", "--without-gossip", "--without-mingle", "--without-heartbeat"]
+# The runner claims the queued tasks from Postgres (.github#5 / .github#6).
+# With WORKER_SIMULATE it runs one job at a time against the in-memory FakeKube.
+CMD ["poetry", "run", "python", "-m", "app.runner"]

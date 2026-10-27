@@ -1,20 +1,31 @@
 """The worker's database access: psycopg 3, plain SQL, role ``appstore_worker``.
 
-The worker writes task events, results and leases; it never needs the ORM
-models of the API. Connections are per process (prefork children open
-their own after the fork) and in autocommit mode unless a block asks for
-a transaction.
+The worker claims tasks, writes task events, results and leases; it never
+needs the ORM models of the API. Every connection is in autocommit mode
+unless a block asks for a transaction.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+import uuid
 
 import psycopg
 
 from .config import settings
-from .pgq import libpq_url
+
+# Tells this process apart from an earlier one with the same host name and
+# pid (a container restarted in its pod is pid 1 again).
+_INSTANCE = uuid.uuid4().hex[:8]
+
+
+def libpq_url(url: str) -> str:
+    """``url`` without a SQLAlchemy driver suffix, e.g. ``postgresql+psycopg2://`` -> ``postgresql://``."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    return f"{scheme.split('+', 1)[0]}://{rest}"
 
 
 def connect(purpose: str) -> psycopg.Connection:
@@ -27,5 +38,5 @@ def connect(purpose: str) -> psycopg.Connection:
 
 
 def worker_id() -> str:
-    """Who holds a task: host and process id of the process running it."""
-    return f"{socket.gethostname()}:{os.getpid()}"
+    """Who holds a task: host, process id and instance of the worker process running it."""
+    return f"{socket.gethostname()}:{os.getpid()}:{_INSTANCE}"

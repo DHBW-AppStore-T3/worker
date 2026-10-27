@@ -32,14 +32,10 @@ class Settings(BaseSettings):
     APP_ENV: Literal["development", "production"] = "production"
 
     # Database (.github#5): the worker's own role ``appstore_worker`` on the
-    # application database. It may use the task queue, append task events
+    # application database. It may claim queued tasks, append task events
     # and write the result columns of ``tasks``, nothing else (no users, no
     # credentials).
     DATABASE_URL: str
-
-    # Celery broker: the ``pgq`` transport on that database. Empty means
-    # ``pgq+`` + DATABASE_URL.
-    CELERY_BROKER_URL: str = ""
 
     # Fernet keys shared with the backend (``utils.crypto``), at least one:
     # RESULTS_ENCRYPTION_KEY seals a task's results (``tasks.outputs_enc``).
@@ -100,21 +96,22 @@ class Settings(BaseSettings):
     # creates; the admission policy lets it touch only those.
     K8S_ENVIRONMENT: str = ""
 
-    # A claimed message stays hidden from other workers this long; the
-    # worker's main process renews it every third of it while it holds the
-    # message. After a hard crash the message reappears after at most this.
-    WORKER_QUEUE_VISIBILITY_SECONDS: int = 300
+    # Jobs one worker process runs at once, one thread each (they mostly wait
+    # for the Kubernetes API). Always 1 with WORKER_SIMULATE.
+    WORKER_CONCURRENCY: int = 4
+    # The runner wakes on NOTIFY task_queued / task_released and also looks
+    # for work this often (a NOTIFY sent while its connection is down is lost).
+    WORKER_POLL_INTERVAL_SECONDS: float = 5.0
 
     # A running task holds a lease on its row; the worker renews it every
     # third of this. A task whose lease ran out is failed by the API as
     # ``worker_lost`` and never re-run.
     TASK_LEASE_SECONDS: int = 90
-    # Upper bound of one job (Celery soft time limit; the hard limit is
-    # five minutes later).
+    # Upper bound of one job: past it the job fails at its next check; if it
+    # is still running five minutes later, its lease is given up.
     WORKER_JOB_TIMEOUT_SECONDS: int = 7200
-    # Touched every 30 s by the worker's main process; the container
-    # healthcheck reads its age (``celery inspect ping`` needs remote
-    # control, which the pgq transport does not have).
+    # Touched by the runner's main loop every WORKER_POLL_INTERVAL_SECONDS;
+    # the container healthcheck reads its age.
     WORKER_HEARTBEAT_FILE: str = "/tmp/worker-heartbeat"
 
     # Local development without a Kubernetes cluster: pod jobs run against
@@ -153,14 +150,6 @@ class Settings(BaseSettings):
         if self.WORKER_SIMULATE and not self.is_development:
             raise ValueError("WORKER_SIMULATE requires APP_ENV=development")
         return self
-
-    @property
-    def celery_broker_url(self) -> str:
-        """Broker URL for Celery; defaults to the application database."""
-        if self.CELERY_BROKER_URL:
-            return self.CELERY_BROKER_URL
-        scheme, _, rest = self.DATABASE_URL.partition("://")
-        return f"pgq+{scheme.split('+', 1)[0]}://{rest}"
 
 
 settings = Settings()

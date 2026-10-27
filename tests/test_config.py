@@ -21,14 +21,16 @@ class TestConfiguration:
         from app.config import settings
 
         assert hasattr(settings, "DATABASE_URL")
-        assert hasattr(settings, "CELERY_BROKER_URL")
-        # The VM path (OpenTofu, Packer, OpenStack, Git clone) is gone (.github#12).
+        # The VM path (OpenTofu, Packer, OpenStack, Git clone) is gone (.github#12),
+        # and so is Celery with its broker: the queue is the tasks table.
         for gone in (
             "TEMP_REPO_BASE_PATH",
             "TOFU_PATH",
             "PACKER_PATH",
             "OPENSTACK_ALLOWED_AUTH_URLS",
             "WORKER_JOB_UID_BASE",
+            "CELERY_BROKER_URL",
+            "WORKER_QUEUE_VISIBILITY_SECONDS",
         ):
             assert not hasattr(settings, gone)
         assert hasattr(settings, "CREDENTIAL_ENCRYPTION_KEY")
@@ -50,26 +52,15 @@ class TestConfiguration:
 
         reload(config)
 
-        # The broker defaults to the database, through the pgq transport.
-        assert config.settings.celery_broker_url == "pgq+postgresql://appstore_worker:pw@postgres:5432/appstore"
+        assert config.settings.DATABASE_URL == "postgresql+psycopg2://appstore_worker:pw@postgres:5432/appstore"
+        assert config.settings.WORKER_CONCURRENCY == 4
+        assert config.settings.WORKER_POLL_INTERVAL_SECONDS == 5.0
 
-    @patch.dict(
-        os.environ,
-        {
-            "APP_ENV": "development",
-            "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
-            "DATABASE_URL": "postgresql://u:p@db/x",
-            "CELERY_BROKER_URL": "pgq+postgresql://other@db/y",
-        },
-        clear=True,
-    )
-    def test_explicit_broker_url_wins(self):
-        from importlib import reload
+    def test_the_database_url_loses_its_driver_suffix_for_libpq(self):
+        from app.db import libpq_url
 
-        from app import config
-
-        reload(config)
-        assert config.settings.celery_broker_url == "pgq+postgresql://other@db/y"
+        assert libpq_url("postgresql+psycopg2://u:p@db:5432/x") == "postgresql://u:p@db:5432/x"
+        assert libpq_url("postgresql://u:p@db/x") == "postgresql://u:p@db/x"
 
     @pytest.mark.parametrize(
         ("env", "message"),

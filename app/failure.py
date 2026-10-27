@@ -2,8 +2,7 @@
 
 Carries the transcript and whatever the job got that far (state, outputs,
 commit) so the failed task row is as informative as a successful one. The
-job runtime records it in ``tasks`` (``JobTask``); it no longer travels
-through Celery's result backend.
+job runtime records it in ``tasks`` (``job_runtime.run``).
 """
 
 import json
