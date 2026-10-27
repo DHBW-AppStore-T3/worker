@@ -13,6 +13,7 @@ from app import job_runtime, pod_tasks, upload_mac
 from app.config import settings
 from app.failure import Failure
 from app.k8s.fake import FakeKube
+from app.k8s.kube import EventInfo, PodInfo, Snapshot
 
 DIGEST = "sha256:" + "a" * 64
 DEP = "123e4567-e89b-12d3-a456-426614174000"
@@ -480,6 +481,44 @@ def test_pods_waiting_for_their_volume_are_no_failure(volume_late):
 
     assert deploy()["status"] == "success"
     assert kube.deployment_label(NS) == DEP
+
+
+class SilentAppKube(FakeKube):
+    """Every pod runs but its app never answers on its port (the readiness probe fails)."""
+
+    def snapshot(self, namespace):
+        snap = super().snapshot(namespace)
+        for pod in snap.pods:
+            pod.phase, pod.ready = "Running", False
+            snap.events.append(
+                EventInfo(
+                    f"Pod/{pod.name}", "Unhealthy", "Readiness probe failed: dial tcp 10.0.0.7:8080: connection refused"
+                )
+            )
+        return snap
+
+
+def test_a_deploy_whose_app_never_answers_says_so_when_it_times_out(monkeypatch):
+    kube = SilentAppKube()
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    monkeypatch.setattr(pod_tasks, "_clock", Clock(5))
+    monkeypatch.setattr(settings, "K8S_READY_TIMEOUT_SECONDS", 60)
+
+    with pytest.raises(Failure, match="does not answer on its port: Readiness probe failed: dial tcp"):
+        deploy()
+
+
+def test_not_answering_reason_names_only_a_running_pod_that_is_not_ready():
+    starting = PodInfo(name="a-0", workload="a", phase="Pending")
+    crashing = PodInfo(name="b-0", workload="b", phase="Running", waiting_reason="CrashLoopBackOff")
+    ready = PodInfo(name="c-0", workload="c", phase="Running", ready=True)
+    assert pod_tasks.not_answering_reason(Snapshot(exists=True, pods=[starting, crashing, ready])) is None
+    silent = PodInfo(name="d-0", workload="d", phase="Running")
+    snap = Snapshot(exists=True, pods=[silent], events=[EventInfo("Pod/d-0", "Unhealthy", "Readiness probe failed: x")])
+    assert (
+        pod_tasks.not_answering_reason(snap)
+        == "Pod d-0 runs, but its app does not answer on its port: Readiness probe failed: x"
+    )
 
 
 def test_a_pod_unschedulable_past_the_grace_period_fails_the_deploy(volume_late):
