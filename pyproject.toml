@@ -196,6 +196,17 @@ warn_no_return = true
 follow_imports = "normal"
 ignore_missing_imports = true
 strict_optional = true
+# app/ has no __init__.py (a namespace package); without this mypy aborts on the first relative import
+# ("No parent module") and checks nothing.
+explicit_package_bases = true
+
+# Byte-identical copies of backend files (tests/test_shared_files.py pins their hashes), so they cannot be
+# touched here alone. 9 mypy errors surfaced there once mypy ran at all (task_contract.team_endpoints_output
+# returns Any, k8s/spec.py reuses a variable for two types and infers a dict type too narrow for **extra,
+# k8s/kube.py hits a kubernetes stub false positive). Fix them in both repositories, then drop this override.
+[[tool.mypy.overrides]]
+module = ["app.task_contract", "app.k8s.kube", "app.k8s.spec"]
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"

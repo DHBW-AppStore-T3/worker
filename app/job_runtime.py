@@ -468,6 +468,8 @@ class Job:
             thread.join(timeout=30)
         sealed = None
         if terraform_outputs is not None or tf_state is not None:
+            if results_cipher is None:  # the settings require one of the two keys
+                raise RuntimeError("neither RESULTS_ENCRYPTION_KEY nor CREDENTIAL_ENCRYPTION_KEY is set")
             sealed = seal_results(results_cipher, terraform_outputs=terraform_outputs, tf_state=tf_state)
         event_type = {"SUCCESS": EVENT_SUCCEEDED, "FAILED": EVENT_FAILED}.get(status)
         with db.connect("finish") as conn, conn.transaction():
