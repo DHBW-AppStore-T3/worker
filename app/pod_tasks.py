@@ -133,6 +133,9 @@ def render_settings() -> RenderSettings:
         node_selector=json.loads(settings.K8S_STUDENT_NODE_SELECTOR or "{}"),
         tolerations=tuple(json.loads(settings.K8S_STUDENT_TOLERATIONS or "[]")),
         extra_egress_except=tuple(c.strip() for c in settings.K8S_EXTRA_EGRESS_EXCEPT.split(",") if c.strip()),
+        egress_tcp_ports=tuple(int(p) for p in settings.K8S_EGRESS_TCP_PORTS.split(",") if p.strip()),
+        kube_api_cidrs=tuple(c.strip() for c in settings.K8S_KUBE_API_CIDRS.split(",") if c.strip()),
+        ingress_pod_labels=json.loads(settings.K8S_INGRESS_POD_LABELS or "{}"),
         environment=settings.K8S_ENVIRONMENT,
         vnc_proxy_image=settings.K8S_VNC_PROXY_IMAGE,
     )

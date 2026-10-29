@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     # Pod/service/node CIDRs of the cluster, which pods with internet access
     # may not reach either (comma-separated, IPv4 and IPv6).
     K8S_EXTRA_EGRESS_EXCEPT: str = ""
+    # TCP ports "internet" is open on (comma-separated).
+    K8S_EGRESS_TCP_PORTS: str = "80,443"
+    # The Kubernetes API as the noVNC proxy reaches it (comma-separated CIDRs); empty: any address on 443/6443.
+    K8S_KUBE_API_CIDRS: str = ""
+    # Labels (JSON object) of the ingress controller's pods; empty: every pod of K8S_INGRESS_NAMESPACE.
+    K8S_INGRESS_POD_LABELS: str = ""
     K8S_POLL_INTERVAL_SECONDS: float = 3.0
     K8S_READY_TIMEOUT_SECONDS: int = 600
     K8S_DELETE_TIMEOUT_SECONDS: int = 300

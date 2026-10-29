@@ -971,6 +971,21 @@ def test_a_credential_key_equal_to_the_results_key_adds_no_second_candidate(monk
     assert len(upload_mac._verify_keys()) == 1
 
 
+def test_the_network_limits_of_the_chart_reach_the_renderer(monkeypatch):
+    default = pod_tasks.render_settings()
+    # Out of the box: web ports only, nothing known about the API or the ingress controller's pods.
+    assert default.egress_tcp_ports == (80, 443)
+    assert default.kube_api_cidrs == () and dict(default.ingress_pod_labels) == {}
+
+    monkeypatch.setattr(settings, "K8S_EGRESS_TCP_PORTS", "443, 8443")
+    monkeypatch.setattr(settings, "K8S_KUBE_API_CIDRS", "fd00:43::1/128, 10.43.0.1/32")
+    monkeypatch.setattr(settings, "K8S_INGRESS_POD_LABELS", '{"app.kubernetes.io/name": "traefik"}')
+    configured = pod_tasks.render_settings()
+    assert configured.egress_tcp_ports == (443, 8443)
+    assert configured.kube_api_cidrs == ("fd00:43::1/128", "10.43.0.1/32")
+    assert dict(configured.ingress_pod_labels) == {"app.kubernetes.io/name": "traefik"}
+
+
 # --- a job given the wrong kind of spec, and the cluster misbehaving ------------------------------
 def test_a_pod_job_refuses_a_vm_spec_and_the_vm_job_a_pod_spec(cluster, image_namespace):
     with pytest.raises(Failure, match="not a kubernetes app"):
