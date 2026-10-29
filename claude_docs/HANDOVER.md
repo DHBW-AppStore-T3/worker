@@ -12,7 +12,7 @@ Lebendes Übergabedokument (Harness-Konzept: [HARNESS.md](https://github.com/DHB
 
 ## 2. CI (`.github/workflows/ci.yml`, Branches `main` und `dev`)
 
-Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service `worker_test`, echter Runner) · Coverage (kombiniert, Zeilen + Branches; Gate ≥ 76 % auf allen Branches und PRs) · Security (Trivy, pip-audit) · Build des Targets `pod-deployer` · Image-Scan · Push nach `ghcr.io` (Push auf `main`/`dev`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment`.
+Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pytest -m integration`, Postgres-Service `worker_test`, echter Runner) · Coverage (kombiniert; getrennte Gates ≥ 80 % Zeilen und ≥ 62 % Branches, auf allen Branches und PRs; ein rotes Gate stoppt Build, Push und Rollout) · Security (Trivy, pip-audit) · Build des Targets `pod-deployer` · Image-Scan · Push nach `ghcr.io` (Push auf `main`/`dev`) · Roll out on k8s: startet `k8s-bump.yml` im Repo `deployment`.
 
 ## 3. Regeln im Code
 
