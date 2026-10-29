@@ -158,6 +158,9 @@ markers = [
 # Coverage Configuration
 # ================================================================
 [tool.coverage.run]
+# Line AND branch coverage: the gate in ci.yml reads the combined percentage,
+# which with branch=true is (covered lines + covered branches) / (statements + branches).
+branch = true
 source = ["app"]
 omit = [
     "*/tests/*",
