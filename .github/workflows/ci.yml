@@ -51,7 +51,6 @@ jobs:
 
       - name: Run MyPy
         run: poetry run mypy app/ --ignore-missing-imports
-        continue-on-error: true
 
   # ================================================================
   # 🧪 TEST (unit) — no external dependencies

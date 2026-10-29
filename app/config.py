@@ -152,4 +152,5 @@ class Settings(BaseSettings):
         return self
 
 
-settings = Settings()
+# Every field is filled from the environment (pydantic-settings); mypy has no pydantic plugin and reads them as constructor arguments.
+settings = Settings()  # type: ignore[call-arg]

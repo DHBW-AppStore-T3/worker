@@ -200,6 +200,9 @@ warn_no_return = true
 follow_imports = "normal"
 ignore_missing_imports = true
 strict_optional = true
+# app/ has no __init__.py (a namespace package); without this mypy aborts on the first relative import
+# ("No parent module") and checks nothing.
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"

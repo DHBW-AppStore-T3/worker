@@ -72,4 +72,5 @@ class Failure(Exception):
 
     def to_dict(self) -> dict[str, Any]:
         """Convert exception data to dict for serialization"""
-        return json.loads(str(self))
+        data: dict[str, Any] = json.loads(str(self))
+        return data
