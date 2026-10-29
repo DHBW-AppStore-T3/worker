@@ -25,78 +25,42 @@ RUN pip install --no-cache-dir poetry
 COPY pyproject.toml poetry.lock* ./
 RUN poetry install --no-root --only=main --no-ansi
 
-# -----------------------------------------------------------------------------
-# Stage 2: Runtime - Schlankes Production Image
-# -----------------------------------------------------------------------------
-FROM python:3.11-slim AS runtime
+# The venv's own pip is not needed to run the worker, and it bundles copies of
+# urllib3, msgpack and pkg_resources that Trivy reports (see the next stage).
+RUN .venv/bin/python -m pip uninstall -y pip
 
-# Build arguments für Multi-Platform Support
-ARG TARGETARCH
-ARG TERRAFORM_VERSION=1.15.5
-ARG PACKER_VERSION=1.15.3
+# -----------------------------------------------------------------------------
+# Pod deployer (.github#4): pod and KubeVirt jobs only. It renders the
+# Kubernetes objects itself and runs nothing from the app repositories, so it
+# needs no git, OpenTofu, Packer or OpenStack CLI, and no root.
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS pod-deployer
+
+# SECURITY_REFRESH changes in every CI build (the workflow passes the run id), so the upgrade below never comes from
+# the build cache: a cached layer keeps the package state of its first build and misses every fix released since.
+ARG SECURITY_REFRESH
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
+    useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin appstore
+
+# No pip, setuptools or wheel in the base image's Python: the worker runs from
+# the venv and installs nothing at runtime. Trivy scans these system
+# site-packages too, and pip bundles its own urllib3, msgpack and
+# pkg_resources (pip/_vendor/bom.cdx.json); even the newest pip ships
+# versions with HIGH CVEs, so removing it is the fix, not an upgrade.
+RUN python -m pip uninstall -y pip setuptools wheel
 
 WORKDIR /app
-
-# System Dependencies. ``apt-get upgrade`` runs first so the base
-# ``python:3.11-slim`` tag picks up Debian-security backports released
-# after the upstream image was last rebuilt — that's where things like
-# CVE-2026-45447 (openssl 3.5.6-1~deb13u2) come from. Trivy blocks the
-# push on any HIGH/CRITICAL OS finding, so even though it enlarges the
-# layer slightly we'd rather take the bytes than burn a .trivyignore
-# line every time upstream debian releases a CVE-fix.
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    git \
-    wget \
-    unzip \
-    curl \
-    ca-certificates \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Upgrade base-image Python tooling (pip / setuptools / wheel) to pull
-# in security fixes that the upstream `python:3.11-slim` tag hasn't
-# picked up yet. Trivy scans these system site-packages — anything
-# HIGH/CRITICAL here blocks the push.
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# OpenStack CLI installieren
-RUN pip install --no-cache-dir python-openstackclient
-
-# Terraform installieren (platform-aware)
-RUN ARCH="${TARGETARCH:-amd64}" && \
-    echo "Installing Terraform ${TERRAFORM_VERSION} for ${ARCH}" && \
-    wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    unzip -qo terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    mv terraform /usr/local/bin/ && \
-    rm -f terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
-    terraform --version
-
-# Packer installieren (platform-aware)
-RUN ARCH="${TARGETARCH:-amd64}" && \
-    echo "Installing Packer ${PACKER_VERSION} for ${ARCH}" && \
-    wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    unzip -qo packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    mv packer /usr/local/bin/ && \
-    rm -f packer_${PACKER_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
-    packer --version
-
-# Virtual Environment vom Builder kopieren
 COPY --from=builder /app/.venv /app/.venv
-
-# Application Code kopieren
 COPY app/ ./app/
 
-# Arbeitsverzeichnis für Worker
-RUN mkdir -p /tmp/worker_repos
-
-# Environment für .venv
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    WORKER_HEARTBEAT_FILE=/tmp/worker-heartbeat
 
-# Health check (optional - prüft ob Celery läuft)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD celery -A app.celery_app inspect ping -d celery@$HOSTNAME || exit 1
+USER 10001
 
-# Celery Worker starten
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; sys.exit(time.time() - os.path.getmtime(os.environ['WORKER_HEARTBEAT_FILE']) > 120)" || exit 1
+
+CMD ["python", "-m", "app.runner"]

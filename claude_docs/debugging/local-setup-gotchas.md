@@ -1,18 +1,10 @@
-# Worker — Lokale Setup-Gotchas
+# Lokales Setup — Stolpersteine
 
-## 1. Worker startet nicht standalone
-- **Gotcha:** Der Versuch, den Worker isoliert per `poetry run celery ...` auf dem Host zu starten, scheitert in der Regel an fehlenden Abhängigkeiten (`terraform` Binary, `packer` Binary, RabbitMQ, Redis, `postgres-tfstate`).
-- **Best Practice:** Entwicklung und Testen über das `deployment`-Repo via `make dev-up` und `make shell-worker`.
-
-## 2. Formatierungs-Konflikt zwischen Black, isort und Ruff
-- **Gotcha:** `worker` ist das einzige Repo, das neben `ruff` auch noch `black` und `isort` konfiguriert hat. Alle drei sind auf `line-length = 120` gestellt.
-- **Best Practice:** Vor dem Commit immer alle drei Formatter ausführen:
-  ```bash
-  poetry run black .
-  poetry run isort .
-  poetry run ruff check --fix .
-  poetry run ruff format .
-  ```
-
-## 3. Temporäres Repository-Verzeichnis (`TEMP_REPO_BASE_PATH`)
-- **Gotcha:** Standardpfad ist `/tmp/worker_repos`. Nach unsauberen Task-Abbrüchen können dort verwaiste Git-Klone verbleiben und Speicherplatz belegen. Der Worker bereinigt Klone im `finally`-Block, bei `SIGKILL` greift dieser jedoch nicht.
+- Der Worker startet nur im Stack aus `deployment/` (`make init`, später `make dev-up`). Anleitung ab Null: `deployment/docs/dev-setup.md`. Auf dem Host fehlt das DB-Schema mit der Rolle `appstore_worker`.
+- Kein Hot-Reload: nach Code-Änderung `make dev-restart-worker`.
+- `worker-sim` ist ein Prozess (`--pool=solo`); der `FakeKube`-Zustand (`WORKER_SIMULATE=true`) gilt für diesen Prozess und ist nach einem Neustart weg.
+- Der Worker verbindet sich als `appstore_worker`; das Login entsteht erst durch `make migrate-dev` (Teil von `make init`).
+- Drei Formatierer: `ruff`, `black`, `isort`, alle `line-length = 120`. Vor dem Commit: `poetry run black . && poetry run isort . && poetry run ruff check --fix .`. CI prüft zusätzlich `mypy app/`.
+- `pyproject.toml` fordert Python `>=3.10,<3.12`; die Images nutzen 3.11.
+- Pytest-Standard: 60 s Timeout je Test (`--timeout-method=thread`); längere Tests mit `@pytest.mark.timeout(N)`.
+- Die Umgebung des Dev-Containers verfälscht Tests (ohne `CREDENTIAL_ENCRYPTION_KEY` bricht schon die Sammlung ab); Rezept mit der Umgebung von CI im `README.md`, Abschnitt Tests.

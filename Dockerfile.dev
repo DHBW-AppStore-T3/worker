@@ -7,45 +7,23 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    wget \
-    unzip \
     curl \
     gcc \
     libpq-dev \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenStack CLI
-RUN pip install --no-cache-dir python-openstackclient
-
-# Install Terraform
-ARG TERRAFORM_VERSION=1.6.6
-RUN wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
-    && unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
-    && mv terraform /usr/local/bin/ \
-    && rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip
-
-# Install Packer
-ARG PACKER_VERSION=1.10.0
-RUN wget https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip \
-    && unzip packer_${PACKER_VERSION}_linux_amd64.zip \
-    && mv packer /usr/local/bin/ \
-    && rm packer_${PACKER_VERSION}_linux_amd64.zip
-
 # Install Poetry
 RUN curl -sSL https://install.python-poetry.org | python3 - && \
     ln -s /root/.local/bin/poetry /usr/local/bin/poetry
 
 # Copy Poetry files and install dependencies
-COPY pyproject.toml ./
+COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root --no-interaction --no-ansi
 
 # Copy application code
 COPY . .
 
-# Create temp directory for repositories
-RUN mkdir -p /tmp/worker_repos
-
-# Starte Celery Worker mit poetry run
-CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]
+# The runner claims the queued tasks from Postgres (.github#5 / .github#6).
+# With WORKER_SIMULATE it runs one job at a time against the in-memory FakeKube.
+CMD ["poetry", "run", "python", "-m", "app.runner"]

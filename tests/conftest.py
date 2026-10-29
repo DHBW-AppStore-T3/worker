@@ -1,10 +1,20 @@
 """Pytest configuration and fixtures."""
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
+
+# ``app.config`` requires DATABASE_URL. Unit tests never connect; the
+# integration tests use this database (CI: the Postgres service) and build
+# the worker's part of the schema in it (tests/schema.sql).
+os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/worker_test")
+# The suite runs with the published CI key, which production refuses.
+os.environ.setdefault("APP_ENV", "development")
+
+SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 
 
 # ----------------------------------------------------------------
@@ -21,13 +31,28 @@ import pytest
 # Marker implizit ``unit``. Damit gilt: **default ist unit**, und
 # nur Tests, die echte externe Abhängigkeiten brauchen (DB, Broker,
 # Netz), müssen explizit als ``integration`` markiert werden.
+#
+# Ausnahme: ein Test, der die Datenbank anfordert (``pg``/``pg_url``),
+# wird ``integration``. In der unit-Lane gibt es keine Datenbank, die
+# Fixture würde ihn dort lautlos überspringen. Ein ausdrücklich als
+# ``unit`` markierter Test mit diesen Fixtures ist ein Widerspruch und
+# bricht die Sammlung ab.
+DB_FIXTURES = {"pg", "pg_url"}
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         markers = {m.name for m in item.iter_markers()}
+        uses_db = bool(DB_FIXTURES & set(item.fixturenames))
+        if uses_db and "unit" in markers:
+            raise pytest.UsageError(
+                f"{item.nodeid} is marked 'unit' but uses the database; the unit lane has none "
+                "and would skip it. Mark it 'integration'."
+            )
         # ``integration`` / ``slow`` haben Vorrang — wer explizit
         # markiert, will nicht in die unit-Lane gezogen werden.
         if "integration" not in markers and "slow" not in markers and "unit" not in markers:
-            item.add_marker(pytest.mark.unit)
+            item.add_marker(pytest.mark.integration if uses_db else pytest.mark.unit)
 
 
 @pytest.fixture
@@ -49,3 +74,32 @@ def mock_git_url():
 def mock_tag():
     """Mock Git tag for testing."""
     return "v1.0.0"
+
+
+# ----------------------------------------------------------------
+# Database (integration tests)
+# ----------------------------------------------------------------
+@pytest.fixture(scope="session")
+def pg_url():
+    """The test database with the worker's tables; skips when it is not reachable."""
+    import psycopg
+
+    from app.db import libpq_url
+
+    url = libpq_url(os.environ["DATABASE_URL"])
+    try:
+        with psycopg.connect(url, autocommit=True, connect_timeout=5) as conn:
+            conn.execute(SCHEMA_SQL.read_text(encoding="utf-8"))
+    except psycopg.OperationalError as e:
+        pytest.skip(f"no test database at DATABASE_URL: {e}")
+    return url
+
+
+@pytest.fixture
+def pg(pg_url):
+    """An autocommit connection to the test database; tables are emptied afterwards."""
+    import psycopg
+
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        yield conn
+        conn.execute("TRUNCATE task_events, tasks, deployments CASCADE")

@@ -1,54 +1,31 @@
-# Worker — Architekturübersicht
+# Worker — Überblick
 
-Der Worker führt alle zeitintensiven Infrastruktur-Operationen asynchron und außerhalb des FastAPI-Web-Threads aus.
+Der Worker ist der Pod-Deployer und holt die Tasks aus der Tabelle `tasks` (`app/runner.py`). Jeder Job läuft auf derselben Job-Runtime (`app/job_runtime.py`): die Task-Zeile `tasks` ist die einzige Wahrheit über den Job.
 
-## Orchestrierungs-Pipeline
+## Job-Runtime
 
-Ein Task (z. B. `tasks.deploy_application`) durchläuft eine definierte Pipeline von Services:
+1. **Prolog** (`job_runtime.start`): PENDING → RUNNING mit `claimed_by` und Lease. Trifft die Nachricht auf einen RUNNING-Task mit abgelaufener Lease (Wiederzustellung nach totem Worker), wird er `worker_lost` gesetzt und **nicht** erneut ausgeführt. Abgebrochene und beendete Tasks werden übersprungen.
+2. **Während des Jobs:** ein Heartbeat erneuert die Lease alle `TASK_LEASE_SECONDS/3` und erkennt Cancel oder verlorene Lease; ein Listener auf `NOTIFY task_cancel` reagiert sofort. Events und Logzeilen gehen gepuffert in `task_events`; `current_phase` und `progress_pct` der Task-Zeile werden mitgeführt.
+3. **Epilog** (`Job.finish`): Status, Transkript (`logs`) und versiegelte Ergebnisse (`outputs_enc`) in einer Transaktion mit dem Terminal-Event; Lease frei, hinter dem Task geparkte Nachrichten sichtbar, `NOTIFY task_released`.
 
-```
-RabbitMQ Task Payload
-        │
-        ▼
-1. Fernet Decryption (utils/crypto.py)
-   Entschlüsselt OpenStack-Credentials & Git-Tokens in-process
-        │
-        ▼
-2. Git Clone (services/git_service.py)
-   Klont das Ziel-App-Repository am spezifizierten Release-Tag nach /tmp/worker_repos/
-        │
-        ▼
-3. Packer Discovery & Build (services/packer_discovery.py, packer_executor.py)
-   Prüft auf vorhandene Packer-Templates (.pkr.hcl / .json)
-   Sichert den Build über Redis-Lock (services/build_lock.py) ab
-   Erstellt bei Bedarf ein neues VM-Glance-Image auf OpenStack
-        │
-        ▼
-4. OpenStack Auth (services/openstack_auth.py)
-   Schreibt eine task-isolierte clouds.yaml für Terraform / OpenStack SDK
-        │
-        ▼
-5. Terraform Provisionierung (services/terraform_executor.py)
-   Initialisiert Terraform mit Postgres-Remote-State (Schema deployment_<id>)
-   Führt init / plan / apply bzw. destroy aus
-   Streamt alle stdout/stderr-Zeilen live via Celery-Events
-        │
-        ▼
-6. Abschluss & Ergebnis
-   Liefert Status, extrahierte Outputs (z. B. IPv4/IPv6, SSH-Keys) oder strukturiertes Failure-Objekt zurück
-```
+Ein Job ist eine Task-Zeile (`taskId`). Fehler: `Failure` (`app/failure.py`) trägt Transkript, State, Outputs und Commit in die fehlgeschlagene Zeile.
 
-## Kernkomponenten in `app/`
+## Jobs (Queue `pods`, `app/pod_tasks.py`)
 
-- **`celery_app.py`**: Initialisierung und Konfiguration des Celery-Workers (`task_acks_late=True`, `worker_prefetch_multiplier=1`).
-- **`config.py`**: Pydantic BaseSettings für Umgebungsvariablen (`CELERY_BROKER_URL`, `TFSTATE_DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`).
-- **`tasks.py`**: Die fünf Celery-Tasks:
-  1. `tasks.deploy_application`
-  2. `tasks.destroy_deployment`
-  3. `tasks.pause_deployment`
-  4. `tasks.resume_deployment`
-  5. `tasks.redeploy_resource`
-- **`services/`**: Kapselung der Einzelschritte (Git, Packer, Terraform, OpenStack, Locks).
-- **`utils/`**:
-  - `logger.py`: Thread-sicherer `StructuredLogger` mit drei Sinks (Speicher-Buffer, Container-Konsole, Celery-Event-Bus).
-  - `crypto.py`: Entschlüsselung von Credentials-Envelopes.
+Der Worker klont nichts und führt nichts aus dem App-Repository aus. Die API liest `appstore.yaml` am festgelegten Commit, prüft sie und legt die Spec in den Job; der Worker prüft sie erneut (`app/k8s/spec.py`), rendert die Kubernetes-Objekte selbst (`app/k8s/render.py`) und wendet sie per Server-Side Apply an (`app/k8s/kube.py`). Kein eigener State: der Zustand eines Deployments ist sein Namespace `dep-<8 hex>`. Vor jedem Zugriff prüft der Worker, dass der Namespace zu diesem Deployment gehört.
+
+| Job | Phasen |
+|---|---|
+| `pods.deploy_application` (`runtime: kubernetes`) | `STARTING`, `SPEC_LOAD`, `K8S_NAMESPACE`, `K8S_POLICIES` (Quota, LimitRange, NetworkPolicy), `K8S_APPLY`, `K8S_WAIT_READY`, `OUTPUTS_AND_CLEANUP` |
+| `pods.deploy_vm_application` (`runtime: kubevirt-vm`) | gleiche Phasen; Namespace, PVC-Klon des Golden Images, VirtualMachine, noVNC-Proxy |
+| `pods.destroy_deployment` | `STARTING`, `K8S_DELETE`, `K8S_WAIT_GONE`, `CLEANUP` |
+| `pods.pause_deployment` / `resume_deployment` | `K8S_SCALE_DOWN`, `K8S_WAIT_STOPPED` / `K8S_SCALE_UP`, `K8S_WAIT_READY` |
+| `pods.redeploy_resource` (Workload neu starten) | `K8S_RESTART`, `K8S_WAIT_READY` |
+
+Bei einem Fehler im Deploy löscht der Worker den halb angelegten Namespace und wirft `Failure` mit lesbarem Grund (ImagePullBackOff, keine Kapazität, Quota). Ein Cancel überlässt das Aufräumen dem Destroy, den die API hinter den Job parkt. Zugangsdaten (Passwörter je Workload) erzeugt der Worker (`secrets.token_urlsafe`) und liefert sie als versiegelte Outputs.
+
+Rechte: Der pod-deployer legt `dep-*`-Namespaces an und bindet darin zwei ClusterRoles (`K8S_DEPLOYER_CLUSTER_ROLE`, `K8S_READER_CLUSTER_ROLE`), begrenzt durch die Admission-Policy aus dem Repo `deployment`.
+
+## Schlüssel
+
+`RESULTS_ENCRYPTION_KEY` versiegelt die Ergebnisse (`tasks.outputs_enc`), gleich wie in der API. Ist er nicht gesetzt, versiegelt `CREDENTIAL_ENCRYPTION_KEY` (Rückfall für Altbestand). Weitere Schlüssel hat der Worker nicht.

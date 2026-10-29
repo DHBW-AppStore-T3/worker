@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "worker"
 version = "0.1.0"
-description = "Celery Worker für Click-n-Deploy"
+description = "Worker für Click-n-Deploy: führt die Jobs der Postgres-Task-Queue aus"
 license = "Apache-2.0"
 package-mode = false
 authors = [
     "Your Name <your.email@example.com>"
 ]
-keywords = ["celery", "redis", "terraform", "packer", "git", "worker"]
+keywords = ["postgres", "kubernetes", "worker"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -18,18 +18,15 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.12"
-celery = {extras = ["redis"], version = "^5.3.4"}
-sqlalchemy = "^2.0.23"
-psycopg2-binary = "^2.9.9"
+# psycopg 3: the task queue (tasks table, LISTEN/NOTIFY), task events, leases.
+psycopg = {extras = ["binary"], version = ">=3.2"}
 pydantic = "^2.5.0"
 pydantic-settings = "^2.14.2"
-gitpython = ">=3.1.62"
 python-dotenv = "^1.0.0"
 pyyaml = "^6.0.1"
-watchdog = "^4.0"
 cryptography = ">=50.0.1"
-redis = "^5.0"
-msgpack = ">=1.2.1"
+# Pod apps (.github#4): the pod deployer applies and watches namespaces.
+kubernetes = ">=31.0.0"
 
 [tool.poetry.group.dev.dependencies]
 # Linting & Formatting
@@ -44,7 +41,7 @@ pytest-asyncio = "^0.23"
 pytest-cov = "^4.1"
 # pytest-timeout: kills a single test after ``timeout`` seconds so
 # a hung dependency call (e.g. a real git clone that escaped its
-# mock, a Celery broker connection that wasn't faked) cannot
+# mock, a database connection that wasn't faked) cannot
 # freeze the entire run. ``timeout_method = "thread"`` is essential
 # — the default ``signal`` method cannot interrupt C-extension
 # calls or subprocess waits.
@@ -161,6 +158,10 @@ markers = [
 # Coverage Configuration
 # ================================================================
 [tool.coverage.run]
+# Line AND branch coverage. The gate in ci.yml checks lines and branches against
+# separate minimums; ``percent_covered`` (coverage.py, also used by fail_under) is the
+# blend (covered lines + covered branches) / (statements + branches).
+branch = true
 source = ["app"]
 omit = [
     "*/tests/*",
@@ -199,6 +200,9 @@ warn_no_return = true
 follow_imports = "normal"
 ignore_missing_imports = true
 strict_optional = true
+# app/ has no __init__.py (a namespace package); without this mypy aborts on the first relative import
+# ("No parent module") and checks nothing.
+explicit_package_bases = true
 
 [[tool.mypy.overrides]]
 module = "tests.*"

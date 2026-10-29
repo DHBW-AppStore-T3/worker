@@ -4,111 +4,11 @@
 # comment. Document *why* a finding is suppressed so reviewers can
 # revisit when the upstream advisory changes.
 
-# AVD-DS-0002: Dockerfile/Dockerfile.dev run as root.
-# The worker invokes terraform / packer / openstack CLI against
-# bind-mounted git repos. Switching to non-root requires verifying
-# that all three toolchains can write into /tmp/worker_repos and
-# .terraform plugin caches without permission issues — and that
-# bind-mount UIDs line up on macOS + Linux. Tracked in #16.
+# AVD-DS-0002: Dockerfile.dev runs as root.
+# The production Dockerfile runs as UID 10001. The dev image is only used by
+# docker compose for local development (WORKER_SIMULATE, no cluster).
 AVD-DS-0002
 
-# Packer upstream CVE backlog — Packer's latest release (v1.15.3)
-# still ships with Go 1.25.9 and a handful of outdated modules.
-# Nothing to fix on our side; we just bump PACKER_VERSION when
-# HashiCorp ships a release built against Go 1.25.10+. Tracked
-# in #18.
-#
-# Go stdlib (fixed in 1.25.10):
-CVE-2026-33811
-CVE-2026-33814
-CVE-2026-39820
-CVE-2026-39823
-CVE-2026-39825
-CVE-2026-39826
-CVE-2026-39836
-CVE-2026-42499
-# Go stdlib (fixed in 1.25.11 / 1.26.4) — also covers terraform's
-# stdlib hit on Go 1.25.10, see Terraform block below:
-CVE-2026-27145
-# Go modules pulled in by Packer:
-CVE-2026-46680
-CVE-2026-44973
-CVE-2026-45022
-# containerd/v2 vendored in Packer (fixed in 2.0.10/2.1.9/2.2.5/2.3.2):
-CVE-2026-53488
-CVE-2026-53489
-CVE-2026-53492
-
-# Terraform upstream CVE backlog — Terraform's latest stable release
-# (v1.15.5) is built against Go 1.25.9; HashiCorp hasn't yet shipped
-# a rebuild against Go 1.25.11+. Nothing to fix on our side; we bump
-# TERRAFORM_VERSION as soon as HashiCorp ships a release built against
-# Go 1.25.11 / 1.26.4 or later.
-#
-# Go stdlib (fixed in 1.25.11 / 1.26.4):
-CVE-2026-42504
-# Go stdlib os.Root symlink-following / directory-traversal (fixed in
-# 1.25.12 / 1.26.5 / 1.27.0-rc.2). Hits both Packer and Terraform
-# binaries; suppressed until HashiCorp rebuilds against Go 1.25.12+.
-CVE-2026-39822
-
-# Go modules vendored into Packer and/or Terraform — fixed upstream but
-# only available after HashiCorp ships a rebuild. Same backlog story
-# as the stdlib entries above.
-#
-# golang.org/x/crypto (fixed in 0.52.0):
-CVE-2026-39827
-CVE-2026-39828
-CVE-2026-39829
-CVE-2026-39830
-# CVE-2026-39831: golang.org/x/crypto/ssh security-key bypass (missing
-# user-presence check). Vendored into Packer; fixed upstream in 0.52.0,
-# available once HashiCorp rebuilds. Nothing to fix on our side.
-CVE-2026-39831
-CVE-2026-39832
-CVE-2026-39835
-CVE-2026-42508
-CVE-2026-46595
-CVE-2026-46597
-# golang.org/x/net (fixed in 0.55.0):
-CVE-2026-25680
-CVE-2026-25681
-CVE-2026-27136
-CVE-2026-39821
-CVE-2026-42502
-CVE-2026-42506
-
-# google.golang.org/grpc (fixed in 1.82.1): gRPC-Go xDS RBAC / HTTP/2
-# advisory. Vendored into Packer and Terraform; available once HashiCorp
-# rebuilds against the patched grpc. Nothing to fix on our side.
-GHSA-hrxh-6v49-42gf
-CVE-2026-84304
-CVE-2026-84445
-
-# Terraform 1.15.5 upstream Go stdlib & vendored module CVE backlog:
-# Go stdlib (fixed in 1.25.13+):
-CVE-2026-33818
-CVE-2026-56853
-CVE-2026-56858
-CVE-2026-56859
-CVE-2026-56860
-CVE-2026-56862
-CVE-2026-71556
-# golang.org/x/net (fixed in 0.56.0):
-CVE-2026-46600
-# golang.org/x/text (fixed in 0.39.0):
-CVE-2026-56852
-# golang.org/x/crypto (fixed in 0.55.0):
-CVE-2026-56854
-# golang.org/x/mod (fixed in 0.40.0):
-CVE-2026-56864
-CVE-2026-56865
-
-# CVE-2025-47273: Path Traversal in setuptools PackageIndex (pre-78.1.1).
-# False positive from Trivy scanning internal pip vendored SBOM metadata.
-CVE-2025-47273
-
-# GHSA-6v7p-g79w-8964: MessagePack out-of-bounds read on unpacker reuse.
-# Transitive via Celery/kombu; pinned to msgpack >= 1.2.1 in pyproject.toml.
-GHSA-6v7p-g79w-8964
-
+# No CVE entries: the setuptools/urllib3/msgpack findings came from the copies
+# pip bundles (pip/_vendor/bom.cdx.json). The images no longer ship pip
+# (Dockerfile), so there is nothing left to suppress.
