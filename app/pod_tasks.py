@@ -103,15 +103,10 @@ def _default_kube() -> Kube:
     return _sim_kube if settings.WORKER_SIMULATE else KubeApi()
 
 
+# How the cluster connection is made; tests replace it (monkeypatch), local runs use WORKER_SIMULATE.
 _kube_factory: KubeFactory = _default_kube
 # The clock of the waits (deadlines, how long a pod is unschedulable); tests replace it.
 _clock: Callable[[], float] = time.monotonic
-
-
-def set_kube_factory(factory: KubeFactory) -> None:
-    """Replace how the cluster connection is made (tests, local runs with FakeKube)."""
-    global _kube_factory
-    _kube_factory = factory
 
 
 def limits() -> PlatformLimits:
