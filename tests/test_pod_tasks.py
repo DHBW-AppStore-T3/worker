@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import logging
 import threading
 import uuid
 
@@ -14,6 +15,7 @@ from app.config import settings
 from app.failure import Failure
 from app.k8s.fake import FakeKube
 from app.k8s.kube import EventInfo, PodInfo, Snapshot
+from app.k8s.render import FIELD_MANAGER
 
 DIGEST = "sha256:" + "a" * 64
 DEP = "123e4567-e89b-12d3-a456-426614174000"
@@ -982,3 +984,167 @@ def test_the_network_limits_of_the_chart_reach_the_renderer(monkeypatch):
     assert configured.egress_tcp_ports == (443, 8443)
     assert configured.kube_api_cidrs == ("fd00:43::1/128", "10.43.0.1/32")
     assert dict(configured.ingress_pod_labels) == {"app.kubernetes.io/name": "traefik"}
+
+
+# --- a job given the wrong kind of spec, and the cluster misbehaving ------------------------------
+def test_a_pod_job_refuses_a_vm_spec_and_the_vm_job_a_pod_spec(cluster, image_namespace):
+    with pytest.raises(Failure, match="not a kubernetes app"):
+        deploy(spec=VM_SPEC, teams=VM_TEAMS)
+    with pytest.raises(Failure, match="not a kubevirt-vm app"):
+        deploy_vm(spec=SPEC, teams=TEAMS)
+
+    assert cluster.objects == {}
+
+
+def test_a_vm_deploy_validates_the_spec_again_and_touches_nothing(cluster, image_namespace):
+    spec = copy.deepcopy(VM_SPEC)
+    spec["hostNetwork"] = True
+
+    with pytest.raises(Failure, match="appstore.yaml is invalid"):
+        deploy_vm(spec=spec)
+
+    assert cluster.objects == {}
+
+
+def test_a_vm_deploy_without_members_fails(cluster, image_namespace):
+    with pytest.raises(Failure, match="no teams or members"):
+        deploy_vm(teams={})
+
+    assert cluster.objects == {}
+
+
+def test_a_vm_deploy_above_the_workload_limit_fails(cluster, image_namespace, monkeypatch):
+    monkeypatch.setattr(settings, "K8S_MAX_WORKLOADS_PER_DEPLOYMENT", 0)
+
+    with pytest.raises(Failure, match="exceed the limit"):
+        deploy_vm()
+
+    assert cluster.objects == {}
+
+
+class VmPhaseKube(FakeKube):
+    """A cluster whose VirtualMachineInstances are all in ``phase``."""
+
+    def __init__(self, phase, **kwargs):
+        super().__init__(**kwargs)
+        self.phase = phase
+
+    def snapshot(self, namespace):
+        snap = super().snapshot(namespace)
+        for vmi in snap.vmis:
+            vmi.phase = self.phase
+        return snap
+
+
+@pytest.mark.parametrize("phase", ["Failed", "Unknown"])
+def test_a_vm_that_fails_while_the_deploy_waits_ends_the_wait_with_that_reason(events, monkeypatch, phase):
+    kube = VmPhaseKube(phase, ready_after_polls=10**6)
+    kube.namespace_labels["vm-poc"] = {}
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+
+    with pytest.raises(Failure, match=f"the VM .* is {phase}"):  # not "timed out" after the VM timeout
+        deploy_vm()
+
+    while kube.snapshot(NS).exists:  # the failed deployment's namespace goes
+        pass
+    assert NS not in kube.namespace_labels
+
+
+class VanishingKube(FakeKube):
+    """The namespace is removed (a queued destroy ran) while a deploy still waits for its pods."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.snapshots = 0
+
+    def snapshot(self, namespace):
+        self.snapshots += 1
+        if self.snapshots > 3:
+            self.namespace_labels.pop(namespace, None)
+        return super().snapshot(namespace)
+
+
+def test_a_namespace_removed_while_the_deploy_waits_fails_the_deploy_at_once(events, monkeypatch):
+    kube = VanishingKube(ready_after_polls=10**6)
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+
+    with pytest.raises(Failure, match="namespace disappeared"):  # not "timed out" after the ready timeout
+        deploy()
+
+
+class NamespaceDeleteFailsKube(FakeKube):
+    def delete_namespace(self, name):
+        raise RuntimeError("403 forbidden")
+
+
+def test_a_cleanup_that_fails_never_hides_the_failure_that_caused_it(events, monkeypatch, caplog):
+    kube = NamespaceDeleteFailsKube(fail_reason="ImagePullBackOff")
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(Failure, match="image cannot be pulled"):
+        deploy()
+
+    assert f"Could not remove {NS}" in caplog.text and "403 forbidden" in caplog.text
+
+
+@pytest.mark.parametrize("job", [pod_tasks.pause_deployment, pod_tasks.resume_deployment])
+def test_pausing_or_resuming_a_deployment_whose_namespace_is_gone_fails(cluster, job):
+    with pytest.raises(Failure, match="does not exist"):
+        job(DEP)
+
+
+def test_resuming_a_vm_deployment_without_virtual_machines_fails(cluster, events):
+    cluster.apply(
+        {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": NS,
+                "labels": {
+                    pod_tasks.MANAGED_BY_LABEL: FIELD_MANAGER,
+                    pod_tasks.DEPLOYMENT_LABEL: DEP,
+                    pod_tasks.VM_NAMESPACE_LABEL: "true",
+                },
+            },
+        }
+    )
+
+    with pytest.raises(Failure, match="has no VirtualMachines to start"):
+        pod_tasks.resume_deployment(DEP)
+
+
+class StrayNamespaceKube(FakeKube):
+    """Another namespace carries the deployment's label (e.g. left over from an earlier attempt)."""
+
+    def namespaces(self, label_selector):
+        return [*super().namespaces(label_selector), "dep-123e4567-stray"]
+
+
+def test_a_destroy_that_leaves_objects_of_the_deployment_behind_does_not_report_success(events, monkeypatch):
+    kube = StrayNamespaceKube()
+    monkeypatch.setattr(pod_tasks, "_kube_factory", lambda: kube)
+    deploy()
+
+    with pytest.raises(Failure, match="still in the cluster: dep-123e4567-stray"):
+        pod_tasks.destroy_deployment(DEP)
+
+
+def test_only_file_variables_are_collected_and_a_file_variable_nobody_filled_is_skipped(cluster):
+    spec = copy.deepcopy(SPEC)
+    spec["variables"] = [
+        {"name": "course", "type": "string"},
+        {"name": "assignment", "type": "file", "scope": "team", "ext": ["zip"], "mountPath": "/data/a.zip"},
+        {"name": "handout", "type": "file", "scope": "deployment", "ext": ["pdf"], "mountPath": "/data/h.pdf"},
+    ]
+    stored = sealed("assignment", "Team-1", "a.zip", b"PK\x03\x04")
+    # "course" is a plain value, "handout" was never uploaded; only the assignment becomes a file.
+    user_vars = {"terraform": {"course": "Informatik 1", "assignment": {"Team-1": stored}}}
+
+    deploy(spec=spec, user_vars=user_vars)
+
+    files = {
+        o["metadata"]["labels"]["appstore.dhbw/workload"]: set(o["data"])
+        for (kind, name, ns, _v), o in cluster.objects.items()
+        if kind == "Secret" and ns == NS and name.endswith("-files")
+    }
+    assert files == {"team-1-anna-b": {"assignment"}, "team-1-ben": {"assignment"}}
