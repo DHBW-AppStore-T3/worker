@@ -4,11 +4,11 @@
 
 Closes #
 
-**Art der Änderung:** <!-- feat | fix | refactor | test | docs | ci | chore — bei Breaking Change (Task-Name, Argumente, Status) zusätzlich "BREAKING" -->
+**Art der Änderung:** <!-- feat | fix | refactor | test | docs | ci | chore — bei Breaking Change (Job-Name, Argumente, Status) zusätzlich "BREAKING" -->
 
 ## Prüfung
 
-<!-- Wie wurde das Verhalten geprüft? Welche Tasks, welche App-Vorlage, welche Umgebung (lokal mit `deployment` → `make dev-up`, Staging, echtes OpenStack)? -->
+<!-- Wie wurde das Verhalten geprüft? Welche Jobs (`pods.deploy_application`, `pods.deploy_vm_application`, `pods.destroy_deployment`, …), welche App-Vorlage, welche Umgebung (lokal mit `deployment` → `make dev-up` mit simuliertem Kubernetes, Staging mit echtem Cluster)? -->
 
 ## Checkliste
 
@@ -21,29 +21,31 @@ Jeder Punkt wird abgehakt, bevor der PR gemergt werden kann. Der CI-Check
 "PR Checklist" blockiert den Merge, solange hier noch ein offenes "- [ ]" steht.
 
 Trifft ein Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
-- [x] n/a — Task-Contract: keine Änderung an Tasks oder Payloads
+- [x] n/a — Task-Contract: keine Änderung an Jobs oder Payloads
 
 Die reviewende Person prüft, dass die Häkchen stimmen, und bestätigt das mit
-ihrem Approval. Lint (ruff, black, isort, mypy), Tests (unit/integration),
-Security, Build und Image Scan laufen als CI-Checks (das Coverage-Gate nur
-bei PRs nach `main`) und werden hier nicht wiederholt.
+ihrem Approval (auf `dev` ist keines erzwungen: dann prüft die Autorin oder der
+Autor die Häkchen selbst und die Fragen kommen im Release-PR zurück). Lint
+(ruff, black, isort, mypy), Tests (unit/integration), Coverage-Gate (≥ 80 %
+Zeilen, ≥ 70 % Branches auf jedem Branch), Security, Build und Image Scan laufen
+als CI-Checks und werden hier nicht wiederholt.
 -->
 
 **Funktionale Eignung**
 
 - [ ] Vollständigkeit: Alle Akzeptanzkriterien des verlinkten Issues sind umgesetzt; Abweichungen oder offene Punkte sind oben begründet
-- [ ] Korrektheit: pytest-Tests (`unit`/`integration`) decken die Akzeptanzkriterien ab, inkl. Fehlerfällen (Terraform-/Packer-Fehler, OpenStack-API-Fehler, Timeouts)
-- [ ] Angemessenheit: Geänderte Terraform-/Packer-/OpenStack-Pfade mindestens einmal real gegen OpenStack ausgeführt (lokal oder Staging), nicht nur mit Mocks
-- [ ] Fehlerpfad: Bei Fehler oder Abbruch wird der Task-/Deployment-Status korrekt gemeldet, und es bleiben keine verwaisten OpenStack-Ressourcen oder Locks zurück
-- [ ] Wiederholbarkeit: Tasks verhalten sich bei Retry, Pause/Resume oder Worker-Neustart korrekt (idempotent, kein doppeltes Anlegen)
+- [ ] Korrektheit: pytest-Tests (`unit`/`integration`) decken die Akzeptanzkriterien ab, inkl. Fehlerfällen (Kubernetes-API-Fehler, Pod nicht bereit/nicht schedulbar, Timeouts, Abbruch)
+- [ ] Angemessenheit: Geänderte Pfade gegen einen echten Cluster ausgeführt (Staging; der simulierte Stack mit `FakeKube` erzwingt weder NetworkPolicies noch die Admission-Policy), nicht nur mit Mocks
+- [ ] Fehlerpfad: Bei Fehler oder Abbruch wird der Task-/Deployment-Status korrekt gemeldet, und es bleiben keine verwaisten Namespaces, Volumes oder Leases zurück (`_cleanup_after_failure`)
+- [ ] Abbruch & Neustart: Cancel, SIGTERM und Lease-Verlust (`worker_lost`) sind bedacht; ein Job läuft nie zweimal und legt bei erneutem Lauf nichts doppelt an
 
 **Schnittstellen & Konfiguration**
 
-- [ ] Task-Contract: Task-Namen, Argumente und Status-Rückmeldungen bleiben mit dem Backend kompatibel, sonst Backend-PR verlinkt
-- [ ] App-Vorlagen: Änderungen an der Verarbeitung von Packer/Terraform sind mit den bestehenden App-Vorlagen (`template-app` u. a.) verträglich
-- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo (`.env.example`, Compose) nachgezogen
+- [ ] Task-Contract: Änderungen an `app/task_contract.py` oder `app/k8s/` (Job-Namen, Argumente, Events, Status) sind im Backend identisch nachgezogen (`tests/test_shared_files.py` prüft den Hash), sonst Backend-PR verlinkt
+- [ ] App-Vorlagen: Änderungen an der Verarbeitung von `appstore.yaml` und den erzeugten Kubernetes-Objekten (Pods, Services, Ingress, NetworkPolicies, KubeVirt-VMs) sind mit der Admission-Policy (`deployment/k8s/charts/appstore/templates/admission-policy*.yaml`) und den bestehenden App-Vorlagen (`template-app` u. a.) verträglich; neue Rechte des Pod-Deployers stehen in dessen ClusterRole und in der Policy
+- [ ] Konfiguration: Neue Umgebungsvariablen in `app/config.py` (mit sinnvollem Default) und im `deployment`-Repo nachgezogen (lokal `.env.example` und `docker-compose.dev.yml`; Staging/Produktion `k8s/charts/appstore` und `k8s/environments/`); Grenzwerte (`APP_*`) haben in API und Worker dieselben Werte
 
 **Sicherheit & Doku**
 
-- [ ] Sicherheit: Keine Secrets im Diff; OpenStack-Credentials, SSH-Keys und Tokens werden weder geloggt noch im Task-Ergebnis zurückgegeben; neue `pip-audit`-/`.trivyignore`-Ausnahmen begründet
+- [ ] Sicherheit: Keine Secrets im Diff; Passwörter, Zugangsdaten und Tokens der Apps werden weder geloggt noch im Task-Ergebnis im Klartext zurückgegeben; neue `pip-audit`-/`.trivyignore`-Ausnahmen begründet
 - [ ] Doku: `claude_docs/HANDOVER.md` aktualisiert; Architektur/Entscheidungen in `claude_docs/` nachgezogen, falls betroffen
