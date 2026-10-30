@@ -160,6 +160,24 @@ def test_team_scope_shares_one_workload_per_team():
     assert out["team_vms"]["value"]["Team-1"]["url"] == anna["url"]
 
 
+def test_a_scope_the_person_chose_arrives_as_a_fixed_spec_and_decides_what_a_workload_is(cluster):
+    # Where the app lets the person choose (scopeChoice), the API sends the choice as ``scope`` and no further choice.
+    chosen = {**SPEC, "scope": "team", "scopeChoice": False}
+
+    accounts = accounts_of(deploy(spec=chosen))
+
+    assert accounts[f"Team-1-{uid('anna.b')}"]["workload"] == accounts[f"Team-1-{uid('ben')}"]["workload"] == "team-1"
+    assert cluster.workloads(NS) == {"team-1", "team-2", "team-3"}
+
+
+def test_an_app_that_allows_a_choice_is_not_refused_by_the_worker(cluster):
+    # The API normally fixes the spec; a spec that still carries the choice is valid, with the author's scope.
+    out = deploy(spec={**SPEC, "scope": "user", "scopeChoice": True})
+
+    assert out["status"] == "success"
+    assert len(cluster.workloads(NS)) == 6
+
+
 @pytest.mark.parametrize(
     ("reason", "text"),
     [
@@ -193,6 +211,8 @@ def test_timeout_is_reported(cluster, monkeypatch):
         lambda s: s["workload"]["containers"][0].update(image=f"ghcr.io/dhbw-appstore-t3-evil/x@{DIGEST}"),
         lambda s: s["workload"]["containers"][0].update(resources={"cpu": "64", "memory": "1Gi"}),
         lambda s: s.update(hostNetwork=True),
+        lambda s: s.update(scopeChoice="yes"),
+        lambda s: s.update(scope="everyone", scopeChoice=False),
         lambda s: s["access"][0].update(template="https://{workload}.evil.example"),
     ],
 )
