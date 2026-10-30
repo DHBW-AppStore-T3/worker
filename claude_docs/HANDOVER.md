@@ -23,6 +23,7 @@ Lint (ruff, black, isort, mypy) · Unit (`pytest -m unit`) · Integration (`pyte
 5. Tests ohne DB-Fixture sind automatisch `unit`, mit `pg`/`pg_url` `integration`; ein ausdrücklich als `unit` markierter Test mit DB-Fixture bricht die Sammlung ab.
 6. Integrationstests brauchen eine Test-Datenbank in `DATABASE_URL`; `tests/schema.sql` baut den Worker-Teil des Schemas samt Rolle `appstore_worker` (Superuser nötig). Die Prozess-Tests (`tests/test_worker_process.py`, inkl. `kill -9`) laufen vollständig nur unter Linux.
 7. Drei Formatierer (ruff, black, isort), alle `line-length = 120`.
+8. `scopeChoice` (Backend): Die Wahl der Person kommt als festes Spec im Job an (`scope` = die Wahl, `scopeChoice` false). Der Worker rendert, was im Spec steht, und prüft es erneut; ein Spec, das `scopeChoice` noch trägt, ist gültig.
 
 ## 4. Offen
 
