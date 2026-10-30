@@ -4,7 +4,7 @@
 
 Closes #
 
-**Art der Änderung:** <!-- feat | fix | refactor | test | docs | ci | chore — bei Breaking Change (Job-Name, Argumente, Status) zusätzlich "BREAKING" -->
+**Art der Änderung:** <!-- feat | fix | refactor | test | docs | ci | chore; bei Breaking Change (Job-Name, Argumente, Status) zusätzlich "BREAKING" -->
 
 ## Prüfung
 
@@ -21,11 +21,9 @@ Jeder Punkt wird abgehakt, bevor der PR gemergt werden kann. Der CI-Check
 "PR Checklist" blockiert den Merge, solange hier noch ein offenes "- [ ]" steht.
 
 Trifft ein Punkt nicht zu: mit "n/a" markieren UND abhaken, z. B.
-- [x] n/a — Task-Contract: keine Änderung an Jobs oder Payloads
+- [x] n/a, Task-Contract: keine Änderung an Jobs oder Payloads
 
-Die reviewende Person prüft, dass die Häkchen stimmen, und bestätigt das mit
-ihrem Approval (auf `dev` ist keines erzwungen: dann prüft die Autorin oder der
-Autor die Häkchen selbst und die Fragen kommen im Release-PR zurück). Lint
+Lint
 (ruff, black, isort, mypy), Tests (unit/integration), Coverage-Gate (≥ 80 %
 Zeilen, ≥ 70 % Branches auf jedem Branch), Security, Build und Image Scan laufen
 als CI-Checks und werden hier nicht wiederholt.
